@@ -1,0 +1,1452 @@
+//! 终端核心：alacritty_terminal（VT 状态机）+ GPUI 绘制 + 键鼠编码。
+//!
+//! 数据流：
+//!   pty/ssh ─ mpsc ─► processor.advance(term) ─► renderable_content() ─► GPUI canvas 绘制
+//!   键鼠事件 ─ VT 序列编码 ─► mpsc ─► pty/ssh（Term 产生的查询响应经 PtyProxy 回写）
+//!
+//! 渲染方式：每帧在 `prepare_frame` 中生成一份 `TermSnapshot`（可见行的
+//! 文本 + 颜色 run + 选区/查找/光标覆盖层），由 app 层的 `canvas` 元素
+//! 持快照绘制。输入经 GPUI 事件监听器（cx.listener）回写本模块。
+//!
+//! 选区是我们自己的状态（Point 起点/终点），复制文本用
+//! `term.bounds_to_string()`，避免依赖 alacritty 的 Selection 类型。
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term;
+use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::{Term, TermMode};
+use anyhow::Result;
+use gpui_kit::{
+    App, Bounds, Font, Hsla, Keystroke, Modifiers, Pixels, Point as GPoint,
+    ScrollDelta, SharedString, Size, TextRun, Window, fill, hsla, px, quad, size,
+};
+use tokio::sync::mpsc;
+use vte::ansi::Processor;
+
+use crate::backends::{self, TermIo};
+
+const SCROLLBACK: usize = 10_000;
+
+const BG: Hsla = Hsla {
+    h: 0.619,
+    s: 0.25,
+    l: 0.104,
+    a: 1.0,
+};
+const FG_DEFAULT: Hsla = Hsla {
+    h: 0.60,
+    s: 0.36,
+    l: 0.898,
+    a: 1.0,
+};
+
+/// Term → UI 的事件（经 PtyProxy 转发）。
+pub enum PaneEvent {
+    /// OSC 0/2：窗口标题变更
+    Title(String),
+    /// OSC 52：终端请求把内容写入系统剪贴板
+    ClipboardStore(String),
+}
+
+/// Term 尺寸。total_lines = 屏幕行数 + 回滚深度。
+#[derive(Clone, Copy, Debug)]
+pub struct TermSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl Dimensions for TermSize {
+    fn columns(&self) -> usize {
+        self.cols as usize
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows as usize
+    }
+    fn total_lines(&self) -> usize {
+        self.rows as usize + SCROLLBACK
+    }
+}
+
+/// Term 的事件代理：
+/// - `PtyWrite`（设备查询的应答）回写给后端输入通道；
+/// - `Title` / `ClipboardStore` 转给 UI（app_tx）；
+/// - `ColorRequest` 用内置色板应答；`ClipboardLoad`（OSC52 读）回空串。
+pub struct PtyProxy {
+    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    app_tx: Option<mpsc::UnboundedSender<PaneEvent>>,
+}
+
+fn send_pty(tx: &Option<mpsc::UnboundedSender<Vec<u8>>>, text: &str) {
+    if let Some(tx) = tx {
+        let _ = tx.send(text.as_bytes().to_vec());
+    }
+}
+
+fn color_request_rgb(index: usize) -> vte::ansi::Rgb {
+    // 0..16 命名色 / 16..232 色块 / 232..256 灰阶 / 256+ 特殊色彩
+    let c = match index {
+        256 => hsla_to_rgb(FG_DEFAULT),      // foreground
+        257 => hsla_to_rgb(BG),              // background
+        258 => (255, 255, 255),              // cursor
+        259..=266 => rgb_to_tuple(index - 259),
+        267 => rgb_to_tuple(14),             // bright foreground（近似）
+        268 => hsla_to_rgb(BG),              // dim background
+        i if i < 16 => rgb_to_tuple(i),
+        i => hsla_to_rgb(palette_color((i as u8).min(255))),
+    };
+    vte::ansi::Rgb { r: c.0, g: c.1, b: c.2 }
+}
+
+fn rgb_to_tuple(i: usize) -> (u8, u8, u8) {
+    const RGB16: [[u8; 3]; 16] = [
+        [30, 30, 34],
+        [234, 78, 102],
+        [69, 197, 112],
+        [238, 190, 70],
+        [86, 143, 238],
+        [197, 108, 234],
+        [72, 202, 224],
+        [200, 208, 220],
+        [90, 96, 110],
+        [255, 120, 140],
+        [120, 240, 160],
+        [255, 220, 120],
+        [130, 180, 255],
+        [230, 160, 255],
+        [130, 240, 255],
+        [240, 244, 252],
+    ];
+    let c = RGB16[i.min(15)];
+    (c[0], c[1], c[2])
+}
+
+fn hsla_to_rgb(c: Hsla) -> (u8, u8, u8) {
+    let rgba = c.to_rgb();
+    (
+        (rgba.r * 255.0).round() as u8,
+        (rgba.g * 255.0).round() as u8,
+        (rgba.b * 255.0).round() as u8,
+    )
+}
+
+impl EventListener for PtyProxy {
+    fn send_event(&self, event: Event) {
+        match event {
+            Event::PtyWrite(text) => send_pty(&self.tx, &text),
+            Event::ColorRequest(index, formatter) => {
+                send_pty(&self.tx, &formatter(color_request_rgb(index)));
+            }
+            Event::ClipboardLoad(_typ, formatter) => {
+                // OSC52 读剪贴板：不支持读取，回空串避免程序挂起
+                send_pty(&self.tx, &formatter(""));
+            }
+            Event::Title(title) => {
+                if let Some(app_tx) = &self.app_tx {
+                    let _ = app_tx.send(PaneEvent::Title(title));
+                }
+            }
+            Event::ResetTitle => {
+                if let Some(app_tx) = &self.app_tx {
+                    let _ = app_tx.send(PaneEvent::Title("终端".to_string()));
+                }
+            }
+            Event::ClipboardStore(_typ, text) => {
+                if let Some(app_tx) = &self.app_tx {
+                    let _ = app_tx.send(PaneEvent::ClipboardStore(text));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 一个终端标签页。
+pub struct TermPane {
+    pub title: String,
+    pub term: Term<PtyProxy>,
+    processor: Processor,
+    pub dims: TermSize,
+    io: TermIo,
+    /// 本窗格的启动配置（分屏时按此复制一个新会话）
+    pub spawn: SpawnCfg,
+    /// 对端断开
+    pub dead: bool,
+    /// 选区：(起点, 终点)，绝对 Line 坐标
+    pub selection: Option<(Point<Line>, Point<Line>)>,
+    /// 是否为分屏中的聚焦窗格
+    pub has_focus: bool,
+    /// PaneEvent 接收端（标题/OSC52）
+    events_rx: mpsc::UnboundedReceiver<PaneEvent>,
+    /// 查找关键字（空 = 未搜索）
+    pub search: String,
+    /// 匹配项：(绝对行, 起始列, 结束列)
+    pub search_matches: Vec<(i32, usize, usize)>,
+    /// 当前定位到的匹配序号
+    pub search_index: usize,
+    /// 输入镜像通道：开启「同步输入」时，把本窗格输入复制一份出去
+    pub mirror: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// 每帧单元格尺寸（逻辑像素），由 prepare_frame 按字体测量
+    pub cell: Size<Pixels>,
+    /// 绘制快照使用的字号（与 fit_to 测量保持一致，避免列对齐错位）
+    pub font_size: Pixels,
+}
+
+/// 新窗格的启动方式（预留：分屏复制会话时按此重建）。
+#[derive(Clone)]
+#[allow(dead_code)] // 字段用于记录来源，分屏复制会话时会读取
+pub enum SpawnCfg {
+    Local,
+    Ssh {
+        host: String,
+        port: u16,
+        user: String,
+        auth: backends::ssh::SshAuth,
+        /// 跳板机（ProxyJump），None = 直连
+        jump: Option<backends::ssh::JumpHost>,
+    },
+    /// 在 PTY 里运行任意命令（Ping / traceroute 等）
+    Command {
+        program: String,
+        args: Vec<String>,
+    },
+    /// 原始 TCP（Telnet）
+    Tcp {
+        host: String,
+        port: u16,
+    },
+}
+
+impl TermPane {
+    pub fn new_local(title: String, cols: u16, rows: u16) -> Result<Self> {
+        let mut pane = Self::new(title, backends::local::spawn(cols, rows)?, cols, rows);
+        pane.spawn = SpawnCfg::Local;
+        Ok(pane)
+    }
+
+    /// 在 PTY 中运行任意命令（Ping 等），复用终端渲染与交互。
+    pub fn new_command(
+        title: String,
+        program: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        let io = backends::local::spawn_command(program, args, cols, rows)?;
+        let mut pane = Self::new(title, io, cols, rows);
+        pane.spawn = SpawnCfg::Command {
+            program: program.to_string(),
+            args: args.to_vec(),
+        };
+        Ok(pane)
+    }
+
+    /// 原始 TCP（Telnet）会话。
+    pub fn new_tcp(title: String, host: String, port: u16, cols: u16, rows: u16) -> Result<Self> {
+        let io = backends::tcp::spawn(&host, port)?;
+        let mut pane = Self::new(title, io, cols, rows);
+        pane.spawn = SpawnCfg::Tcp { host, port };
+        Ok(pane)
+    }
+
+    pub async fn new_ssh(
+        title: String,
+        host: String,
+        port: u16,
+        user: String,
+        auth: backends::ssh::SshAuth,
+        jump: Option<backends::ssh::JumpHost>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        let io = backends::ssh::spawn(
+            host.clone(),
+            port,
+            user.clone(),
+            auth.clone(),
+            jump.clone(),
+            cols,
+            rows,
+        )
+        .await?;
+        let mut pane = Self::new(title, io, cols, rows);
+        pane.spawn = SpawnCfg::Ssh { host, port, user, auth, jump };
+        Ok(pane)
+    }
+
+    fn new(title: String, io: TermIo, cols: u16, rows: u16) -> Self {
+        let dims = TermSize { cols, rows };
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<PaneEvent>();
+        let proxy = PtyProxy {
+            tx: Some(io.input_tx.clone()),
+            app_tx: Some(events_tx),
+        };
+        let term = Term::new(term::Config::default(), &dims, proxy);
+        Self {
+            title,
+            term,
+            processor: Processor::new(),
+            dims,
+            io,
+            spawn: SpawnCfg::Local,
+            dead: false,
+            selection: None,
+            has_focus: false,
+            events_rx,
+            search: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
+            mirror: None,
+            cell: size(px(9.0), px(17.0)),
+            font_size: px(14.0),
+        }
+    }
+
+    /// 吸收后端字节流，返回 true 表示有新内容。
+    pub fn pump(&mut self) -> bool {
+        let mut dirty = false;
+        let mut budget = 16; // 每帧最多 16 批，避免大吞吐打满 UI
+        loop {
+            if budget == 0 {
+                break;
+            }
+            match self.io.output_rx.try_recv() {
+                Ok(data) => {
+                    self.processor.advance(&mut self.term, &data);
+                    dirty = true;
+                    budget -= 1;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.dead = true;
+                    return true;
+                }
+            }
+        }
+        dirty
+    }
+
+    /// 吸收 PaneEvent（标题 / OSC52），返回 (标题变化, 待写剪贴板文本)。
+    pub fn drain_pane_events(&mut self) -> (bool, Option<String>) {
+        let mut changed = false;
+        let mut clip = None;
+        while let Ok(ev) = self.events_rx.try_recv() {
+            match ev {
+                PaneEvent::Title(t) => {
+                    self.title = t;
+                    changed = true;
+                }
+                PaneEvent::ClipboardStore(text) => {
+                    clip = Some(text);
+                }
+            }
+        }
+        (changed, clip)
+    }
+
+    /// 终端 resize（含通知后端），返回是否发生变化。
+    pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
+        if cols < 2 || rows < 2 || (self.dims.cols, self.dims.rows) == (cols, rows) {
+            return false;
+        }
+        self.dims = TermSize { cols, rows };
+        self.term.resize(self.dims);
+        let _ = self.io.resize_tx.send((cols, rows));
+        true
+    }
+
+    /// SSH 会话句柄（本地 / Telnet 窗格返回 None），供 SFTP 面板复用连接。
+    pub fn ssh_handle(&self) -> Option<std::sync::Arc<backends::ssh::SshHandle>> {
+        self.io.ssh.clone()
+    }
+
+    pub fn write_input(&self, bytes: Vec<u8>) {
+        // 同步输入：先复制给其它窗格，再写本窗格
+        if let Some(mx) = &self.mirror {
+            let _ = mx.send(bytes.clone());
+        }
+        let _ = self.io.input_tx.send(bytes);
+    }
+
+    /// 只写本窗格（广播回放时用，避免二次镜像造成回环）。
+    pub fn write_input_local(&self, bytes: Vec<u8>) {
+        let _ = self.io.input_tx.send(bytes);
+    }
+
+    // ------------------------------------------------------------------
+    // 查找
+    // ------------------------------------------------------------------
+
+    /// 设置查找关键字并重新计算匹配项（大小写不敏感）。
+    pub fn set_search(&mut self, needle: &str) {
+        self.search = needle.to_string();
+        self.search_matches.clear();
+        self.search_index = 0;
+        let needle = needle.trim().to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        let (top, bottom) = {
+            let grid = self.term.grid();
+            (grid.topmost_line().0, grid.bottommost_line().0)
+        };
+        for line in top..=bottom {
+            if let Some((start, end)) = self.find_in_line(Line(line), &needle) {
+                self.search_matches.push((line, start, end));
+            }
+        }
+        // 默认定位到最靠近屏幕底部（最新）的一处
+        if !self.search_matches.is_empty() {
+            self.search_index = self.search_matches.len() - 1;
+            self.scroll_to_search_match();
+        }
+    }
+
+    /// 在当前行内查找，返回 (起始列, 结束列)——按列而非字符索引。
+    fn find_in_line(&self, line: Line, needle: &str) -> Option<(usize, usize)> {
+        let grid = self.term.grid();
+        let mut text = String::new();
+        // char 序号 → 列号映射（跳过双宽字符的占位格）
+        let mut col_of_char: Vec<usize> = Vec::new();
+        for col in 0..self.dims.cols as usize {
+            let cd = &grid[line][Column(col)];
+            if cd.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cd.c);
+            col_of_char.push(col);
+        }
+        let lower = text.to_lowercase();
+        let pos = lower.find(needle)?;
+        let char_start = text[..pos].chars().count();
+        let char_len = needle.chars().count();
+        let char_end = (char_start + char_len).min(col_of_char.len());
+        if char_start >= col_of_char.len() {
+            return None;
+        }
+        let start_col = col_of_char[char_start];
+        let end_col = col_of_char
+            .get(char_end.saturating_sub(1))
+            .copied()
+            .unwrap_or(start_col);
+        Some((start_col, end_col))
+    }
+
+    /// 把视口滚动到当前匹配项。
+    pub fn scroll_to_search_match(&mut self) {
+        let Some(&(line, _, _)) = self.search_matches.get(self.search_index) else {
+            return;
+        };
+        let content = self.term.renderable_content();
+        let offset = content.display_offset as i32;
+        drop(content);
+        let bottom_line = self.dims.rows as i32 - 1 - offset;
+        let mid = self.dims.rows as i32 / 2;
+        let delta = line - (bottom_line - mid);
+        if delta != 0 {
+            self.term.scroll_display(Scroll::Delta(-delta));
+        }
+    }
+
+    /// 下一个 / 上一个匹配项。
+    pub fn search_next(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_index = (self.search_index + 1) % self.search_matches.len();
+        self.scroll_to_search_match();
+    }
+
+    pub fn search_prev(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_index = if self.search_index == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.search_index - 1
+        };
+        self.scroll_to_search_match();
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.search_matches.clear();
+        self.search_index = 0;
+    }
+
+    pub fn selection_text(&self) -> Option<String> {
+        let (a, b) = normalized_selection(&self.selection)?;
+        Some(self.term.bounds_to_string(a, b))
+    }
+
+    /// 是否存在非空选区（起点与终点不同）。
+    pub fn has_selection(&self) -> bool {
+        match normalized_selection(&self.selection) {
+            Some((a, b)) => a != b,
+            None => false,
+        }
+    }
+
+    /// 把选区文本写入系统剪贴板，返回是否真的复制到了内容。
+    pub fn copy_selection(&self, cx: &mut App) -> bool {
+        let Some(raw) = self.selection_text() else {
+            return false;
+        };
+        // 行尾空白不进入剪贴板，避免粘到 shell 里带一堆空格
+        let text = raw
+            .split('\n')
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return false;
+        }
+        copy_to_clipboard(cx, text);
+        true
+    }
+
+    /// 系统剪贴板 → 终端输入。返回是否发送了内容。
+    pub fn paste_clipboard(&mut self, cx: &App) -> bool {
+        let Some(text) = read_clipboard(cx) else {
+            return false;
+        };
+        self.scroll_to_bottom(0);
+        let text = text.replace("\r\n", "\n");
+        // 开了 bracketed paste 的程序（bash/zsh/vim）要求粘贴内容被
+        // `ESC[200~ … ESC[201~` 包住，否则多行粘贴会被当成逐条命令执行。
+        let bracketed = {
+            let content = self.term.renderable_content();
+            content.mode.contains(TermMode::BRACKETED_PASTE)
+        };
+        if bracketed {
+            let mut out = String::with_capacity(text.len() + 12);
+            out.push_str("\x1b[200~");
+            out.push_str(&text);
+            out.push_str("\x1b[201~");
+            self.write_input(out.into_bytes());
+        } else {
+            // 终端里回车只有一个字节 \r
+            let text = text.replace('\n', "\r");
+            self.write_input(text.into_bytes());
+        }
+        true
+    }
+
+    /// 全选（含回滚历史）。
+    pub fn select_all(&mut self) {
+        let (top, bottom) = {
+            let grid = self.term.grid();
+            (grid.topmost_line(), grid.bottommost_line())
+        };
+        let last_col = Column(self.dims.cols.saturating_sub(1) as usize);
+        self.selection = Some((Point::new(top, Column(0)), Point::new(bottom, last_col)));
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// 取终端最近若干行可见文本（供 AI 上下文使用）。
+    pub fn context_text(&self, max_lines: usize, max_line_len: usize) -> String {
+        if max_lines == 0 {
+            return String::new();
+        }
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+        drop(content);
+
+        let grid = self.term.grid();
+        let bottom = self.dims.rows as i32 - 1 - display_offset as i32;
+        let topmost = grid.topmost_line().0;
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..max_lines as i32 {
+            let row = bottom - i;
+            if row < topmost {
+                break;
+            }
+            let text = self.line_text(Line(row), max_line_len);
+            if !text.trim().is_empty() {
+                lines.push(text);
+            }
+        }
+        lines.reverse();
+        lines.join("\n")
+    }
+
+    /// 取某一绝对行的文本（按 max_len 截断）。
+    fn line_text(&self, line: Line, max_len: usize) -> String {
+        let grid = self.term.grid();
+        let mut s = String::new();
+        for col in 0..self.dims.cols as usize {
+            let cd = &grid[line][Column(col)];
+            if cd.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            s.push(cd.c);
+        }
+        let trimmed = s.trim_end().to_string();
+        if trimmed.chars().count() > max_len {
+            let head: String = trimmed.chars().take(max_len).collect();
+            format!("{head}…")
+        } else {
+            trimmed
+        }
+    }
+
+    /// 根据可用空间与字体测量单元格，并 resize 终端。
+    /// 在渲染帧开头调用（render 拿得到 window）。
+    pub fn fit_to(
+        &mut self,
+        window: &mut Window,
+        font_size: f32,
+        available: Size<Pixels>,
+    ) -> bool {
+        self.font_size = px(font_size);
+        let font = terminal_font();
+        let run = [TextRun {
+            len: 1,
+            font: font.clone(),
+            color: FG_DEFAULT,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
+        let shaped = window.text_system().shape_line(
+            SharedString::from("W"),
+            px(font_size),
+            &run,
+            None,
+        );
+        self.cell = size(shaped.width, shaped.ascent + shaped.descent + px(1.0));
+        let cols = ((available.width / self.cell.width).floor() as u16).max(4);
+        let rows = ((available.height / self.cell.height).floor() as u16).max(3);
+        self.resize(cols, rows)
+    }
+
+    /// 生成一帧绘制快照（app 层的 canvas 元素用它绘制网格）。
+    pub fn snapshot(&self) -> TermSnapshot {
+        let content = self.term.renderable_content();
+        let cursor = content.cursor;
+        let display_offset = content.display_offset;
+        let mode: TermMode = content.mode;
+        let sel = normalized_selection(&self.selection);
+        let cols_i = self.dims.cols;
+        let rows_i = self.dims.rows;
+        let colors: Colors = *content.colors;
+        drop(content);
+
+                let cell = self.cell;
+        let mut snap = TermSnapshot {
+            cell,
+            font_size: self.font_size,
+            rows: Vec::with_capacity(rows_i as usize),
+            sel_quads: Vec::new(),
+            search_quads: Vec::new(),
+            search_current_quads: Vec::new(),
+            cursor: None,
+            focused: self.has_focus,
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            mouse_mode: mode.intersects(
+                TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+            ),
+        };
+
+        let q = |row: i32, c0: usize, c1: usize| {
+            let x = px(c0 as f32 * cell.width.as_f32());
+            let y = px(row as f32 * cell.height.as_f32());
+            let w = px(((c1 + 1).max(c0) - c0) as f32 * cell.width.as_f32());
+            Bounds::new(GPoint::new(x, y), size(w, cell.height))
+        };
+
+        // ---- 选区高亮 ----
+        if let Some((a, b)) = sel {
+            for line in a.line.0..=b.line.0 {
+                let row = line + display_offset as i32;
+                if row < 0 || row >= rows_i as i32 {
+                    continue;
+                }
+                let col_start = if line == a.line.0 { a.column.0 } else { 0 };
+                let col_end = if line == b.line.0 {
+                    (b.column.0 + 1).min(cols_i as usize)
+                } else {
+                    cols_i as usize
+                };
+                if col_start >= col_end {
+                    continue;
+                }
+                snap.sel_quads.push(q(row, col_start, col_end - 1));
+            }
+        }
+
+        // ---- 查找高亮 ----
+        if !self.search_matches.is_empty() {
+            let current = self.search_matches.get(self.search_index).copied();
+            for (idx, &(line, c0, c1)) in self.search_matches.iter().enumerate() {
+                let row = line + display_offset as i32;
+                if row < 0 || row >= rows_i as i32 {
+                    continue;
+                }
+                let is_current = current.map(|c| c.0 == line).unwrap_or(false)
+                    && idx == self.search_index;
+                if is_current {
+                    snap.search_current_quads.push(q(row, c0, c1));
+                } else {
+                    snap.search_quads.push(q(row, c0, c1));
+                }
+            }
+        }
+
+        // ---- 网格文本 ----
+        let grid = self.term.grid();
+        for row in 0..rows_i as i32 {
+            let line = Line(row - display_offset as i32);
+            let mut runs: Vec<TermRun> = Vec::new();
+            // 已被跳过的「空白 + 无底色」格数：稍后补回占位空格，
+            // 保证等宽字形按列推进（否则后面文本会因缺格而向左挤）
+            let mut pending_spaces = 0usize;
+            for col in 0..cols_i as usize {
+                let cd = &grid[line][Column(col)];
+                let flags = cd.flags;
+                if flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue; // 双宽字符的后半格
+                }
+                let mut fg = resolve_color(cd.fg, &colors, true, flags);
+                let mut bg = resolve_color(cd.bg, &colors, false, flags);
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                let bg = if bg == BG { None } else { Some(bg) };
+
+                let mut s: String = cd.c.into();
+                if let Some(zw) = cd.zerowidth() {
+                    for z in zw.iter() {
+                        s.push(*z);
+                    }
+                }
+                if s == " " && bg.is_none() {
+                    // 空白且无底色：先记下列数，继续推进（行尾的会自然丢弃）
+                    pending_spaces += 1;
+                    continue;
+                }
+                if pending_spaces > 0 {
+                    // 把跳过的空白补成占位空格。空格本身不可见、
+                    // TextRun bg=None 不画底色，颜色跟谁都可以。
+                    let pad = " ".repeat(std::mem::take(&mut pending_spaces));
+                    if let Some(last) = runs.last_mut() {
+                        last.text.push_str(&pad);
+                    } else {
+                        runs.push(TermRun {
+                            text: pad,
+                            fg,
+                            bg,
+                            underline: false,
+                        });
+                    }
+                }
+                // 合并相同样式的相邻 run
+                if let Some(last) = runs.last_mut() {
+                    if last.fg == fg && last.bg == bg && last.underline == flags.contains(Flags::UNDERLINE) {
+                        last.text.push_str(&s);
+                        continue;
+                    }
+                }
+                runs.push(TermRun {
+                    text: s,
+                    fg,
+                    bg,
+                    underline: flags.contains(Flags::UNDERLINE),
+                });
+            }
+            if !runs.is_empty() {
+                snap.rows.push(TermRow { row, runs });
+            }
+        }
+
+        // ---- 光标 ----
+        let cursor_row = cursor.point.line.0 + display_offset as i32;
+        if cursor_row >= 0 && cursor_row < rows_i as i32 && cursor.shape != vte::ansi::CursorShape::Hidden {
+            let bounds = Bounds::new(
+                GPoint::new(
+                    px(cursor.point.column.0 as f32 * cell.width.as_f32()),
+                    px(cursor_row as f32 * cell.height.as_f32()),
+                ),
+                cell,
+            );
+            let color = if self.has_focus {
+                hsla(0.6, 0.35, 0.9, 0.9)
+            } else {
+                hsla(0.0, 0.0, 0.66, 0.35)
+            };
+            snap.cursor = Some(TermCursor {
+                bounds,
+                shape: match cursor.shape {
+                    vte::ansi::CursorShape::Block => CursorShape::Block,
+                    vte::ansi::CursorShape::HollowBlock => CursorShape::Hollow,
+                    vte::ansi::CursorShape::Beam => CursorShape::Beam,
+                    _ => CursorShape::Underline,
+                },
+                color,
+            });
+        }
+
+        snap
+    }
+
+    // ------------------------------------------------------------------
+    // 输入处理（由 app 层的 GPUI 监听器转发进来）
+    // ------------------------------------------------------------------
+
+    /// 处理一次按键（GPUI Keystroke）。
+    ///
+    /// 剪贴板快捷键必须在这里拦下来：pty 只认字节流，
+    /// Ctrl+C 在终端里是中断信号（^C），所以复制统一走 Ctrl+Shift+C。
+    pub fn handle_keystroke(&mut self, ks: &Keystroke, cx: &mut App) {
+        let mods = &ks.modifiers;
+        let ctrl = mods.control && !mods.alt;
+
+        // ---- 复制 ----
+        // Ctrl+Shift+C / Ctrl+Insert 是终端通用复制键；
+        // 另加「Ctrl+C 且有选区时复制」——Windows Terminal 的智能复制习惯，
+        // 没选区时仍然往下走，保持 ^C 中断语义。
+        let smart_copy = ctrl && ks.key == "c" && !mods.shift && self.has_selection();
+        let explicit_copy = (ctrl && mods.shift && ks.key == "c") || (ctrl && ks.key == "insert");
+        if explicit_copy || smart_copy {
+            // 没有真正选区时不做任何事：单击只留下一个「零宽选区」，
+            // 直接复制会把光标下那一个字塞进剪贴板。
+            if self.has_selection() {
+                self.copy_selection(cx);
+                if smart_copy {
+                    // 复制完清掉选区，否则第二次 Ctrl+C 还是复制，永远发不出 ^C
+                    self.clear_selection();
+                }
+            }
+            return;
+        }
+
+        // ---- 粘贴 ----
+        if (ctrl && (ks.key == "v" || ks.key == "insert"))
+            || (mods.shift && ks.key == "insert")
+        {
+            self.paste_clipboard(cx);
+            return;
+        }
+
+        // 可打印文本（含 CJK 输入法提交）：直接送字节
+        if !mods.control && !mods.alt {
+            if let Some(text) = &ks.key_char {
+                if !text.is_empty() {
+                    self.scroll_to_bottom(0);
+                    self.write_input(text.clone().into_bytes());
+                    return;
+                }
+            }
+        }
+
+        // 命名键 → VT 序列
+        if let Some(seq) = encode_key(&ks.key, mods) {
+            self.scroll_to_bottom(0);
+            self.write_input(seq);
+        }
+    }
+
+    /// 鼠标点击 → 选区起点 / 焦点请求。
+    pub fn mouse_down(&mut self, col: usize, row: i32, mods: &Modifiers) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        ) {
+            let b = match () {
+                _ => 0u8, // 调用方只传左键信息，其余按钮由 app 层直接报告
+            };
+            let _ = b;
+            self.mouse_report(mods, col, row, 0, true);
+            // 鼠标交给远端程序了，本地选区不再有意义
+            self.clear_selection();
+            return true;
+        }
+        let point = self.point_at(col, row);
+        self.selection = Some((point, point));
+        true
+    }
+
+    /// 鼠标拖拽 → 选区扩展。返回是否处于鼠标报告模式。
+    pub fn mouse_drag(&mut self, col: usize, row: i32, mods: &Modifiers) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) {
+            self.mouse_report(mods, col, row, 32, true);
+            return true;
+        }
+        let point = self.point_at(col, row);
+        self.selection = self.selection.map(|(a, _)| (a, point));
+        false
+    }
+
+    /// 鼠标抬起：非鼠标报告模式下结束选区。
+    pub fn mouse_up(&mut self, col: usize, row: i32, mods: &Modifiers) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        ) {
+            self.mouse_report(mods, col, row, 0, false);
+            return true;
+        }
+        let point = self.point_at(col, row);
+        self.selection = self.selection.map(|(a, _)| (a, point));
+        false
+    }
+
+    /// 中键（鼠标报告模式时）。
+    pub fn mouse_middle(&mut self, col: usize, row: i32, mods: &Modifiers, pressed: bool) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        ) {
+            self.mouse_report(mods, col, row, 1, pressed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 右键（鼠标报告模式时）。
+    pub fn mouse_right(&mut self, col: usize, row: i32, mods: &Modifiers, pressed: bool) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        ) {
+            self.mouse_report(mods, col, row, 2, pressed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 鼠标移动（悬停，鼠标报告模式时）。
+    pub fn mouse_motion(&mut self, col: usize, row: i32) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            self.mouse_report(&Modifiers::default(), col, row, 32, true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 滚轮：返回 true 表示事件被终端消费（鼠标报告/备屏）。
+    pub fn scroll(&mut self, delta: ScrollDelta) -> bool {
+        let content = self.term.renderable_content();
+        let mode = content.mode;
+        drop(content);
+        let up = match delta {
+            ScrollDelta::Pixels(p) => p.y > px(0.0),
+            ScrollDelta::Lines(l) => l.y > 0.0,
+        };
+        if mode.intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        ) {
+            let (row, col) = self.viewport_bottom_cell();
+            let button = if up { 64 } else { 65 };
+            self.mouse_report(&Modifiers::default(), col, row, button, true);
+            return true;
+        } else if mode.contains(TermMode::ALT_SCREEN) {
+            // alternate scroll：换 ↑/↓
+            let seq: &[u8] = if up { b"\x1b[A" } else { b"\x1b[B" };
+            for _ in 0..3 {
+                self.write_input(seq.to_vec());
+            }
+            return true;
+        } else {
+            let d: i32 = if up { 3 } else { -3 };
+            self.term.scroll_display(Scroll::Delta(d));
+            return false;
+        }
+    }
+
+    fn viewport_bottom_cell(&self) -> (i32, usize) {
+        (self.dims.rows as i32 - 1, 0)
+    }
+
+    /// 列/行 → 绝对坐标点。
+    fn point_at(&self, col: usize, row: i32) -> Point<Line> {
+        let content = self.term.renderable_content();
+        let offset = content.display_offset as i32;
+        drop(content);
+        Point::new(Line(row - offset), Column(col.min(self.dims.cols as usize - 1)))
+    }
+
+    /// SGR(1006) 鼠标报告：positions 为视口坐标（1-based）。
+    fn mouse_report(&mut self, mods: &Modifiers, col: usize, row: i32, button: u8, pressed: bool) {
+        let mod_extra =
+            (mods.shift as u8) | ((mods.alt as u8) << 1) | ((mods.control as u8) << 2);
+        let code = button + mod_extra * 4;
+        let action = if pressed { 'M' } else { 'm' };
+        let seq = format!("\x1b[<{code};{};{}{}", col + 1, row + 1, action);
+        self.write_input(seq.into_bytes());
+    }
+
+    /// 键入时若停在回滚历史之上，自动跳回底部（xterm 习惯）。
+    fn scroll_to_bottom(&mut self, _display_offset: usize) {
+        let content = self.term.renderable_content();
+        let offset = content.display_offset;
+        drop(content);
+        if offset > 0 {
+            self.term.scroll_display(Scroll::Bottom);
+        }
+    }
+}
+
+/* ----------------------------------------------------------------------
+ * 绘制快照
+ * ------------------------------------------------------------------- */
+
+/// 单行文本样式段（相邻同样式已合并）。
+#[derive(Clone, Debug)]
+pub struct TermRun {
+    pub text: String,
+    pub fg: Hsla,
+    pub bg: Option<Hsla>,
+    pub underline: bool,
+}
+
+/// 单行快照。row 为视口行号。
+#[derive(Clone)]
+pub struct TermRow {
+    pub row: i32,
+    pub runs: Vec<TermRun>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CursorShape {
+    Block,
+    Hollow,
+    Beam,
+    Underline,
+}
+
+#[derive(Clone)]
+pub struct TermCursor {
+    pub bounds: Bounds<Pixels>,
+    pub shape: CursorShape,
+    pub color: Hsla,
+}
+
+/// 一帧终端绘制快照（坐标相对终端原点）。
+#[derive(Clone)]
+pub struct TermSnapshot {
+    pub cell: Size<Pixels>,
+    /// 与 fit_to 测量时相同的字号（保证 shape_line 推进与列宽一致）
+    pub font_size: Pixels,
+    pub rows: Vec<TermRow>,
+    pub sel_quads: Vec<Bounds<Pixels>>,
+    pub search_quads: Vec<Bounds<Pixels>>,
+    pub search_current_quads: Vec<Bounds<Pixels>>,
+    pub cursor: Option<TermCursor>,
+    pub focused: bool,
+    pub alt_screen: bool,
+    pub mouse_mode: bool,
+}
+
+/// 把快照绘制到 window（origin 为终端区域原点）。
+pub fn paint_snapshot(snap: &TermSnapshot, origin: GPoint<Pixels>, window: &mut Window, cx: &mut App) {
+    // 选区（画在文字下面）
+    for b in &snap.sel_quads {
+        window.paint_quad(fill(*b + origin, hsla(0.606, 0.55, 0.487, 0.39)));
+    }
+    // 查找高亮
+    for b in &snap.search_quads {
+        window.paint_quad(fill(*b + origin, hsla(0.16, 0.5, 0.42, 0.27)));
+    }
+    for b in &snap.search_current_quads {
+        window.paint_quad(fill(*b + origin, hsla(0.11, 0.9, 0.62, 0.47)));
+    }
+
+    // 文本
+    let font = terminal_font();
+    for row in &snap.rows {
+        let mut text = String::new();
+        let mut runs: Vec<TextRun> = Vec::new();
+        for r in &row.runs {
+            let byte_len = r.text.len();
+            text.push_str(&r.text);
+            runs.push(TextRun {
+                len: byte_len,
+                font: font.clone(),
+                color: r.fg,
+                background_color: r.bg,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+        if text.is_empty() {
+            continue;
+        }
+        let text_len = text.len();
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text),
+            snap.font_size,
+            &runs,
+            None,
+        );
+        let line_origin =
+            GPoint::new(origin.x, origin.y + px(row.row as f32 * snap.cell.height.as_f32()));
+        let _ = shaped.paint(
+            line_origin,
+            snap.cell.height,
+            gpui_kit::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+        // 下划线
+        let mut x = 0.0f32;
+        for (r, _) in row.runs.iter().zip(runs.iter()) {
+            let run_w = shaped.width.as_f32() * (r.text.len() as f32 / text_len as f32);
+            if r.underline {
+                let ub = Bounds::new(
+                    GPoint::new(origin.x + px(x), line_origin.y + snap.cell.height - px(1.5)),
+                    size(px(run_w), px(1.0)),
+                );
+                window.paint_quad(fill(ub, r.fg));
+            }
+            x += run_w;
+        }
+    }
+
+    // 光标
+    if let Some(cur) = &snap.cursor {
+        let b = cur.bounds + origin;
+        // 失焦时光标画成空心（终端没获得键盘焦点，用户一眼能看出来）
+        let shape = if snap.focused {
+            cur.shape
+        } else {
+            match cur.shape {
+                CursorShape::Block => CursorShape::Hollow,
+                other => other,
+            }
+        };
+        match shape {
+            CursorShape::Block => {
+                window.paint_quad(fill(b, hsla(0.6, 0.3, 0.9, 0.27)));
+                window.paint_quad(quad(
+                    b,
+                    gpui_kit::Corners::all(px(0.0)),
+                    gpui_kit::transparent_black(),
+                    gpui_kit::Edges::all(px(1.0)),
+                    cur.color,
+                    gpui_kit::BorderStyle::Solid,
+                ));
+            }
+            CursorShape::Hollow => {
+                window.paint_quad(quad(
+                    b,
+                    gpui_kit::Corners::all(px(0.0)),
+                    gpui_kit::transparent_black(),
+                    gpui_kit::Edges::all(px(1.5)),
+                    cur.color,
+                    gpui_kit::BorderStyle::Solid,
+                ));
+            }
+            CursorShape::Beam => {
+                let bb =
+                    Bounds::new(b.origin, size(px(b.size.width.as_f32() * 0.18), b.size.height));
+                window.paint_quad(fill(bb, cur.color));
+            }
+            CursorShape::Underline => {
+                let bb = Bounds::new(
+                    GPoint::new(b.origin.x, b.origin.y + px(b.size.height.as_f32() * 0.78)),
+                    size(b.size.width, px(b.size.height.as_f32() * 0.22)),
+                );
+                window.paint_quad(fill(bb, cur.color));
+            }
+        }
+    }
+}
+
+/// 终端等宽字体。
+pub fn terminal_font() -> Font {
+    Font {
+        family: crate::fonts::terminal_font_family().into(),
+        weight: gpui_kit::FontWeight::NORMAL,
+        style: gpui_kit::FontStyle::Normal,
+        features: Default::default(),
+        fallbacks: None,
+    }
+}
+
+/// 写系统剪贴板。
+pub fn copy_to_clipboard(cx: &mut App, text: String) {
+    use gpui_kit::ClipboardItem;
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+}
+
+/// 读系统剪贴板文本。
+pub fn read_clipboard(cx: &App) -> Option<String> {
+    cx.read_from_clipboard().and_then(|item| {
+        if let Some(text) = item.text() {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        None
+    })
+}
+
+/// 归一化选区（保证 a 在 b 之前）。
+pub fn normalized_selection(
+    sel: &Option<(Point<Line>, Point<Line>)>,
+) -> Option<(Point<Line>, Point<Line>)> {
+    let (a, b) = sel.clone()?;
+    let (la, ca) = (a.line.0, a.column.0);
+    let (lb, cb) = (b.line.0, b.column.0);
+    if (la, ca) <= (lb, cb) {
+        Some((a, b))
+    } else {
+        Some((b, a))
+    }
+}
+
+/// GPUI 键名 → VT 字节。返回 None 表示该事件被 UI 功能吃掉。
+/// 可打印字符（含 AltGr/中文输入）走 Keystroke::key_char，
+/// 这里只处理命名键与 Ctrl 控制码。
+fn encode_key(key: &str, mods: &Modifiers) -> Option<Vec<u8>> {
+    // ---- Ctrl 控制码 ----
+    if mods.control && !mods.alt {
+        if let Some(code) = ctrl_code(key) {
+            return Some(vec![code]);
+        }
+    }
+
+    // ---- 命名键 → CSI 序列 ----
+    let mod_param = 1
+        + (mods.shift as i32)
+        + ((mods.alt as i32) << 1)
+        + ((mods.control as i32) << 2);
+    let mod_suffix = if mod_param > 1 {
+        format!(";{mod_param}")
+    } else {
+        String::new()
+    };
+
+    // 带字母的 CSI 键（A-D/H/F）
+    if let Some(csi_char) = match key {
+        "up" => Some(if mod_param > 1 { 'a' } else { 'A' }),
+        "down" => Some(if mod_param > 1 { 'b' } else { 'B' }),
+        "right" => Some(if mod_param > 1 { 'c' } else { 'C' }),
+        "left" => Some(if mod_param > 1 { 'd' } else { 'D' }),
+        "home" => Some(if mod_param > 1 { 'h' } else { 'H' }),
+        "end" => Some(if mod_param > 1 { 'f' } else { 'F' }),
+        _ => None,
+    } {
+        use std::fmt::Write as _;
+        let mut seq = String::from("\x1b[");
+        if mod_param > 1 {
+            let _ = write!(seq, "1{mod_suffix}");
+        }
+        seq.push(csi_char);
+        return Some(seq.into_bytes());
+    }
+
+    // ~ 结尾的 CSI 键
+    let csi_tilde: Option<u32> = match key {
+        "insert" => Some(2),
+        "delete" => Some(3),
+        "pageup" => Some(5),
+        "pagedown" => Some(6),
+        "f5" => Some(15),
+        "f6" => Some(17),
+        "f7" => Some(18),
+        "f8" => Some(19),
+        "f9" => Some(20),
+        "f10" => Some(21),
+        "f11" => Some(23),
+        "f12" => Some(24),
+        _ => None,
+    };
+    if let Some(n) = csi_tilde {
+        use std::fmt::Write as _;
+        let mut seq = String::from("\x1b[");
+        let _ = write!(seq, "{n}{mod_suffix}~");
+        return Some(seq.into_bytes());
+    }
+    // F1-F4（SS 前缀）
+    if mod_param == 1 {
+        match key {
+            "f1" => return Some(b"\x1bOP".to_vec()),
+            "f2" => return Some(b"\x1bOQ".to_vec()),
+            "f3" => return Some(b"\x1bOR".to_vec()),
+            "f4" => return Some(b"\x1bOS".to_vec()),
+            _ => {}
+        }
+    }
+
+    match key {
+        "enter" => Some(b"\r".to_vec()),
+        "tab" => Some(b"\t".to_vec()),
+        "backspace" => Some(vec![0x7f]),
+        "escape" => Some(b"\x1b".to_vec()),
+        _ => None,
+    }
+}
+
+/// Ctrl+字母 → 控制码（^A=1 … ^Z=26）。
+fn ctrl_code(key: &str) -> Option<u8> {
+    let mut chars = key.chars();
+    let (c, rest) = (chars.next()?, chars.as_str());
+    if !rest.is_empty() || !c.is_ascii_alphabetic() {
+        return None;
+    }
+    Some((c.to_ascii_uppercase() as u8) & 0x1f)
+}
+
+/* ---- 颜色 ---- */
+
+fn rgb(r: u8, g: u8, b: u8) -> Hsla {
+    // 与 egui Color32::from_rgb 等价的 sRGB → Hsla（GPUI 的 hsla 为线性色空间，
+    // 但终端配色使用 hsla 近似即可；显示效果与旧版差异可接受）。
+    let (h, s, l) = rgb_to_hsl(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    hsla(h, s, l, 1.0)
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    if (max - min).abs() < f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        (g - b) / d + if g < b { 6.0 } else { 0.0 }
+    } else if max == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h / 6.0, s, l)
+}
+
+fn named_color(n: vte::ansi::NamedColor) -> Hsla {
+    use vte::ansi::NamedColor;
+    let i = match n {
+        NamedColor::Black | NamedColor::DimBlack => 0,
+        NamedColor::Red | NamedColor::DimRed => 1,
+        NamedColor::Green | NamedColor::DimGreen => 2,
+        NamedColor::Yellow | NamedColor::DimYellow => 3,
+        NamedColor::Blue | NamedColor::DimBlue => 4,
+        NamedColor::Magenta | NamedColor::DimMagenta => 5,
+        NamedColor::Cyan | NamedColor::DimCyan => 6,
+        NamedColor::White | NamedColor::DimWhite => 7,
+        NamedColor::BrightBlack => 8,
+        NamedColor::BrightRed => 9,
+        NamedColor::BrightGreen => 10,
+        NamedColor::BrightYellow => 11,
+        NamedColor::BrightBlue => 12,
+        NamedColor::BrightMagenta => 13,
+        NamedColor::BrightCyan => 14,
+        NamedColor::BrightWhite | NamedColor::BrightForeground => 15,
+        NamedColor::Foreground => return FG_DEFAULT,
+        NamedColor::Background => return BG,
+        NamedColor::Cursor => return rgb(240, 244, 252),
+        NamedColor::DimForeground => return FG_DEFAULT,
+    };
+    rgb_by_index(i)
+}
+
+fn rgb_by_index(i: usize) -> Hsla {
+    const RGB16: [[u8; 3]; 16] = [
+        [30, 30, 34],
+        [234, 78, 102],
+        [69, 197, 112],
+        [238, 190, 70],
+        [86, 143, 238],
+        [197, 108, 234],
+        [72, 202, 224],
+        [200, 208, 220],
+        [90, 96, 110],
+        [255, 120, 140],
+        [120, 240, 160],
+        [255, 220, 120],
+        [130, 180, 255],
+        [230, 160, 255],
+        [130, 240, 255],
+        [240, 244, 252],
+    ];
+    let c = RGB16[i.min(15)];
+    rgb(c[0], c[1], c[2])
+}
+
+/// xterm 256 色表（内置静态色板）。
+fn palette_color(i: u8) -> Hsla {
+    if i < 16 {
+        return rgb_by_index(i as usize);
+    }
+    if i < 232 {
+        let i = i - 16;
+        let [r, g, b] = [((i / 36) % 6) as u8, ((i / 6) % 6) as u8, (i % 6) as u8];
+        let ch = |v: u8| -> u8 {
+            if v == 0 {
+                0
+            } else {
+                v * 40 + 55
+            }
+        };
+        return rgb(ch(r), ch(g), ch(b));
+    }
+    let v = 8 + (i - 232) * 10;
+    rgb(v, v, v)
+}
+
+fn resolve_color(c: vte::ansi::Color, colors: &Colors, is_fg: bool, flags: Flags) -> Hsla {
+    // OSC10/11/256 改色后的动态覆盖优先，未覆盖时才落回内置色板
+    let base = match c {
+        vte::ansi::Color::Spec(sc) => rgb(sc.r, sc.g, sc.b),
+        vte::ansi::Color::Indexed(i) => match colors[i as usize] {
+            Some(c) => rgb(c.r, c.g, c.b),
+            None => palette_color(i),
+        },
+        vte::ansi::Color::Named(named) => match colors[named] {
+            Some(c) => rgb(c.r, c.g, c.b),
+            None => match named {
+                vte::ansi::NamedColor::Foreground => FG_DEFAULT,
+                vte::ansi::NamedColor::Background => BG,
+                other => named_color(other),
+            },
+        },
+    };
+    let _ = is_fg;
+    // BOLD 前景提亮 +8；DIM 减半
+    if is_fg && flags.contains(Flags::BOLD) {
+        if let vte::ansi::Color::Indexed(i) = c {
+            if i < 8 {
+                return palette_color(i + 8);
+            }
+        }
+    }
+    if flags.contains(Flags::DIM) {
+        hsla(base.h, base.s, base.l * 0.6, base.a)
+    } else {
+        base
+    }
+}
+
+/* ---- 背景/默认色常量（供状态栏等复用） ---- */
+
+pub fn bg_color() -> Hsla {
+    BG
+}
