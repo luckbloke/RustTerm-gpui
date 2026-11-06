@@ -55,6 +55,17 @@ pub struct SessionEntry {
     /// 域（RDP 登录用，可空）
     #[serde(default)]
     pub domain: String,
+    /// RDP 共享给远端的本机目录（RDPDR 驱动器重定向；空 = 不共享）。
+    ///
+    /// 只有 RDP 有这个通道，VNC / SPICE 的会话里该字段恒为空。
+    /// `default` 是必需的：加字段之前写下的 sessions.json 里没有这一项。
+    #[serde(default)]
+    pub share_dir: String,
+    /// 旧版服务器兼容（RDP：禁用 NLA，仅用 TLS）。
+    ///
+    /// `default` 同样是为了兼容没有该字段的旧 `sessions.json`。
+    #[serde(default)]
+    pub legacy_compat: bool,
     #[serde(default = "default_group")]
     pub group: String,
 }
@@ -66,7 +77,8 @@ impl SessionEntry {
     }
 }
 
-fn default_group() -> String {
+/// 会话分组缺省值（新建/反序列化共用，避免两处字面量走偏）。
+pub fn default_group() -> String {
     "默认分组".to_string()
 }
 
@@ -206,6 +218,8 @@ impl SessionStore {
                 auth_method: "password".to_string(),
                 key_path: String::new(),
                 domain: String::new(),
+                share_dir: String::new(),
+                legacy_compat: false,
                 group: default_group(),
             }
         };
@@ -243,5 +257,212 @@ impl SessionStore {
         } else {
             self.sessions.push(entry);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 「恢复上次会话」用的标签快照（last_tabs.json）
+// ---------------------------------------------------------------------------
+
+/// 一个可恢复的标签。
+///
+/// **快照里不存任何密码**：SSH / 远程桌面只记 `session_id`（或主机+账户），
+/// 恢复时回 `sessions.json` 取凭据。这样 `last_tabs.json` 单独泄露也不会多一份
+/// 明文口令 —— 口令本来就只在用户显式「保存密码」时进 sessions.json。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LastTab {
+    /// 本地终端
+    Local,
+    /// PTY 里跑的任意命令（Ping / traceroute 等）
+    Command {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// Telnet（原始 TCP）
+    Tcp { host: String, port: u16 },
+    /// SSH
+    Ssh {
+        host: String,
+        port: u16,
+        user: String,
+        /// 密钥路径（非机密，可以直接存）
+        #[serde(default)]
+        key_path: String,
+        /// 来源会话（有则优先按它取凭据）
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// 内置浏览器
+    Browser { url: String },
+    /// 远程桌面
+    Rd {
+        /// `vnc` / `rdp` / `spice`（见 `RdTabProtocol::key`）
+        protocol: String,
+        host: String,
+        port: u16,
+        #[serde(default)]
+        user: String,
+        #[serde(default)]
+        domain: String,
+        #[serde(default)]
+        share_dir: String,
+        /// 旧版服务器兼容（禁用 NLA，仅用 TLS）
+        #[serde(default)]
+        legacy_compat: bool,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// 本地文件浏览器
+    Files,
+}
+
+/// 上次退出时的标签集合。
+///
+/// 只记「哪些标签开着」，不记分屏内部结构（那是 dock 自己的事）。
+/// 读盘失败一律当空快照处理：这东西丢了最多是少个恢复入口，不该弹错误。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastSession {
+    #[serde(default)]
+    pub tabs: Vec<LastTab>,
+}
+
+impl LastSession {
+    /// 与 sessions.json 同目录（配置目录 / 回退目录都能落）。
+    pub fn path() -> Option<PathBuf> {
+        if let Some(p) = SessionStore::path() {
+            if let Some(dir) = p.parent() {
+                return Some(dir.join("last_tabs.json"));
+            }
+        }
+        SessionStore::fallback_path()
+            .and_then(|p| p.parent().map(|d| d.join("last_tabs.json")))
+    }
+
+    pub fn load() -> Self {
+        let Some(path) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(data) = fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&data).unwrap_or_default()
+    }
+
+    /// 尽力而为地写盘：失败静默（没有恢复入口比每次开标签弹错好）。
+    pub fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        let Ok(data) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let _ = SessionStore::write_json(&path, &data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 老版本写下的 sessions.json 里没有 `share_dir`，
+    /// 读的时候必须靠 `#[serde(default)]` 兜住，否则整个会话列表都解析失败
+    /// （`load` 遇到反序列化错误会直接退回 `seed()`，等于用户会话全丢）。
+    #[test]
+    fn legacy_entry_without_share_dir_loads() {
+        let json = r#"{
+            "sessions": [{
+                "id": "s1", "name": "", "kind": "Rdp", "host": "10.0.0.1", "port": 3389,
+                "user": "u", "password": "p", "auth_method": "password",
+                "key_path": "", "domain": "", "group": "默认分组"
+            }],
+            "recent": ["s1"]
+        }"#;
+        let store: SessionStore = serde_json::from_str(json).expect("老格式应能解析");
+        assert_eq!(store.sessions.len(), 1);
+        assert!(store.sessions[0].share_dir.is_empty());
+    }
+
+    #[test]
+    fn share_dir_roundtrip() {
+        let mut entry = SessionEntry {
+            id: "s2".to_string(),
+            name: String::new(),
+            kind: SessionKind::Rdp,
+            host: "10.0.0.2".to_string(),
+            port: 3389,
+            user: "u".to_string(),
+            password: String::new(),
+            auth_method: "password".to_string(),
+            key_path: String::new(),
+            domain: String::new(),
+            share_dir: r"D:\share".to_string(),
+            legacy_compat: false,
+            group: default_group(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.share_dir, r"D:\share");
+
+        // 清空后也要能存成空串（不是缺失字段）
+        entry.share_dir.clear();
+        let back: SessionEntry = serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert!(back.share_dir.is_empty());
+    }
+
+    /// 标签快照必须能往返，且**不能**把口令带进去。
+    #[test]
+    fn last_session_roundtrip_without_secrets() {
+        let snap = LastSession {
+            tabs: vec![
+                LastTab::Local,
+                LastTab::Tcp {
+                    host: "10.0.0.3".to_string(),
+                    port: 23,
+                },
+                LastTab::Ssh {
+                    host: "10.0.0.4".to_string(),
+                    port: 22,
+                    user: "root".to_string(),
+                    key_path: r"C:\keys\id_ed25519".to_string(),
+                    session_id: Some("s1".to_string()),
+                },
+                LastTab::Rd {
+                    protocol: "rdp".to_string(),
+                    host: "10.0.0.5".to_string(),
+                    port: 3389,
+                    user: "u".to_string(),
+                    domain: String::new(),
+                    share_dir: r"D:\share".to_string(),
+                    legacy_compat: true,
+                    session_id: None,
+                },
+                LastTab::Browser {
+                    url: "https://example.com".to_string(),
+                },
+                LastTab::Files,
+            ],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("password"), "快照里不该出现口令字段: {json}");
+
+        let back: LastSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tabs.len(), 6);
+        match &back.tabs[3] {
+            LastTab::Rd { protocol, share_dir, legacy_compat, .. } => {
+                assert_eq!(protocol, "rdp");
+                assert_eq!(share_dir, r"D:\share");
+                assert!(legacy_compat);
+            }
+            other => panic!("第 4 项应是远程桌面，实际 {other:?}"),
+        }
+    }
+
+    /// 未知/损坏的快照按空处理（老版本多一项也不该让恢复按钮炸掉）。
+    #[test]
+    fn broken_last_session_falls_back_to_empty() {
+        assert!(serde_json::from_str::<LastSession>("not json")
+            .map(|s| s.tabs)
+            .unwrap_or_default()
+            .is_empty());
     }
 }

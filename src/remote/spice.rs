@@ -1,12 +1,23 @@
 //! SPICE 客户端 —— 基于 vendor 的 capsaicin。
 //!
-//! 只维护主 surface（primary）作为桌面画面；光标与多 surface 叠层暂不合成
-//! （与参考实现保持同一取舍）。帧输出仍是 RGBA8 脏矩形。
+//! 画面：主 surface（id 0）作为桌面输出；子 surface 单独维护一份缓冲，
+//! **不合成**到主画面 —— SPICE 把子 surface 贴到主面用的是 draw 通道的
+//! `DRAW_COPY_BITS`，capsaicin 目前把它们归到 `UnhandledDraw`，
+//! 客户端拿不到「贴到哪、贴多大」，硬合成只会把像素画到错误位置。
+//! 子面缓冲留着，等 capsaicin 解析 draw 通道后可以直接接上。
+//!
+//! 光标：走 cursor 通道（`CursorEvent`），转成与 RDP / VNC 相同的
+//! `RdEvent::Cursor` / `CursorPos` / `CursorHidden`，由 UI 侧统一绘制并
+//! 隐藏本地系统光标 —— 否则会出现「两个鼠标」。
+//!
+//! 帧输出仍是 RGBA8 脏矩形。
 
 use anyhow::{anyhow, Result};
 use capsaicin_client::{
-    ClientEvent, DisplayEvent, InputEvent, MouseMode, RegionPixels, SpiceClient, SurfaceFormat,
+    ClientEvent, CursorEvent, DisplayEvent, InputEvent, MouseMode, RegionPixels, SpiceClient,
+    SurfaceFormat,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -164,6 +175,23 @@ impl Fb {
     }
 }
 
+/// SPICE 坐标是 i32（可能为负，光标移出桌面时会给出负值），RdEvent 用 u16。
+fn clamp_pos(v: i32) -> u16 {
+    v.clamp(0, u16::MAX as i32) as u16
+}
+
+/// SPICE 光标位图（Argb8888，内存序 B,G,R,A）→ RGBA8。
+///
+/// 与帧缓冲不同，光标位图的 alpha 是真实透明度（非预乘），必须保留，
+/// 否则光标会画成一块实心方块。
+fn argb_to_rgba(pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len());
+    for px in pixels.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    out
+}
+
 fn convert_px(px: &[u8], format: SurfaceFormat) -> (u8, u8, u8) {
     match format {
         // 内存序 B,G,R,A
@@ -206,6 +234,10 @@ pub async fn run(
 
     let mut fb: Option<Fb> = None;
     let mut fb_format = SurfaceFormat::Xrgb8888;
+    // 子 surface 缓冲（id → 帧）。不参与主画面输出，见文件头说明。
+    let mut subs: HashMap<u32, Fb> = HashMap::new();
+    // 可缓存的光标位图（unique → 宽高/热点/像素）
+    let mut cursor_cache: HashMap<u64, (u16, u16, u16, u16, Vec<u8>)> = HashMap::new();
     let mut dirty: Dirty = None;
     let mut last_frame = Instant::now() - FRAME_INTERVAL;
     let mut buttons: u8 = 0;
@@ -303,6 +335,9 @@ pub async fn run(
                         })
                         .await;
                 }
+                // SPICE 后端尚未实现剪贴板通道（capsaicin-client 没有暴露
+                // 剪贴板接口），开关对本协议暂无效果。
+                RdCommand::Clipboard(_) => {}
             }
         }
 
@@ -310,16 +345,16 @@ pub async fn run(
         match tokio::time::timeout(POLL_INTERVAL, client.next_event()).await {
             Ok(Some(event)) => match event {
                 ClientEvent::Display(DisplayEvent::SurfaceCreated {
+                    id,
                     width,
                     height,
                     format,
                     primary,
-                    ..
                 }) => {
-                    if primary || fb.is_none() {
-                        if width == 0 || height == 0 {
-                            continue;
-                        }
+                    if width == 0 || height == 0 {
+                        continue;
+                    }
+                    if primary || id == 0 || fb.is_none() {
                         // 尺寸没变就不重建，避免把已有画面清零
                         let changed = fb
                             .as_ref()
@@ -331,7 +366,17 @@ pub async fn run(
                             let _ = ev.send(RdEvent::Resized { width, height });
                             dirty = Some((0, 0, width, height));
                         }
+                    } else {
+                        // 子 surface（视频叠加层 / 子窗口）：单独留一份缓冲。
+                        // 合成需要 draw 通道的 destination，capsaicin 还没解析，
+                        // 这里只保证「不把子面的像素当主面画」。
+                        if subs.len() < 16 {
+                            let _ = subs.insert(id, Fb::new(width, height)?);
+                        }
                     }
+                }
+                ClientEvent::Display(DisplayEvent::SurfaceDestroyed { id }) => {
+                    subs.remove(&id);
                 }
                 ClientEvent::Display(DisplayEvent::Mode { width, height, .. }) => {
                     // 分辨率可能在连接后变化（用户改分辨率 / VM 重配）：
@@ -357,6 +402,27 @@ pub async fn run(
                     surface_format,
                 }) => {
                     if surface_id != 0 {
+                        // 子 surface 的绘制落到它自己的缓冲里（不输出、不标脏）
+                        if let Some(f) = subs.get_mut(&surface_id) {
+                            let w = rect.width().max(0) as u32;
+                            let h = rect.height().max(0) as u32;
+                            if w > 0 && h > 0 {
+                                match pixels {
+                                    RegionPixels::Raw { data, stride } => f.blit_raw(
+                                        rect.left,
+                                        rect.top,
+                                        w,
+                                        h,
+                                        &data,
+                                        stride,
+                                        surface_format,
+                                    ),
+                                    RegionPixels::SolidColor(color) => {
+                                        f.fill_solid(rect.left, rect.top, w, h, color)
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
                     let Some(f) = fb.as_mut() else { continue };
@@ -386,12 +452,22 @@ pub async fn run(
                     src_y,
                     dest_rect,
                 }) => {
-                    if surface_id != 0 {
-                        continue;
-                    }
                     let cw = dest_rect.width().max(0) as u32;
                     let ch = dest_rect.height().max(0) as u32;
                     if cw == 0 || ch == 0 {
+                        continue;
+                    }
+                    if surface_id != 0 {
+                        if let Some(f) = subs.get_mut(&surface_id) {
+                            f.copy_rect(
+                                src_x,
+                                src_y,
+                                dest_rect.left,
+                                dest_rect.top,
+                                cw,
+                                ch,
+                            );
+                        }
                         continue;
                     }
                     if let Some(f) = fb.as_mut() {
@@ -456,6 +532,90 @@ pub async fn run(
                         dirty = Some((0, 0, f.width, f.height));
                     }
                 }
+                // ---- 远端光标 ----
+                //
+                // SPICE 的光标走独立通道（位图 + 位置 + 可见性）。不处理的话
+                // 画面上就没有远端指针，只剩本地箭头 —— 在远端桌面里
+                // 「看到箭头但点不准」基本都是这个原因。
+                ClientEvent::Cursor(cursor_evt) => match cursor_evt {
+                    CursorEvent::Set {
+                        x,
+                        y,
+                        hot_x,
+                        hot_y,
+                        width,
+                        height,
+                        pixels,
+                        unique,
+                        cacheable,
+                        visible,
+                    } => {
+                        if cacheable {
+                            cursor_cache.insert(
+                                unique,
+                                (width, height, hot_x, hot_y, pixels.clone()),
+                            );
+                        }
+                        if !visible {
+                            let _ = ev.send(RdEvent::CursorHidden);
+                            continue;
+                        }
+                        if width == 0 || height == 0 || pixels.is_empty() {
+                            // 未解码的形状（旧式单色光标）：干脆退回本地系统光标，
+                            // 总比画面里完全没有指针可用
+                            let _ = ev.send(RdEvent::CursorHidden);
+                            continue;
+                        }
+                        let _ = ev.send(RdEvent::Cursor {
+                            width,
+                            height,
+                            hotspot_x: hot_x,
+                            hotspot_y: hot_y,
+                            rgba: argb_to_rgba(&pixels),
+                        });
+                        let _ = ev.send(RdEvent::CursorPos {
+                            x: clamp_pos(x),
+                            y: clamp_pos(y),
+                        });
+                    }
+                    CursorEvent::SetFromCache {
+                        x,
+                        y,
+                        unique,
+                        visible,
+                    } => {
+                        if !visible {
+                            let _ = ev.send(RdEvent::CursorHidden);
+                            continue;
+                        }
+                        if let Some((w, h, hx, hy, px)) = cursor_cache.get(&unique) {
+                            let _ = ev.send(RdEvent::Cursor {
+                                width: *w,
+                                height: *h,
+                                hotspot_x: *hx,
+                                hotspot_y: *hy,
+                                rgba: argb_to_rgba(px),
+                            });
+                            let _ = ev.send(RdEvent::CursorPos {
+                                x: clamp_pos(x),
+                                y: clamp_pos(y),
+                            });
+                        }
+                    }
+                    CursorEvent::Move { x, y } => {
+                        let _ = ev.send(RdEvent::CursorPos {
+                            x: clamp_pos(x),
+                            y: clamp_pos(y),
+                        });
+                    }
+                    CursorEvent::Hide => {
+                        let _ = ev.send(RdEvent::CursorHidden);
+                    }
+                    CursorEvent::InvalidateOne { unique } => {
+                        cursor_cache.remove(&unique);
+                    }
+                    CursorEvent::InvalidateAll => cursor_cache.clear(),
+                },
                 ClientEvent::MouseMode(mode) => {
                     absolute_mouse = matches!(mode, MouseMode::Client);
                 }

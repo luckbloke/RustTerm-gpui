@@ -138,7 +138,6 @@ impl ConfigPanel {
                     .checked(config.enable_key_macros)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         this.config.enable_key_macros = *checked;
-                        crate::macros::apply_keep_alive();
                         cx.notify();
                     })),
             )
@@ -243,7 +242,8 @@ impl ConfigPanel {
                                     read_str(&this.config_panel, |i| &i.ai_model, cx);
                                 this.config_panel.inputs = None;
                                 this.config_panel.open = false;
-                                crate::macros::apply_keep_alive();
+                                // 心跳间隔立即生效（已在连的会话下个周期就按新值走）
+                                crate::macros::apply_keep_alive(this.config.keep_alive_interval);
                                 // 主题立即生效
                                 let mode = if this.config.theme == "light" {
                                     gpui_kit::component::theme::ThemeMode::Light

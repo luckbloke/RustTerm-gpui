@@ -40,6 +40,16 @@ pub(crate) fn query_information(
         Err(NtStatus::NO_MORE_FILES) if initial_query => (NtStatus::NO_SUCH_FILE, None),
         Err(status) => (status, None),
     };
+    // NyaTerm diagnostic: see `windows::trace_enabled`.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] query-dir class={:#X} path={:?} initial={} file={} -> {status:?}",
+            u32::from(req.file_info_class_lvl.clone()),
+            req.path,
+            req.initial_query,
+            req.device_io_request.file_id,
+        ));
+    }
 
     Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
         ClientDriveQueryDirectoryResponse {

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// AI 提供方。
 ///
@@ -233,6 +234,13 @@ impl AppConfig {
     }
 
     pub fn load() -> Self {
+        let cfg = Self::load_inner();
+        // 心跳间隔做成进程级全局量，见 `keep_alive_interval` 的说明
+        set_keep_alive_interval(cfg.keep_alive_interval);
+        cfg
+    }
+
+    fn load_inner() -> Self {
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
@@ -328,4 +336,26 @@ impl AppConfig {
         }
         Err("主配置目录与程序目录均写入失败（可能被安全软件拦截），请把本程序加入杀毒软件白名单".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Keep-Alive 间隔（进程级全局量）
+// ---------------------------------------------------------------------------
+
+/// 当前生效的 Keep-Alive 间隔（秒；`0` = 关闭）。
+///
+/// 为什么不直接读 `AppConfig`：心跳任务跑在 tokio 里（`backends/ssh.rs`），
+/// 那里没有 GPUI 的 `App`，也拿不到配置面板里的实体。而配置面板改完要求
+/// **已经在跑的会话**也立即按新节奏打心跳，所以只能落在一个全局量上，
+/// 由配置面板写、心跳任务读。
+static KEEP_ALIVE_SECS: AtomicU64 = AtomicU64::new(30);
+
+/// 心跳间隔（秒）。`0` 表示不发心跳。
+pub fn keep_alive_interval() -> u64 {
+    KEEP_ALIVE_SECS.load(Ordering::Relaxed)
+}
+
+/// 设置心跳间隔（配置加载 / 配置面板保存时调用）。
+pub fn set_keep_alive_interval(secs: u64) {
+    KEEP_ALIVE_SECS.store(secs, Ordering::Relaxed);
 }

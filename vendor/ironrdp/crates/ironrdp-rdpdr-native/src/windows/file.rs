@@ -33,7 +33,14 @@ const FILE_OPEN_BY_FILE_ID: u32 = 0x0000_2000;
 const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
 const FILE_OPEN_NO_RECALL: u32 = 0x0040_0000;
 const FILE_OPEN_FOR_FREE_SPACE_QUERY: u32 = 0x0080_0000;
-const ALLOWED_CREATE_OPTIONS: u32 = FILE_DIRECTORY_FILE
+/// Create options this backend honours.
+///
+/// NyaTerm: MSTSC and FreeRDP tolerate create options the client does not
+/// model (Explorer sends hints such as `FILE_NO_INTERMEDIATE_BUFFERING` while
+/// opening a volume). Refusing the whole IRP for such a bit surfaces remotely
+/// as "无法访问 \\tsclient\..." on an otherwise healthy share, so unknown bits
+/// are dropped here instead and the open keeps exactly the same semantics.
+const HONOURED_CREATE_OPTIONS: u32 = FILE_DIRECTORY_FILE
     | FILE_WRITE_THROUGH
     | FILE_SEQUENTIAL_ONLY
     | FILE_SYNCHRONOUS_IO_NONALERT
@@ -69,9 +76,36 @@ const READ_ONLY_MUTATION_ACCESS: u32 = FILE_WRITE_DATA
     | GENERIC_ALL
     | GENERIC_WRITE;
 const MAX_STATIC_IO_SIZE: usize = 1024 * 1024;
+/// NyaTerm: caps a single read response so the total RDPDR message (header +
+/// data) stays well below the server-side virtual-channel reassembly budget.
+///
+/// Empirically the server silently kills the redirected device right after the
+/// first oversized (`0x8000`) read completion, leaving `\\tsclient\...` with
+/// "设备没有连接" (0x8007048F) for every later open and copy. A short read is a
+/// legal partial completion: rdpdr.sys chains another read for the remainder,
+/// exactly as it does at the end of a file.
+const MAX_READ_RESPONSE_DATA: usize = 16 * 1024;
 
 pub(crate) fn create(backend: &mut WindowsRdpdrBackend, req: DeviceCreateRequest) -> PduResult<Vec<SvcMessage>> {
-    let response = match create_inner(backend, &req) {
+    let outcome = create_inner(backend, &req);
+    let status = match &outcome {
+        Ok(_) => NtStatus::SUCCESS,
+        Err(status) => *status,
+    };
+    // NyaTerm diagnostic: the remote shell turns a refused create into
+    // "无法访问 \\tsclient\...", so keep the request fields beside the status.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] create device={} completion={} path={:?} access={:#010X} options={:#010X} disposition={} -> {status:?}",
+            req.device_io_request.device_id,
+            req.device_io_request.completion_id,
+            req.path,
+            req.desired_access.bits(),
+            req.create_options.bits(),
+            u32::from(req.create_disposition),
+        ));
+    }
+    let response = match outcome {
         Ok((file_id, information)) => DeviceCreateResponse {
             device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
             file_id,
@@ -104,6 +138,12 @@ pub(crate) fn close(backend: &mut WindowsRdpdrBackend, req: DeviceCloseRequest) 
     } else {
         NtStatus::INVALID_HANDLE
     };
+    // NyaTerm diagnostic: logged unconditionally so the exact end-of-copy
+    // sequence is visible in the trace file.
+    super::log_diagnostic(format_args!(
+        "[RDPDR] close device={} file={} -> {status:?}",
+        req.device_io_request.device_id, req.device_io_request.file_id
+    ));
 
     messages.push(SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
         device_io_response: DeviceIoResponse::new(req.device_io_request, status),
@@ -125,6 +165,15 @@ pub(crate) fn read(backend: &mut WindowsRdpdrBackend, req: DeviceReadRequest) ->
         Ok(read_data) => (NtStatus::SUCCESS, read_data),
         Err(status) => (status, Vec::new()),
     };
+    if status != NtStatus::SUCCESS {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] read device={} file={} length={} offset={:?} -> {status:?}",
+            req.device_io_request.device_id,
+            req.device_io_request.file_id,
+            req.length,
+            req.offset
+        ));
+    }
 
     Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
         DeviceReadResponse {
@@ -142,6 +191,15 @@ pub(crate) fn write(backend: &mut WindowsRdpdrBackend, req: DeviceWriteRequest) 
         },
         Err(status) => (status, 0),
     };
+    if status != NtStatus::SUCCESS {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] write device={} file={} length={} offset={:?} -> {status:?}",
+            req.device_io_request.device_id,
+            req.device_io_request.file_id,
+            req.write_data.len(),
+            req.offset
+        ));
+    }
 
     Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
         DeviceWriteResponse {
@@ -161,6 +219,13 @@ pub(crate) fn query_information(
         Err(status) => (status, None),
     };
     let response_length = buffer.as_ref().map_or(0, FileInformationClass::size);
+    // NyaTerm diagnostic: see `windows::trace_enabled`.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] query-info class={information_class:#X} file={} -> {status:?}",
+            req.device_io_request.file_id
+        ));
+    }
     debug!(
         information_class,
         ?status,
@@ -181,6 +246,13 @@ pub(crate) fn set_information(
     req: ServerDriveSetInformationRequest,
 ) -> PduResult<Vec<SvcMessage>> {
     let status = set_information_inner(backend, &req).map_or_else(|status| status, |_| NtStatus::SUCCESS);
+    // NyaTerm diagnostic: logged unconditionally so the exact end-of-copy
+    // sequence (timestamps, close) is visible in the trace file.
+    super::log_diagnostic(format_args!(
+        "[RDPDR] set-info class={:?} file={} -> {status:?}",
+        req.set_buffer,
+        req.device_io_request.file_id,
+    ));
     let response = ClientDriveSetInformationResponse::new(&req, status).map_err(|error| encode_err!(error))?;
 
     Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(
@@ -234,7 +306,10 @@ pub(super) fn create_inner(
         create_disposition: u32::from(req.create_disposition),
         // A remote server must not be able to use this hint to exercise the
         // local process's backup or restore privileges during ACL evaluation.
-        create_options: (req.create_options.bits() & !FILE_OPEN_FOR_BACKUP_INTENT) | FILE_SYNCHRONOUS_IO_NONALERT,
+        // Unmodelled hint bits are dropped rather than refused (see
+        // `HONOURED_CREATE_OPTIONS`).
+        create_options: (req.create_options.bits() & HONOURED_CREATE_OPTIONS & !FILE_OPEN_FOR_BACKUP_INTENT)
+            | FILE_SYNCHRONOUS_IO_NONALERT,
     };
     let _security_privilege = security::enable_for_access_system_security(req.desired_access.bits())?;
     let reservation = backend
@@ -292,6 +367,9 @@ fn read_inner(backend: &WindowsRdpdrBackend, req: &DeviceReadRequest) -> Result<
     if length == 0 {
         return Ok(Vec::new());
     }
+
+    // NyaTerm: see `MAX_READ_RESPONSE_DATA`.
+    let length = length.min(MAX_READ_RESPONSE_DATA);
 
     let mut read_data = vec![0; length];
     let completion = file
@@ -499,7 +577,7 @@ fn validate_create_request(req: &DeviceCreateRequest, read_only: bool, is_root: 
     if delete_on_close && desired_access & DELETE == 0 {
         return Err(NtStatus::INVALID_PARAMETER);
     }
-    if create_options & FILE_OPEN_BY_FILE_ID != 0 || create_options & !ALLOWED_CREATE_OPTIONS != 0 {
+    if create_options & FILE_OPEN_BY_FILE_ID != 0 {
         return Err(NtStatus::NOT_SUPPORTED);
     }
     if create_options & FILE_DIRECTORY_FILE != 0 && create_options & FILE_NON_DIRECTORY_FILE != 0 {
@@ -687,6 +765,22 @@ mod tests {
 
             assert_eq!(validate_create_request(&request, false, false), Ok(()));
         }
+    }
+
+    #[test]
+    fn create_requests_drop_unmodelled_hint_options() {
+        // FILE_NO_INTERMEDIATE_BUFFERING | FILE_COMPLETE_IF_OPLOCKED are hints
+        // this backend does not model. Explorer sends them while opening a
+        // redirected volume; refusing the IRP for them hides a healthy share
+        // behind "无法访问 \\tsclient\...".
+        let request = create_request(
+            FILE_READ_ATTRIBUTES,
+            CreateDisposition::FILE_OPEN,
+            0x0000_0008 | 0x0000_0100,
+            r"\example.txt",
+        );
+
+        assert_eq!(validate_create_request(&request, false, false), Ok(()));
     }
 
     #[test]

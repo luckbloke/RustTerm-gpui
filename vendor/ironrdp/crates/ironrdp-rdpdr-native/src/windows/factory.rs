@@ -22,7 +22,7 @@ pub struct RedirectedDrive {
 }
 
 impl RedirectedDrive {
-    /// Creates a drive definition for one full logical Windows volume.
+    /// Creates a drive definition for one local directory (`D:\` or `D:\dir`).
     pub fn new(
         device_id: u32,
         display_name: impl Into<String>,

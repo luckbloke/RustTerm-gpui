@@ -29,6 +29,51 @@ use crate::pdu::efs::ServerDriveIoRequest;
 
 const MAX_PRINTER_WRITE_BYTES: u32 = 16 * 1024 * 1024;
 
+/// NyaTerm diagnostic switch for RDPDR protocol troubleshooting.
+///
+/// The consuming application installs no `tracing` subscriber, so the records
+/// below never reach the console. With `NYATERM_RDPDR_TRACE=1` the announced
+/// device names and every filesystem IRP are printed on stderr.
+fn trace_enabled() -> bool {
+    std::env::var_os("NYATERM_RDPDR_TRACE").is_some()
+}
+
+/// NyaTerm diagnostic sink: prints one diagnostic line on stderr and appends it
+/// to the file named by `NYATERM_RDPDR_LOG` (the host application points that
+/// at its own data directory).
+///
+/// stderr alone is invisible for windowed (`windows_subsystem = "windows"`)
+/// launches, which is exactly how end users run the app while hitting a
+/// misbehaving redirected drive.
+fn log_diagnostic(line: core::fmt::Arguments<'_>) {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    eprintln!("[RDPDR {timestamp}] {line}");
+
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("NYATERM_RDPDR_LOG") else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "[RDPDR {timestamp}] {line}");
+}
+
+/// Decodes the UTF-16LE, NUL-terminated filesystem device name carried in a
+/// `DEVICE_ANNOUNCE` header, for diagnostics.
+fn decode_utf16_name(device_data: &[u8]) -> String {
+    let code_units = device_data
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+
+    String::from_utf16_lossy(&code_units)
+}
+
 /// The RDPDR channel as specified in [\[MS-RDPEFS\]].
 ///
 /// This channel must always be advertised with the "rdpsnd"
@@ -504,6 +549,18 @@ impl Rdpdr {
             }
         }
         self.pending_device_announcements.extend(device_ids);
+        // NyaTerm diagnostic: the announced name is what File Explorer shows as
+        // "<directory> on <computer>"; print it so a wrongly truncated name is
+        // visible without a protocol capture.
+        for device in &device_list {
+            log_diagnostic(format_args!(
+                "[RDPDR] announcing device id={} type={:?} dos_name={:?} full_name={:?}",
+                device.device_id(),
+                device.device_type(),
+                device.preferred_dos_name(),
+                decode_utf16_name(device.device_data()),
+            ));
+        }
         let res = RdpdrPdu::ClientDeviceListAnnounce(ClientDeviceListAnnounce { device_list });
         trace!("sending {:?}", res);
         Ok(vec![SvcMessage::from(res)])
@@ -525,12 +582,20 @@ impl Rdpdr {
             .for_device_type(device_id)
             .map_err(|e| decode_err!(e))?;
         let accepted = pdu.result_code == NtStatus::SUCCESS;
+        // NyaTerm diagnostic: keep the status around for the rejection log below,
+        // since the backend consumes the PDU.
+        let result_code = pdu.result_code;
         self.backend
             .as_mut()
             .ok_or_else(|| pdu_other_err!("missing rdpdr backend"))?
             .handle_server_device_announce_response(pdu)?;
 
         if accepted {
+            // NyaTerm diagnostic: an accepted announce is what makes the server
+            // create "\\tsclient\<name>"; a rejected one is printed below.
+            log_diagnostic(format_args!(
+                "[RDPDR] server accepted device announcement: device_id={device_id}"
+            ));
             self.pending_device_announcements.retain(|id| *id != device_id);
             if !self.active_device_ids.contains(&device_id) {
                 self.active_device_ids.push(device_id);
@@ -550,6 +615,11 @@ impl Rdpdr {
         } else {
             Vec::new()
         };
+        // NyaTerm diagnostic: a rejected redirect is otherwise silent, leaving the
+        // remote session without the expected \\tsclient share.
+        log_diagnostic(format_args!(
+            "[RDPDR] server rejected device announcement: device_id={device_id} result_code={result_code:?}"
+        ));
         self.backend_active_drive_ids.retain(|id| *id != device_id);
         self.pending_device_announcements.retain(|id| *id != device_id);
         let removal_requested = self.pending_drive_removals.contains(&device_id);
@@ -628,16 +698,43 @@ impl Rdpdr {
                         completion_id = dev_io_req.completion_id,
                         "Ignoring filesystem IRP for a rejected device"
                     );
+                    // NyaTerm diagnostic: dropping the IRP leaves the server
+                    // waiting, which surfaces as "无法访问 \\tsclient\...".
+                    log_diagnostic(format_args!(
+                        "[RDPDR] dropping filesystem IRP for rejected device {} file={} completion={} major={:?}",
+                        dev_io_req.device_id, dev_io_req.file_id, dev_io_req.completion_id, dev_io_req.major_function
+                    ));
                     return Ok(Vec::new());
                 }
                 if !self.active_device_ids.contains(&dev_io_req.device_id) {
-                    warn!(
-                        device_id = dev_io_req.device_id,
-                        file_id = dev_io_req.file_id,
-                        completion_id = dev_io_req.completion_id,
-                        "Ignoring filesystem IRP before device announcement confirmation"
-                    );
-                    return Ok(Vec::new());
+                    if self.pending_device_announcements.contains(&dev_io_req.device_id) {
+                        // NyaTerm: real Windows servers race the first filesystem IRP
+                        // against DR_CORE_DEVICE_ANNOUNCE_RSP (observed with a create
+                        // arriving before the confirmation). Dropping it leaves the IRP
+                        // unanswered and the server then reports the whole device as
+                        // disconnected (Explorer: 0x8007048F 设备没有连接) even though
+                        // browsing keeps working, so serve it like mstsc does. The
+                        // backend root is already active (restored at server announce),
+                        // and a later rejection removes the device and cancels its
+                        // deferred operations through remove_drive.
+                        debug!(
+                            device_id = dev_io_req.device_id,
+                            completion_id = dev_io_req.completion_id,
+                            "Serving filesystem IRP before device announcement confirmation"
+                        );
+                    } else {
+                        warn!(
+                            device_id = dev_io_req.device_id,
+                            file_id = dev_io_req.file_id,
+                            completion_id = dev_io_req.completion_id,
+                            "Ignoring filesystem IRP before device announcement confirmation"
+                        );
+                        log_diagnostic(format_args!(
+                            "[RDPDR] dropping filesystem IRP before announcement confirmation: device={} file={} completion={} major={:?}",
+                            dev_io_req.device_id, dev_io_req.file_id, dev_io_req.completion_id, dev_io_req.major_function
+                        ));
+                        return Ok(Vec::new());
+                    }
                 }
                 if dev_io_req.major_function == MajorFunction::DeviceControl {
                     let req = DeviceControlRequest::<AnyIoCtlCode>::decode_with_input_buffer(dev_io_req, src)
@@ -669,6 +766,9 @@ impl Rdpdr {
                 }
 
                 debug!(?req);
+                if trace_enabled() {
+                    eprintln!("[RDPDR] irp {req:?}");
+                }
 
                 Ok(self
                     .backend
@@ -793,7 +893,22 @@ impl SvcProcessor for Rdpdr {
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
         let mut src = ReadCursor::new(payload);
-        let header = SharedHeader::decode(&mut src).map_err(|e| decode_err!(e))?;
+        let header = SharedHeader::decode(&mut src).map_err(|error| {
+            // NyaTerm diagnostic: a decode failure is invisible without a
+            // `tracing` subscriber and would leave the server without a reply.
+            log_diagnostic(format_args!(
+                "[RDPDR] failed to decode {}-byte PDU: {error}",
+                payload.len()
+            ));
+            decode_err!(error)
+        })?;
+        if trace_enabled() {
+            log_diagnostic(format_args!(
+                "[RDPDR] recv {:?} {} bytes",
+                header.packet_id,
+                payload.len()
+            ));
+        }
         if matches!(header.packet_id, PacketId::PrnCacheData | PacketId::PrnUsingXps) {
             warn!(
                 packet_id = ?header.packet_id,
@@ -805,7 +920,7 @@ impl SvcProcessor for Rdpdr {
         let pdu = RdpdrPdu::decode_body(header, &mut src).map_err(|e| decode_err!(e))?;
         debug!("Received {:?}", pdu);
 
-        match pdu {
+        let result = match pdu {
             RdpdrPdu::VersionAndIdPdu(pdu) if pdu.kind == VersionAndIdPduKind::ServerAnnounceRequest => {
                 self.handle_server_announce(pdu)
             }
@@ -840,7 +955,36 @@ impl SvcProcessor for Rdpdr {
             | RdpdrPdu::ClientDriveSetSecurityResponse(_)
             | RdpdrPdu::ClientDriveLockControlResponse(_)
             | RdpdrPdu::EmptyResponse => Err(pdu_other_err!("Rdpdr", "received unexpected packet")),
+        };
+        if trace_enabled() {
+            match &result {
+                Ok(messages) => {
+                    log_diagnostic(format_args!("[RDPDR] -> {} response message(s)", messages.len()));
+                    for message in messages {
+                        match message.encode_unframed_pdu() {
+                            Ok(bytes) => {
+                                let shown = bytes.len().min(96);
+                                let hex = bytes[..shown]
+                                    .iter()
+                                    .map(|byte| format!("{byte:02X}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                log_diagnostic(format_args!(
+                                    "[RDPDR] out {} bytes{}: {hex}",
+                                    bytes.len(),
+                                    if bytes.len() > shown { "+" } else { "" }
+                                ));
+                            }
+                            Err(error) => {
+                                log_diagnostic(format_args!("[RDPDR] out encode failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                Err(error) => log_diagnostic(format_args!("[RDPDR] processing failed: {error}")),
+            }
         }
+        result
     }
 }
 
@@ -1144,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn unconfirmed_or_rejected_drive_irps_are_ignored() {
+    fn unknown_and_rejected_drive_irps_are_ignored() {
         let mut rdpdr = Rdpdr::new(Box::new(TrackingBackend::default()), "test".to_owned())
             .with_drives(Some(vec![(42, "C:".to_owned())]));
         let responses = rdpdr
@@ -1163,9 +1307,21 @@ mod tests {
             .process(&encode_vec(&RdpdrPdu::UserLoggedon).expect("encode user logged on"))
             .expect("process user logged on");
 
+        // NyaTerm: a server may race the first filesystem IRP against the
+        // announcement response; it must still reach the backend. Leaving it
+        // unanswered marks the device disconnected server-side (Explorer
+        // reports 0x8007048F) even though the announcement is accepted.
+        assert_eq!(
+            rdpdr
+                .process(&encoded_drive_io_request(42, 0x100, MajorFunction::Close))
+                .expect("process pre-confirmation drive request")
+                .len(),
+            1
+        );
+
         assert!(
             rdpdr
-                .process(&encoded_drive_io_request(7, 0x100, MajorFunction::Close))
+                .process(&encoded_drive_io_request(7, 0x200, MajorFunction::Close))
                 .expect("process unknown drive request")
                 .is_empty()
         );
@@ -1186,12 +1342,12 @@ mod tests {
                 .process(&encoded_server_device_announce_response(42, NtStatus::ACCESS_DENIED))
                 .is_err()
         );
-        assert!(
+        assert_eq!(
             rdpdr
                 .downcast_backend::<TrackingBackend>()
                 .expect("tracking backend")
-                .drive_requests
-                .is_empty()
+                .drive_requests,
+            vec![(42, 0x100)]
         );
     }
 

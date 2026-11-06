@@ -30,6 +30,12 @@ use crate::backends::{self, TermIo};
 
 const SCROLLBACK: usize = 10_000;
 
+/// 终端 canvas 四周留出的内边距（绘制与鼠标映射共用）。
+///
+/// 放在这里是因为两个使用方都要它：面板视图（`terminal_view.rs`）测尺寸、
+/// 换算列/行；绘制时把文本网格原点同样右移/下移这么多。
+pub const TERM_PAD: f32 = 6.0;
+
 const BG: Hsla = Hsla {
     h: 0.619,
     s: 0.25,
@@ -1047,8 +1053,7 @@ pub struct TermCursor {
 
 /// 一帧终端绘制快照（坐标相对终端原点）。
 #[derive(Clone)]
-pub struct TermSnapshot {
-    pub cell: Size<Pixels>,
+pub struct TermSnapshot {    pub cell: Size<Pixels>,
     /// 与 fit_to 测量时相同的字号（保证 shape_line 推进与列宽一致）
     pub font_size: Pixels,
     pub rows: Vec<TermRow>,
@@ -1061,8 +1066,99 @@ pub struct TermSnapshot {
     pub mouse_mode: bool,
 }
 
+/// 行级 shaping 缓存。
+///
+/// 终端的绘制瓶颈不在「画」而在「排版」：每帧把每一行重新 `shape_line`
+/// （字体 shaping + 字形定位）比上传一次纹理贵得多，而绝大多数行在两帧
+/// 之间**一个字都没变**（真正在变的只有光标行和程序刚输出的那几行）。
+/// 这里按「行文本 + 每段颜色/下划线 + 字号 + 字体族」算一个 64 位 key，
+/// 命中就直接复用上一帧的 `ShapedLine`。
+///
+/// key 只含**内容**、不含行号：滚动时同一行换个位置，依然是命中。
+pub struct LineShapeCache {
+    map: std::collections::HashMap<u64, gpui_kit::ShapedLine>,
+    /// 本帧引用到的 key：超限淘汰时保留它们，避免「刚排好又丢掉」
+    used: std::collections::HashSet<u64>,
+    /// 累计命中 / 未命中（可在状态栏观察缓存是否真的生效）
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl LineShapeCache {
+    pub fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            used: std::collections::HashSet::with_capacity(128),
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// 一帧开始：清掉「本帧用到」的标记。
+    pub fn begin_frame(&mut self) {
+        self.used.clear();
+    }
+
+    /// 一帧结束：超过上限就丢掉本帧没再用到的行。
+    ///
+    /// 不做 LRU：终端缓存的主体就是「当前可见的几十行」，
+    /// 每帧清一次非活跃项已经够用，实现也简单。
+    pub fn end_frame(&mut self) {
+        const LIMIT: usize = 2048;
+        if self.map.len() > LIMIT {
+            let used = &self.used;
+            self.map.retain(|k, _| used.contains(k));
+        }
+    }
+}
+
+impl Default for LineShapeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 把 Hsla 的四个分量打进 hash（`Hsla` 本身没实现 `Hash`）。
+fn hash_color(c: &Hsla, h: &mut std::collections::hash_map::DefaultHasher) {
+    use std::hash::Hash as _;
+    c.h.to_bits().hash(h);
+    c.s.to_bits().hash(h);
+    c.l.to_bits().hash(h);
+    c.a.to_bits().hash(h);
+}
+
+/// 行 key：内容 + 样式 + （由 `base` 携带的）字号与字体族。
+fn line_key(base: u64, row: &TermRow) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = DefaultHasher::new();
+    base.hash(&mut h);
+    for r in &row.runs {
+        r.text.hash(&mut h);
+        hash_color(&r.fg, &mut h);
+        match &r.bg {
+            Some(bg) => {
+                1u8.hash(&mut h);
+                hash_color(bg, &mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        r.underline.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// 把快照绘制到 window（origin 为终端区域原点）。
-pub fn paint_snapshot(snap: &TermSnapshot, origin: GPoint<Pixels>, window: &mut Window, cx: &mut App) {
+///
+/// `cache` 由面板持有（一个终端一份）：这样同一格终端跨帧复用同一批
+/// `ShapedLine`，分屏时各格互不干扰。
+pub fn paint_snapshot(
+    snap: &TermSnapshot,
+    origin: GPoint<Pixels>,
+    cache: &mut LineShapeCache,
+    window: &mut Window,
+    cx: &mut App,
+) {
     // 选区（画在文字下面）
     for b in &snap.sel_quads {
         window.paint_quad(fill(*b + origin, hsla(0.606, 0.55, 0.487, 0.39)));
@@ -1077,31 +1173,59 @@ pub fn paint_snapshot(snap: &TermSnapshot, origin: GPoint<Pixels>, window: &mut 
 
     // 文本
     let font = terminal_font();
+
+    // 与行内容无关的那部分 key（字号 + 字体族），每帧只算一次
+    let base = {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        snap.font_size.as_f32().to_bits().hash(&mut h);
+        crate::fonts::terminal_font_family().hash(&mut h);
+        h.finish()
+    };
+
+    cache.begin_frame();
     for row in &snap.rows {
-        let mut text = String::new();
-        let mut runs: Vec<TextRun> = Vec::new();
-        for r in &row.runs {
-            let byte_len = r.text.len();
-            text.push_str(&r.text);
-            runs.push(TextRun {
-                len: byte_len,
-                font: font.clone(),
-                color: r.fg,
-                background_color: r.bg,
-                underline: None,
-                strikethrough: None,
-            });
+        let key = line_key(base, row);
+        cache.used.insert(key);
+
+        if !cache.map.contains_key(&key) {
+            // 只有未命中才拼字符串 + shaping
+            let mut text = String::new();
+            let mut runs: Vec<TextRun> = Vec::new();
+            for r in &row.runs {
+                let byte_len = r.text.len();
+                text.push_str(&r.text);
+                runs.push(TextRun {
+                    len: byte_len,
+                    font: font.clone(),
+                    color: r.fg,
+                    background_color: r.bg,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            if text.is_empty() {
+                continue;
+            }
+            let shaped = window.text_system().shape_line(
+                SharedString::from(text),
+                snap.font_size,
+                &runs,
+                None,
+            );
+            cache.misses += 1;
+            cache.map.insert(key, shaped);
+        } else {
+            cache.hits += 1;
         }
-        if text.is_empty() {
+
+        let Some(shaped) = cache.map.get(&key) else {
+            continue;
+        };
+        let text_len = shaped.text.len();
+        if text_len == 0 {
             continue;
         }
-        let text_len = text.len();
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            snap.font_size,
-            &runs,
-            None,
-        );
         let line_origin =
             GPoint::new(origin.x, origin.y + px(row.row as f32 * snap.cell.height.as_f32()));
         let _ = shaped.paint(
@@ -1112,9 +1236,9 @@ pub fn paint_snapshot(snap: &TermSnapshot, origin: GPoint<Pixels>, window: &mut 
             window,
             cx,
         );
-        // 下划线
+        // 下划线（按字节占比估算每段的水平位置，与等宽字体一致）
         let mut x = 0.0f32;
-        for (r, _) in row.runs.iter().zip(runs.iter()) {
+        for r in &row.runs {
             let run_w = shaped.width.as_f32() * (r.text.len() as f32 / text_len as f32);
             if r.underline {
                 let ub = Bounds::new(
@@ -1126,6 +1250,7 @@ pub fn paint_snapshot(snap: &TermSnapshot, origin: GPoint<Pixels>, window: &mut 
             x += run_w;
         }
     }
+    cache.end_frame();
 
     // 光标
     if let Some(cur) = &snap.cursor {

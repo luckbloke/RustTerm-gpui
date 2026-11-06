@@ -3,7 +3,7 @@ winresource = "0.1"
 
 [package]
 name = "rustterm-gpui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）"
 
@@ -23,6 +23,8 @@ dirs = "5"
 log = "0.4"
 env_logger = "0.11"
 rfd = "0.15"
+# RDP 剪贴板文件传输：读写系统剪贴板（文本 + 文件列表 CF_HDROP）
+arboard = "3"
 base64 = "0.22"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -48,8 +50,12 @@ capsaicin-client = { path = "vendor/capsaicin/crates/capsaicin-client" }
 # 注意：client-clipboard 必须开——vendor 版 ironrdp-client 的
 # `DirectTransport` 导入被 cfg(feature="clipboard") 包住，关掉会编译失败。
 ironrdp = { path = "vendor/ironrdp/crates/ironrdp", default-features = false, features = [
-    "client", "client-clipboard", "cliprdr", "connector", "core", "input", "pdu", "native-tls"
+    "client", "client-clipboard", "client-rdpdr", "cliprdr", "connector", "core", "input", "pdu", "native-tls"
 ] }
+# RDP 共享目录（文件传输）：RDPDR 通道 + 本地目录后端。
+# 有了它，「把文件拖进远端桌面」等同于把本机某个目录挂成远端的一个盘符，
+# 不用在远端额外跑任何服务。
+ironrdp-rdpdr-native = { path = "vendor/ironrdp/crates/ironrdp-rdpdr-native" }
 
 # 浏览器内核（wry） - 可选
 wry = { version = "0.47", optional = true }
@@ -87,6 +93,11 @@ required-features = ["devtools"]
 [[bin]]
 name = "vncprobe"
 path = "devtools/vncprobe.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "vncpipe"
+path = "devtools/vncpipe.rs"
 required-features = ["devtools"]
 
 [[bin]]

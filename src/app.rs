@@ -18,26 +18,25 @@ use crate::macros::MacroPanel;
 use crate::rdp::{RdTabProtocol, RdpConnectionProfile, RdpProfiles, RemoteDesktopTab};
 use crate::sessions::{SessionKind, SessionStore};
 use crate::sftp::SftpPanel;
-use crate::split::SplitNode;
-use crate::tabs::{PaneId, PaneState, TabContent, TerminalTab};
-use crate::term::{self, SpawnCfg, TermPane, TermSnapshot};
+use crate::tabs::{dock_panels, PendingPane, TabContent, TerminalWorkspace};
+use crate::term::{SpawnCfg, TermPane};
+use crate::terminal_view::TerminalView;
 use crate::ui_icons::ic;
 use crate::widgets::password_field;
 use gpui_kit::base::component_traits::{Disableable as _, Selectable as _};
+use gpui_kit::base::dock::{DockArea, DockPlacement, PanelId};
+use gpui_kit::base::Placement;
 use gpui_kit::base::StyledExt as _;
+use gpui_kit::component::dock::{panel_handle, DockSkin};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::theme::{Theme, ThemeMode};
-use gpui_kit::component::{h_resizable, resizable_panel, v_resizable};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -92,6 +91,10 @@ pub struct AddFormInputs {
     pub password: Entity<InputState>,
     pub key_path: Entity<InputState>,
     pub domain: Entity<InputState>,
+    /// 共享目录（仅 RDP 显示；RDPDR 驱动器重定向）
+    pub share: Entity<InputState>,
+    /// 旧版服务器兼容（仅 RDP：禁用 NLA，只用 TLS）
+    pub legacy_compat: bool,
     pub kind: SessionKind,
     pub auth_key: bool,
     /// Some(id) = 编辑已有会话
@@ -107,23 +110,31 @@ pub struct RustTermApp {
     /// 统一标签页集合（终端 / 浏览器 / 远程桌面 / SFTP）
     pub tabs: Vec<TabContent>,
     pub active: usize,
+    /// 用户自定义的标签标题，与 `tabs` 平行（`None` = 用默认标题）。
+    ///
+    /// 不塞进 `TabContent`：标题是纯展示层信息，不该污染会话状态，
+    /// 也不该跟着终端工作区的 dump/load 一起持久化。
+    pub tab_titles: Vec<Option<String>>,
+    /// 正在被拖动的标签索引（按下未松开；用于拖拽排序）
+    pub tab_drag: Option<usize>,
+    /// 正在重命名的标签索引（双击标签进入）
+    pub tab_rename: Option<usize>,
+    /// 重命名输入框（进入重命名时创建，退出时销毁）
+    pub tab_rename_input: Option<Entity<InputState>>,
     /// 终端键盘焦点
     pub term_focus: Option<FocusHandle>,
     /// 根容器焦点：没有任何标签页时也要有个焦点节点，
     /// 否则按键事件没有分发路径，Ctrl+N / Ctrl+T 等全局快捷键全部失灵。
     pub root_focus: Option<FocusHandle>,
-    /// 本帧各窗格的绘制快照（pane id → 快照，render 阶段生成，canvas 消费）。
-    ///
-    /// 分屏后一屏可能有多个终端，原来「本帧一个 term_snap」的单例假设必须拆掉。
-    pub pane_snaps: HashMap<PaneId, Arc<TermSnapshot>>,
-    /// 各窗格「终端绘制区」上一帧的 bounds（canvas prepaint 写入）。
-    ///
-    /// 两个用途：
-    /// 1. 下一帧按其尺寸 `fit_to`（分屏后各格尺寸不同，不能再用视口估算）；
-    /// 2. 鼠标命中判定 + 列/行换算（取代原来的全局 `TermArea`）。
-    pub pane_areas: HashMap<PaneId, Rc<Cell<Bounds<Pixels>>>>,
-    /// 鼠标按下时锁定的窗格：拖动选区跨出本格后仍然投递给它，直到松开。
-    pub mouse_pane: Option<PaneId>,
+    /// 当前聚焦的终端面板（每帧按窗口焦点刷新；焦点跑到菜单/输入框时保留上一次，
+    /// 所以菜单项、右键菜单、AI 面板都还能作用于「刚才那个终端」）。
+    pub focused_term: Option<WeakEntity<TerminalView>>,
+    /// 工作区 dock 编号（生成 dock id 用）
+    next_workspace_id: usize,
+    /// 上次同步给面板的字号（配置里改了字号时推给所有面板）
+    pushed_font_size: f32,
+    /// 菜单栏发起的窗格操作（下一帧 render 执行：需要 window）
+    pub pending_pane_action: Option<PaneAction>,
 
     // 功能面板
     pub config: AppConfig,
@@ -139,6 +150,12 @@ pub struct RustTermApp {
     next_browser_id: usize,
     pub show_browser_history: bool,
     pub sessions: SessionStore,
+    /// 上次写盘的标签快照（json 文本）。与当前标签对比，变了才落盘。
+    last_snap_json: String,
+    /// 快照节流：render 每帧都跑，落盘两秒一次就够
+    last_snap_at: std::time::Instant,
+    /// 本次运行是否真的有过多标签 —— 免得「一个都没开就退出」把上次的快照冲掉
+    had_tabs: bool,
     pub sidebar_tab: SidebarTab,
     pub selected_session: Option<String>,
     pub search: String,
@@ -236,6 +253,21 @@ pub enum ToolAction {
     PortScan,
 }
 
+/// 菜单栏里发起的窗格操作。
+///
+/// 菜单项的点击回调只有 `&mut App`（拿不到 `&mut Window`），而 dock 的分屏 /
+/// 关闭 / 切标签都需要 window——所以先记下意图，在下一帧 render 里执行。
+/// 与既有的 `pending_new_session` 同一套路。
+#[derive(Clone, Copy, PartialEq)]
+pub enum PaneAction {
+    /// 在聚焦面板旁边分屏
+    Split(Placement),
+    /// 关闭聚焦面板
+    Close,
+    /// 聚焦下一个面板
+    Next,
+}
+
 /// 构造一个下拉菜单项。
 ///
 /// - `action`：仅用于在菜单右侧渲染快捷键提示。点击行为一律由 `op` 决定
@@ -281,11 +313,16 @@ impl RustTermApp {
             runtime,
             tabs: Vec::new(),
             active: 0,
+            tab_titles: Vec::new(),
+            tab_drag: None,
+            tab_rename: None,
+            tab_rename_input: None,
             term_focus: None,
             root_focus: None,
-            pane_snaps: HashMap::new(),
-            pane_areas: HashMap::new(),
-            mouse_pane: None,
+            focused_term: None,
+            next_workspace_id: 1,
+            pushed_font_size: 0.0,
+            pending_pane_action: None,
             config,
             i18n,
             config_panel: ConfigPanel::default(),
@@ -298,6 +335,11 @@ impl RustTermApp {
             next_browser_id: 1,
             show_browser_history: false,
             sessions: SessionStore::load(),
+            // 先把磁盘上的旧快照当基线：首帧标签为空，不这么做会立刻用空快照覆盖它
+            last_snap_json: serde_json::to_string(&crate::sessions::LastSession::load().tabs)
+                .unwrap_or_default(),
+            last_snap_at: std::time::Instant::now(),
+            had_tabs: false,
             sidebar_tab: SidebarTab::Sessions,
             selected_session: None,
             search: String::new(),
@@ -382,7 +424,7 @@ impl RustTermApp {
     pub fn open_local(&mut self) {
         let title = format!("本地 {}", self.tabs.len() + 1);
         match TermPane::new_local(title, 80, 24) {
-            Ok(pane) => self.push_tab(TabContent::Terminal(TerminalTab::new(pane))),
+            Ok(pane) => self.push_tab(TabContent::Terminal(TerminalWorkspace::with_pane(pane))),
             Err(e) => self.set_toast(format!("本地终端启动失败: {e:#}")),
         }
     }
@@ -481,8 +523,10 @@ impl RustTermApp {
     }
 
     pub fn push_tab(&mut self, content: TabContent) {
-        let is_term = content.terminal().is_some();
+        let is_term = content.workspace().is_some();
         self.tabs.push(content);
+        // 与 tabs 平行的自定义标题数组必须同步长高，否则下标会错位
+        self.tab_titles.push(None);
         self.active = self.tabs.len() - 1;
         // 新终端直接吃掉键盘焦点：否则还要用户先点一下终端才能打字
         if is_term {
@@ -590,6 +634,16 @@ impl RustTermApp {
                     username: s.user.clone(),
                     password: s.password.clone(),
                     domain: s.domain.clone(),
+                    // 共享目录随会话走：连上之后远端「我的电脑」里就有这个盘符
+                    share_dir: if proto == RdTabProtocol::Rdp {
+                        s.share_dir.clone()
+                    } else {
+                        String::new()
+                    },
+                    // 旧版服务器兼容也只对 RDP 有意义
+                    legacy_compat: proto == RdTabProtocol::Rdp && s.legacy_compat,
+                    // 记住来源，标签页里改目录能写回这条会话
+                    session_id: Some(s.id.clone()),
                     ..Default::default()
                 };
                 self.rdp_profiles.ensure(profile.clone());
@@ -600,8 +654,316 @@ impl RustTermApp {
         }
     }
 
+    /// 把当前远程桌面标签页里的连接设置写回它来源的那条会话。
+    ///
+    /// 共享目录和「旧版服务器兼容」都有两个入口：会话对话框（本来就存盘）
+    /// 和标签页连接表单。后者原来只是本次运行的临时状态，重启后回落到
+    /// 会话里的旧值 —— 明明是「连同一个会话」，盘符或兼容设置却没了。
+    /// 这里在点「连接」/切换勾选时对齐一次，两处入口以**标签页**为准
+    ///（那是用户刚改的）。
+    ///
+    /// 值没变就不写盘：每次连接都刷一遍 sessions.json 没必要。
+    pub fn persist_rd_settings(&mut self) {
+        let (session_id, share_dir, legacy_compat) = match self.tabs.get(self.active) {
+            Some(TabContent::RemoteDesktop(tab)) => (
+                tab.profile.session_id.clone(),
+                tab.profile.share_dir.clone(),
+                tab.profile.legacy_compat,
+            ),
+            _ => return,
+        };
+        let Some(id) = session_id else { return };
+        let Some(slot) = self.sessions.sessions.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        let mut changed = false;
+        if slot.share_dir != share_dir {
+            slot.share_dir = share_dir;
+            changed = true;
+        }
+        if slot.legacy_compat != legacy_compat {
+            slot.legacy_compat = legacy_compat;
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        if let Err(e) = self.sessions.save() {
+            self.set_toast(e);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 恢复上次会话（last_tabs.json）
+    // ------------------------------------------------------------------
+
+    /// 把当前打开的标签缩成可恢复描述。
+    ///
+    /// 终端工作区只取**第一个**面板的启动方式：分屏的内部结构归 dock 管，
+    /// 这里只负责「这个标签原本是个什么连接」。
+    fn snapshot_tabs(&self, cx: &App) -> Vec<crate::sessions::LastTab> {
+        use crate::sessions::LastTab;
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            match tab {
+                TabContent::Terminal(ws) => {
+                    let Some(dock) = &ws.dock else { continue };
+                    let panels = crate::tabs::dock_panels(dock, cx);
+                    let Some(view) = panels.first() else { continue };
+                    let view = view.read(cx);
+                    let Some(pane) = view.pane_ref() else { continue };
+                    out.push(match &pane.spawn {
+                        crate::term::SpawnCfg::Local => LastTab::Local,
+                        crate::term::SpawnCfg::Command { program, args } => LastTab::Command {
+                            program: program.clone(),
+                            args: args.clone(),
+                        },
+                        crate::term::SpawnCfg::Tcp { host, port } => LastTab::Tcp {
+                            host: host.clone(),
+                            port: *port,
+                        },
+                        crate::term::SpawnCfg::Ssh { host, port, user, auth, .. } => {
+                            let key_path = match auth {
+                                crate::backends::ssh::SshAuth::Key { path, .. } => path.clone(),
+                                _ => String::new(),
+                            };
+                            // 口令不进快照：恢复时按 host/port/user 回会话表找
+                            LastTab::Ssh {
+                                host: host.clone(),
+                                port: *port,
+                                user: user.clone(),
+                                key_path,
+                                session_id: None,
+                            }
+                        }
+                    });
+                }
+                TabContent::Browser(t) => out.push(LastTab::Browser {
+                    url: t.url.clone(),
+                }),
+                TabContent::RemoteDesktop(t) => out.push(LastTab::Rd {
+                    protocol: t.profile.protocol.key().to_string(),
+                    host: t.profile.host.clone(),
+                    port: t.profile.port,
+                    user: t.profile.username.clone(),
+                    domain: t.profile.domain.clone(),
+                    share_dir: t.profile.share_dir.clone(),
+                    legacy_compat: t.profile.legacy_compat,
+                    session_id: t.profile.session_id.clone(),
+                }),
+                TabContent::LocalFiles(_) => out.push(LastTab::Files),
+                // 连接中 / 失败 / 键宏 / 端口扫描没有恢复价值
+                TabContent::Connecting { .. }
+                | TabContent::Failed(_)
+                | TabContent::Macro
+                | TabContent::PortScan => {}
+            }
+        }
+        out
+    }
+
+    /// 每次 render 调一次：标签集合变了就落盘（两秒节流）。
+    fn maybe_save_last_session(&mut self, cx: &App) {
+        if self.tabs.is_empty() && !self.had_tabs {
+            return;
+        }
+        if self.last_snap_at.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        let tabs = self.snapshot_tabs(cx);
+        let json = serde_json::to_string(&tabs).unwrap_or_default();
+        if json == self.last_snap_json {
+            // 内容没变也要推进节流时间，否则下一帧又白算一次
+            self.last_snap_at = std::time::Instant::now();
+            return;
+        }
+        self.had_tabs |= !tabs.is_empty();
+        self.last_snap_json = json;
+        self.last_snap_at = std::time::Instant::now();
+        crate::sessions::LastSession { tabs }.save();
+    }
+
+    /// 恢复上次退出时开着的标签（欢迎页按钮 / 将来也能接到启动参数）。
+    ///
+    /// 凭据一律回 `sessions.json` 取：SSH 用 `session_id` 或主机+账户匹配，
+    /// 远程桌面同理。匹配不到凭据的 SSH 标签**不会**拿空密码去撞，
+    /// 而是跳过并在提示里报个数 —— 静默用错凭据比少恢复一个更难查。
+    pub fn restore_last_session(&mut self, cx: &mut Context<Self>) {
+        use crate::sessions::LastTab;
+        let snap = crate::sessions::LastSession::load();
+        if snap.tabs.is_empty() {
+            self.set_toast("没有可恢复的会话记录");
+            return;
+        }
+        let (mut restored, mut need_login) = (0usize, 0usize);
+        for tab in snap.tabs {
+            match tab {
+                LastTab::Local => {
+                    self.open_local();
+                    restored += 1;
+                }
+                LastTab::Command { program, args } => {
+                    if let Ok(pane) =
+                        TermPane::new_command(program.clone(), &program, &args, 100, 24)
+                    {
+                        self.push_tab(TabContent::Terminal(TerminalWorkspace::with_pane(pane)));
+                        restored += 1;
+                    }
+                }
+                LastTab::Tcp { host, port } => {
+                    self.open_telnet(&host, port);
+                    restored += 1;
+                }
+                LastTab::Ssh { host, port, user, key_path, session_id } => {
+                    let auth = self.resolve_ssh_auth(&host, port, &user, session_id.as_deref(), &key_path);
+                    match auth {
+                        Some(auth) => {
+                            self.submit_ssh(&host, port, &user, auth, None);
+                            restored += 1;
+                        }
+                        None => need_login += 1,
+                    }
+                }
+                LastTab::Browser { url } => {
+                    self.open_browser(&url);
+                    restored += 1;
+                }
+                LastTab::Rd {
+                    protocol,
+                    host,
+                    port,
+                    user,
+                    domain,
+                    share_dir,
+                    legacy_compat,
+                    session_id,
+                } => {
+                    if self.restore_remote_desktop(
+                        &protocol,
+                        host,
+                        port,
+                        user,
+                        domain,
+                        share_dir,
+                        legacy_compat,
+                        session_id,
+                    ) {
+                        restored += 1;
+                    }
+                }
+                LastTab::Files => {
+                    self.open_local_files();
+                    restored += 1;
+                }
+            }
+        }
+        if need_login > 0 {
+            self.set_toast(format!(
+                "已恢复 {restored} 个标签；{need_login} 个 SSH 会话没存密码，请从侧栏重新连接"
+            ));
+        } else {
+            self.set_toast(format!("已恢复 {restored} 个标签"));
+        }
+        cx.notify();
+    }
+
+    /// 恢复 SSH 用的认证信息：会话表里找得到就用它的（可能存了密码），
+    /// 否则退回快照里的密钥路径。都没有 → `None`（调用方跳过这个标签）。
+    fn resolve_ssh_auth(
+        &self,
+        host: &str,
+        port: u16,
+        user: &str,
+        session_id: Option<&str>,
+        key_path: &str,
+    ) -> Option<crate::backends::ssh::SshAuth> {
+        use crate::backends::ssh::SshAuth;
+        let hit = session_id
+            .and_then(|id| self.sessions.by_id(id))
+            .or_else(|| {
+                self.sessions
+                    .sessions
+                    .iter()
+                    .find(|s| s.host == host && s.port == port && s.user == user)
+            });
+        if let Some(s) = hit {
+            if s.uses_key() && !s.key_path.is_empty() {
+                return Some(SshAuth::Key {
+                    path: s.key_path.clone(),
+                    passphrase: String::new(),
+                });
+            }
+            if !s.password.is_empty() {
+                return Some(SshAuth::Password(s.password.clone()));
+            }
+        }
+        // 会话里没有（或没存密码）：临时连的会话只剩密钥路径可用
+        if !key_path.is_empty() {
+            return Some(SshAuth::Key {
+                path: key_path.to_string(),
+                passphrase: String::new(),
+            });
+        }
+        None
+    }
+
+    /// 远程桌面标签的恢复：有来源会话就复用它的密码，然后直接重连；
+    /// 没有就只把表单填好，等用户点连接（不猜密码）。
+    fn restore_remote_desktop(
+        &mut self,
+        protocol: &str,
+        host: String,
+        port: u16,
+        user: String,
+        domain: String,
+        share_dir: String,
+        legacy_compat: bool,
+        session_id: Option<String>,
+    ) -> bool {
+        let Some(proto) = RdTabProtocol::from_key(protocol) else {
+            return false;
+        };
+        let password = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.by_id(id))
+            .map(|s| s.password.clone())
+            .or_else(|| {
+                self.sessions
+                    .sessions
+                    .iter()
+                    .find(|s| s.host == host && s.port == port)
+                    .map(|s| s.password.clone())
+            })
+            .unwrap_or_default();
+        let name = if host.is_empty() {
+            format!("恢复的 {}", proto.label())
+        } else {
+            format!("{} {}:{}", proto.label(), host, port)
+        };
+        let profile = RdpConnectionProfile {
+            name,
+            protocol: proto,
+            host,
+            port,
+            username: user,
+            password: password.clone(),
+            domain,
+            share_dir,
+            legacy_compat,
+            session_id,
+            ..Default::default()
+        };
+        let mut tab = RemoteDesktopTab::new(profile);
+        // 有密码（说明来自会话）才自动连；否则停在表单上让用户确认
+        if !password.is_empty() {
+            tab.connect();
+        }
+        self.push_tab(TabContent::RemoteDesktop(tab));
+        true
+    }
+
     /// 执行工具栏 / 侧栏的动作。
-    pub fn run_tool_action(&mut self, action: ToolAction) {
+    pub fn run_tool_action(&mut self, action: ToolAction, cx: &mut Context<Self>) {
         match action {
             ToolAction::LocalTerminal => self.open_local(),
             ToolAction::SshClient => {
@@ -628,8 +990,8 @@ impl RustTermApp {
                 self.ping_open = true;
                 self.focus_dialog = true;
             }
-            ToolAction::Find => self.toggle_find(),
-            ToolAction::Sync => self.toggle_sync_input(),
+            ToolAction::Find => self.toggle_find(cx),
+            ToolAction::Sync => self.toggle_sync_input(cx),
             ToolAction::Batch => {
                 self.batch_open = true;
                 self.focus_dialog = true;
@@ -641,76 +1003,61 @@ impl RustTermApp {
     }
 
     /// 打开/关闭终端查找栏。打开时把焦点交给查找输入框。
-    pub fn toggle_find(&mut self) {
-        if self.tabs.get(self.active).and_then(|t| t.terminal()).is_none() {
-            self.set_toast("查找仅对终端标签页可用");
+    pub fn toggle_find(&mut self, cx: &mut App) {
+        if self.focused_view(cx).is_none() {
+            self.set_toast("查找仅对终端可用（先点一下某个终端窗格）");
             return;
         }
         self.find_open = !self.find_open;
         if self.find_open {
             self.find_focus = true;
         } else {
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-            if let Some(pane) = self.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                pane.clear_search();
+            if let Some(view) = self.focused_view(cx) {
+                view.update(cx, |v, _| v.clear_search());
             }
             self.focus_term = true;
         }
     }
 
-    pub fn toggle_sync_input(&mut self) {        self.sync_input = !self.sync_input;
+    pub fn toggle_sync_input(&mut self, cx: &mut App) {        self.sync_input = !self.sync_input;
         if self.sync_input {
             let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
             self.sync_tx = Some(tx);
             self.sync_rx = Some(rx);
-            self.set_toast("同步输入已开启：活动终端的按键会复制到其它终端");
+            self.set_toast("同步输入已开启：聚焦窗格的按键会复制到其它终端");
         } else {
             self.sync_tx = None;
             self.sync_rx = None;
-            // 分屏后一屏可能有多个窗格，全部解除镜像
-            for tab in self.tabs.iter_mut() {
-                let Some(t) = tab.terminal_tab_mut() else {
-                    continue;
-                };
-                for slot in t.panes.iter_mut() {
-                    if let PaneState::Live(pane) = &mut slot.state {
-                        pane.mirror = None;
-                    }
-                }
+            // 分屏后一屏可能有多个终端，全部解除镜像
+            for view in self.all_term_views(cx) {
+                view.update(cx, |v, _| v.set_mirror(None));
             }
             self.set_toast("同步输入已关闭");
         }
     }
 
-    pub fn pump_sync_input(&mut self) {
+    pub fn pump_sync_input(&mut self, cx: &mut App) {
         if !self.sync_input {
             return;
         }
         let Some(tx) = self.sync_tx.clone() else {
             return;
         };
-        let active_tab = self.active.min(self.tabs.len().saturating_sub(1));
-        let active_pane = self.active_pane_id();
+        let source = self.focused_view(cx);
+        let views = self.all_term_views(cx);
 
-        // 镜像源只有一个：活动标签的**活动窗格**；其余窗格（含同一标签的其它分屏）
-        // 都要清掉，否则上个来源的按键会被继续复制出去
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let Some(t) = tab.terminal_tab_mut() else {
-                continue;
-            };
-            for slot in t.panes.iter_mut() {
-                let PaneState::Live(pane) = &mut slot.state else {
-                    continue;
-                };
-                let is_source = i == active_tab && Some(slot.id) == active_pane;
+        // 镜像源只有一个：当前聚焦的终端；其余终端都要清掉，
+        // 否则上个来源的按键会被继续复制出去
+        for view in &views {
+            let is_source = source.as_ref().map(|s| s == view).unwrap_or(false);
+            let tx = tx.clone();
+            view.update(cx, |v, _| {
                 if is_source {
-                    if pane.mirror.is_none() {
-                        pane.mirror = Some(tx.clone());
-                    }
-                } else if pane.mirror.is_some() {
-                    pane.mirror = None;
+                    v.set_mirror(Some(tx));
+                } else {
+                    v.set_mirror(None);
                 }
-            }
+            });
         }
 
         let mut batch: Vec<Vec<u8>> = Vec::new();
@@ -722,25 +1069,16 @@ impl RustTermApp {
         if batch.is_empty() {
             return;
         }
-        // 分发到除镜像源之外的每一个窗格
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            let Some(t) = tab.terminal_tab_mut() else {
+        // 分发到除镜像源之外的每一个终端
+        for view in &views {
+            if source.as_ref().map(|s| s == view).unwrap_or(false) {
                 continue;
-            };
-            for slot in t.panes.iter_mut() {
-                let PaneState::Live(pane) = &mut slot.state else {
-                    continue;
-                };
-                if i == active_tab && Some(slot.id) == active_pane {
-                    continue;
-                }
-                if pane.dead {
-                    continue;
-                }
-                for b in &batch {
-                    pane.write_input_local(b.clone());
-                }
             }
+            view.update(cx, |v, _| {
+                for b in &batch {
+                    v.write_input_local(b.clone());
+                }
+            });
         }
     }
 
@@ -753,7 +1091,7 @@ impl RustTermApp {
         let title = format!("Telnet {host}:{port}");
         match TermPane::new_tcp(title, host.clone(), port, 80, 24) {
             Ok(pane) => {
-                self.push_tab(TabContent::Terminal(TerminalTab::new(pane)));
+                self.push_tab(TabContent::Terminal(TerminalWorkspace::with_pane(pane)));
                 self.set_toast(format!("已连接 {host}:{port}"));
             }
             Err(e) => self.set_toast(format!("Telnet 连接失败: {e:#}")),
@@ -772,63 +1110,161 @@ impl RustTermApp {
         let (program, args) = ("ping", vec![host.clone()]);
 
         match TermPane::new_command(format!("Ping {host}"), program, &args, 100, 24) {
-            Ok(pane) => self.push_tab(TabContent::Terminal(TerminalTab::new(pane))),
+            Ok(pane) => self.push_tab(TabContent::Terminal(TerminalWorkspace::with_pane(pane))),
             Err(e) => self.set_toast(format!("Ping 启动失败: {e:#}")),
         }
     }
 
     // ------------------------------------------------------------------
-    // 分屏（轻量版）：只做「分」与「关」，不做拖拽换位 / 布局持久化
+    // 终端面板：创建 / 分屏 / 关闭（布局全部交给 dock）
     // ------------------------------------------------------------------
 
-    /// 当前活动标签对应的终端标签页（仅终端返回）。
-    pub fn active_terminal_tab_mut(&mut self) -> Option<&mut TerminalTab> {
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut())
+    /// 当前聚焦的终端面板。
+    ///
+    /// `focused_term` 由每帧的 [`Self::track_terminal_focus`] 维护：焦点落在某个
+    /// 终端上就记住它；焦点跑去菜单 / 输入框时**保留上一次**，这样右键菜单、
+    /// 菜单栏项、AI 面板仍作用于「刚才那个终端」。
+    pub fn focused_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
+        let view = self.focused_term.as_ref()?.upgrade()?;
+        // 实体可能刚被 dock 移除，用「还在某个工作区的面板里」再确认一次
+        if self.all_term_views(cx).iter().any(|v| v == &view) {
+            Some(view)
+        } else {
+            None
+        }
     }
 
-    /// 在活动窗格旁边分屏。
-    ///
-    /// - `axis`：横向 = 左右并排，纵向 = 上下叠放；`before` = 新窗格放左/上。
-    /// - 新窗格**复制当前窗格的启动配置**（`SpawnCfg`），所以「分屏」得到的是
-    ///   同一个 SSH 主机 / 同一条命令的另一个会话，而不是一个空白本地终端。
-    /// - SSH 要建链，不能卡住 UI：走后台线程 + `PaneState::Connecting` 占位，
-    ///   连上后由 `poll_connecting` 换入。
-    pub fn split_active_pane(&mut self, axis: Axis, before: bool, cx: &mut Context<Self>) {
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
+    /// 所有工作区里的全部终端面板（批量执行 / 同步输入 / 焦点跟踪用）。
+    pub fn all_term_views(&self, cx: &App) -> Vec<Entity<TerminalView>> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            if let Some(dock) = tab.workspace().and_then(|ws| ws.dock.as_ref()) {
+                out.extend(dock_panels(dock, cx));
+            }
+        }
+        out
+    }
 
-        // 先只读地把「分谁、按什么配置分」取出来，避免后面 &mut self 冲突
-        let Some((target, spawn, cols, rows, title)) = self
+    /// 某个标签（工作区）里的第一个终端面板。
+    fn tab_first_view(&self, tab: usize, cx: &App) -> Option<Entity<TerminalView>> {
+        let ws = self.tabs.get(tab)?.workspace()?;
+        dock_panels(ws.dock.as_ref()?, cx).into_iter().next()
+    }
+
+    /// 当前活动标签对应的 dock 区域（仅终端标签返回）。
+    pub fn active_workspace_dock(&self) -> Option<Entity<DockArea>> {
+        self.tabs
+            .get(self.active.min(self.tabs.len().saturating_sub(1)))
+            .and_then(|t| t.workspace())
+            .and_then(|ws| ws.dock.clone())
+    }
+
+    /// 首帧把工作区的 dock 建起来，并把排队的面板装进去。
+    ///
+    /// dock 需要 `&mut Window`、面板实体需要 `&mut App`，而「新建终端」是从菜单 /
+    /// 快捷键发起的（两者都没有），所以面板先排队，在这里统一落地。
+    fn ensure_workspace_dock(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let need_build = self
             .tabs
             .get(idx)
-            .and_then(|t| t.terminal_tab())
-            .and_then(|tab| {
-                let pane = tab.active_pane()?;
-                Some((
-                    tab.active_id(),
-                    pane.spawn.clone(),
-                    pane.dims.cols,
-                    pane.dims.rows,
-                    pane.title.clone(),
-                ))
-            })
-        else {
-            self.set_toast("分屏仅对已连接的终端窗格有效");
+            .and_then(|t| t.workspace())
+            .map(|ws| ws.dock.is_none())
+            .unwrap_or(false);
+        if !need_build {
             return;
+        }
+
+        let id = format!("rustterm-term-{}", self.next_workspace_id);
+        self.next_workspace_id += 1;
+        let (area, skin) = DockSkin::dock_area(id, Some(1), window, cx);
+
+        let pendings = {
+            let Some(ws) = self.tabs.get_mut(idx).and_then(|t| t.workspace_mut()) else {
+                return;
+            };
+            ws.dock = Some(area.clone());
+            ws.skin = Some(skin);
+            std::mem::take(&mut ws.pending)
         };
 
-        let runtime = self.runtime.clone();
-        let made: Result<PaneState, String> = match spawn {
+        let font_size = self.config.font_size;
+        let mut created: Vec<(Entity<TerminalView>, bool)> = Vec::new();
+        for pending in pendings {
+            let (view, is_ssh) = match pending {
+                PendingPane::Ready(pane) => {
+                    let is_ssh = matches!(pane.spawn, SpawnCfg::Ssh { .. });
+                    (TerminalView::entity(pane, font_size, cx), is_ssh)
+                }
+                PendingPane::Connecting { title, rx } => (
+                    TerminalView::connecting(title, rx, font_size, cx),
+                    true,
+                ),
+            };
+            created.push((view.clone(), is_ssh));
+            area.update(cx, |area, acx| {
+                area.add_panel_view(
+                    panel_handle(view.clone()),
+                    DockPlacement::Center,
+                    None,
+                    window,
+                    acx,
+                );
+            });
+        }
+
+        // 新终端直接吃掉键盘焦点（否则还要先点一下才能打字）
+        if let Some((view, _)) = created.first() {
+            let handle = view.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            self.focused_term = Some(view.downgrade());
+        }
+
+        // SSH 会话就绪：执行「连接时」宏（与旧的整标签连接行为一致）
+        let macro_idxs = self.macros.get_on_connect_macros();
+        if !macro_idxs.is_empty() {
+            for (view, is_ssh) in &created {
+                if !*is_ssh {
+                    continue;
+                }
+                let mut bytes: Vec<Vec<u8>> = Vec::new();
+                for i in &macro_idxs {
+                    if let Some(b) = self.macros.send_macro_bytes(*i) {
+                        bytes.push(b);
+                    }
+                }
+                if bytes.is_empty() {
+                    continue;
+                }
+                view.update(cx, |v, _| {
+                    for b in &bytes {
+                        v.write_input(b.clone());
+                    }
+                });
+            }
+        }
+    }
+
+    /// 按启动配置造一个终端面板（SSH 走后台线程，先显示「连接中」占位）。
+    fn build_pane(
+        &self,
+        spawn: SpawnCfg,
+        cols: u16,
+        rows: u16,
+        title: String,
+        cx: &mut App,
+    ) -> Result<Entity<TerminalView>, String> {
+        let font_size = self.config.font_size;
+        match spawn {
             SpawnCfg::Local => TermPane::new_local(title, cols, rows)
-                .map(PaneState::Live)
+                .map(|p| TerminalView::entity(p, font_size, cx))
                 .map_err(|e| format!("分屏失败: {e:#}")),
             SpawnCfg::Command { program, args } => {
                 TermPane::new_command(title, &program, &args, cols, rows)
-                    .map(PaneState::Live)
+                    .map(|p| TerminalView::entity(p, font_size, cx))
                     .map_err(|e| format!("分屏失败: {e:#}"))
             }
             SpawnCfg::Tcp { host, port } => TermPane::new_tcp(title, host, port, cols, rows)
-                .map(PaneState::Live)
+                .map(|p| TerminalView::entity(p, font_size, cx))
                 .map_err(|e| format!("分屏失败: {e:#}")),
             SpawnCfg::Ssh {
                 host,
@@ -838,6 +1274,7 @@ impl RustTermApp {
                 jump,
             } => {
                 let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<TermPane>>();
+                let runtime = self.runtime.clone();
                 let tab_title = title.clone();
                 std::thread::spawn(move || {
                     let result = runtime.block_on(TermPane::new_ssh(
@@ -845,42 +1282,86 @@ impl RustTermApp {
                     ));
                     let _ = tx.send(result);
                 });
-                Ok(PaneState::Connecting { title, rx })
+                Ok(TerminalView::connecting(title, rx, font_size, cx))
             }
-        };
-
-        match made {
-            Ok(state) => {
-                let mut split = false;
-                {
-                    if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                        split = tab.split_with(target, axis, state, before).is_some();
-                    }
-                }
-                if split {
-                    self.focus_term = true;
-                    cx.notify();
-                } else {
-                    self.set_toast("分屏失败：目标窗格已不存在");
-                }
-            }
-            Err(e) => self.set_toast(e),
         }
     }
 
-    /// 关闭当前窗格。只剩一个窗格时不做任何事（提示用 Ctrl+W 关标签）。
-    pub fn close_active_pane(&mut self, cx: &mut Context<Self>) {
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        let Some((target, panes)) = self
-            .tabs
-            .get(idx)
-            .and_then(|t| t.terminal_tab())
-            .map(|tab| (tab.active_id(), tab.layout.len()))
-        else {
+    /// 在当前聚焦面板旁边分屏（`placement` 决定方向）。
+    ///
+    /// 新面板**复制当前会话的启动配置**：SSH 会另起一条连接（不共享通道），
+    /// 本地 / Telnet / 命令同样照搬。
+    pub fn split_focused(
+        &mut self,
+        placement: Placement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.focused_view(cx) else {
+            self.set_toast("分屏需要先有一个终端窗格");
             return;
         };
-        if panes <= 1 {
-            self.set_toast("只有一个窗格：用 Ctrl+W 关闭整个标签");
+        let Some(dock) = self.active_workspace_dock() else {
+            return;
+        };
+        let picked = {
+            let v = view.read(cx);
+            v.spawn().cloned().map(|spawn| {
+                let (cols, rows) = v.dims();
+                (spawn, cols, rows, v.title())
+            })
+        };
+        let Some((spawn, cols, rows, title)) = picked else {
+            self.set_toast("该窗格还没连上，稍后再分屏");
+            return;
+        };
+
+        let new_view = match self.build_pane(spawn, cols, rows, title, cx) {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_toast(e);
+                return;
+            }
+        };
+
+        let target = PanelId::from(view.entity_id());
+        let new_id = PanelId::from(new_view.entity_id());
+        let node = dock
+            .read(cx)
+            .layout(DockPlacement::Center)
+            .and_then(|tree| tree.find_panel_node(target));
+        let handle = new_view.read(cx).focus_handle(cx);
+        dock.update(cx, |area, acx| {
+            // 先入区（成为同组标签），再挪到目标节点旁边成为分割
+            area.add_panel_view(
+                panel_handle(new_view.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                acx,
+            );
+            if let Some(node) = node {
+                area.split_at(node, new_id, placement, window, acx);
+            }
+        });
+        window.focus(&handle, cx);
+        self.focused_term = Some(new_view.downgrade());
+        cx.notify();
+    }
+
+    /// 关闭当前聚焦的终端面板；只剩一个面板时等价于关闭整个工作区标签。
+    pub fn close_focused_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.focused_view(cx) else {
+            self.set_toast("没有可关闭的终端窗格");
+            return;
+        };
+        let Some(dock) = self.active_workspace_dock() else {
+            return;
+        };
+        if dock_panels(&dock, cx).len() <= 1 {
+            let idx = self.active.min(self.tabs.len().saturating_sub(1));
+            self.close_tab(idx, cx);
+            window.blur(cx);
             return;
         }
 
@@ -892,111 +1373,146 @@ impl RustTermApp {
             }
         }
         if !bytes.is_empty() {
-            if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                if let Some(pane) = tab.pane_mut(target) {
-                    for b in bytes {
-                        pane.write_input(b);
-                    }
+            view.update(cx, |v, _| {
+                for b in &bytes {
+                    v.write_input(b.clone());
                 }
-            }
+            });
         }
 
-        let mut removed = false;
-        {
-            if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                removed = tab.remove(target);
-            }
+        dock.update(cx, |area, acx| {
+            area.remove_panel(view.clone(), window, acx);
+        });
+
+        // 焦点交给剩下的第一个面板
+        if let Some(next) = dock_panels(&dock, cx).first() {
+            let handle = next.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            self.focused_term = Some(next.downgrade());
         }
-        if removed {
-            self.focus_term = true;
-            cx.notify();
+        cx.notify();
+    }
+
+    /// 每帧记录键盘焦点落在哪个终端面板上。
+    ///
+    /// 焦点不在任何终端上（菜单 / 输入框 / 浏览器）时**保留上一次**：菜单项与
+    /// 右键菜单在点击瞬间已经不再持有终端焦点，但仍要作用于刚才那个终端。
+    fn track_terminal_focus(&mut self, window: &Window, cx: &App) {
+        let Some(handle) = window.focused(cx) else {
+            return;
+        };
+        for view in self.all_term_views(cx) {
+            if view.read(cx).focus_handle(cx) == handle {
+                self.focused_term = Some(view.downgrade());
+                return;
+            }
         }
     }
 
-    /// 把焦点切到下一个窗格（只有一个窗格时无操作）。
-    pub fn focus_next_pane(&mut self, cx: &mut Context<Self>) {
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        let mut moved = false;
-        {
-            if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                let ids = tab.leaf_ids();
-                if ids.len() > 1 {
-                    let cur = ids.iter().position(|id| *id == tab.active).unwrap_or(0);
-                    tab.active = ids[(cur + 1) % ids.len()];
-                    moved = true;
-                }
-            }
+    /// 在同一个工作区内把焦点切到下一个终端面板（dock 切标签 + 键盘焦点）。
+    pub fn focus_next_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dock) = self.active_workspace_dock() else {
+            return;
+        };
+        let panels = dock_panels(&dock, cx);
+        if panels.len() < 2 {
+            return;
         }
-        if moved {
-            self.focus_term = true;
-            cx.notify();
-        }
+        let cur = self
+            .focused_view(cx)
+            .and_then(|v| panels.iter().position(|p| p == &v))
+            .unwrap_or(0);
+        let next = panels[(cur + 1) % panels.len()].clone();
+        let id = PanelId::from(next.entity_id());
+        let handle = next.read(cx).focus_handle(cx);
+        dock.update(cx, |area, acx| area.select_panel(id, window, acx));
+        window.focus(&handle, cx);
+        self.focused_term = Some(next.downgrade());
+        cx.notify();
     }
 
-    /// 活动标签是否可分屏（菜单项置灰用）。
-    pub fn can_split(&self) -> bool {
-        self.tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            .and_then(|t| t.terminal_tab())
-            .map(|tab| tab.active_pane().is_some())
+    /// 是否有可操作的终端面板（菜单项置灰用）。
+    pub fn can_split(&self, cx: &App) -> bool {
+        self.focused_view(cx).is_some()
+    }
+
+    /// 当前工作区是否多于一个终端面板（「关闭当前窗格」菜单项置灰用）。
+    pub fn has_multiple_panes(&self, cx: &App) -> bool {
+        self.active_workspace_dock()
+            .map(|dock| dock_panels(&dock, cx).len() > 1)
             .unwrap_or(false)
     }
 
-    /// 活动标签是否有多个窗格（「关闭当前窗格」菜单项置灰用）。
-    pub fn has_multiple_panes(&self) -> bool {
-        self.tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            .and_then(|t| t.terminal_tab())
-            .map(|tab| tab.layout.len() > 1)
-            .unwrap_or(false)
-    }
-
-    pub fn send_batch_command(&mut self, cmd: String) {
+    pub fn send_batch_command(&mut self, cmd: String, cx: &mut App) {
         let cmd = cmd.trim().to_string();
         if cmd.is_empty() {
             return;
         }
+        // 批量执行覆盖**每一个**终端面板（分屏、各工作区都算）
+        let views = self.all_term_views(cx);
         let mut n = 0usize;
-        for tab in self.tabs.iter_mut() {
-            let Some(t) = tab.terminal_tab_mut() else {
-                continue;
-            };
-            // 批量执行覆盖**每一个**终端窗格（分屏也算各自的会话）
-            for slot in t.panes.iter_mut() {
-                let PaneState::Live(pane) = &mut slot.state else {
-                    continue;
-                };
-                if pane.dead {
-                    continue;
+        for view in &views {
+            view.update(cx, |v, _| {
+                if !v.is_dead() {
+                    v.write_input_local(format!("{cmd}\r").into_bytes());
+                    n += 1;
                 }
-                pane.write_input_local(format!("{cmd}\r").into_bytes());
-                n += 1;
-            }
+            });
         }
         self.batch_open = false;
         self.set_toast(format!("已把命令发送到 {n} 个终端"));
     }
 
-    pub fn send_macro_to_active(&mut self, idx: usize) {
-        if let Some(bytes) = self.macros.send_macro_bytes(idx) {
-            if let Some(pane) = self.tabs.get_mut(self.active).and_then(|t| t.terminal_mut()) {
-                if !pane.dead {
-                    pane.write_input(bytes);
-                    self.set_toast("宏已发送到当前终端");
-                }
+    pub fn send_macro_to_active(&mut self, idx: usize, cx: &mut App) {
+        let Some(bytes) = self.macros.send_macro_bytes(idx) else {
+            return;
+        };
+        let target = self.focused_view(cx).or_else(|| self.tab_first_view(self.active, cx));
+        let Some(view) = target else {
+            return;
+        };
+        let sent = view.update(cx, |v, _| {
+            if v.is_dead() {
+                return false;
             }
+            v.write_input(bytes);
+            true
+        });
+        if sent {
+            self.set_toast("宏已发送到当前终端");
         }
     }
 
-    pub fn close_tab(&mut self, index: usize) {
+    pub fn close_tab(&mut self, index: usize, cx: &mut App) {
         if index < self.tabs.len() {
             // 关闭前先执行「断开时」宏（如 exit / 清理命令）——
             // 字节已经进了 SSH 通道的发送队列，随后标签被销毁不影响投递。
-            if matches!(self.tabs[index], TabContent::Terminal(_)) {
-                self.run_trigger_macros(crate::macros::TriggerKind::OnDisconnect, index);
+            if self.tabs[index].workspace().is_some() {
+                let mut bytes: Vec<Vec<u8>> = Vec::new();
+                for i in self.macros.get_on_disconnect_macros() {
+                    if let Some(b) = self.macros.send_macro_bytes(i) {
+                        bytes.push(b);
+                    }
+                }
+                if !bytes.is_empty() {
+                    if let Some(view) = self.tab_first_view(index, cx) {
+                        view.update(cx, |v, _| {
+                            for b in &bytes {
+                                v.write_input(b.clone());
+                            }
+                        });
+                    }
+                }
             }
             self.tabs[index].shutdown();
             self.tabs.remove(index);
+            if index < self.tab_titles.len() {
+                self.tab_titles.remove(index);
+            }
+            // 关标签后重命名态一律作废：索引已经不可信
+            self.tab_rename = None;
+            self.tab_rename_input = None;
+            self.tab_drag = None;
             if !self.tabs.is_empty() {
                 self.active = if index <= self.active {
                     self.active.saturating_sub(1).min(self.tabs.len() - 1)
@@ -1026,25 +1542,22 @@ impl RustTermApp {
         }
         let tab = self.tabs.remove(from);
         self.tabs.insert(ins, tab);
+        // 自定义标题跟着走，否则重命名会「粘」在原来的位置上
+        if from < self.tab_titles.len() && ins <= self.tab_titles.len() {
+            let title = self.tab_titles.remove(from);
+            self.tab_titles.insert(ins, title);
+        }
         self.active = a;
+        // 拖拽排序后重命名态作废（索引变了）
+        self.tab_rename = None;
+        self.tab_rename_input = None;
+        self.tab_drag = None;
     }
 
     pub fn poll_connecting(&mut self) {
-        // 分屏窗格：SSH 连接结果同样经通道回传。连上后补执行「连接时」宏，
-        // 并把键盘焦点交给新窗格（用户刚点的分屏，期待立刻能打字）。
-        for i in 0..self.tabs.len() {
-            let changed = self
-                .tabs
-                .get_mut(i)
-                .and_then(|t| t.terminal_tab_mut())
-                .map(|tab| tab.poll())
-                .unwrap_or(false);
-            if changed {
-                self.run_trigger_macros(crate::macros::TriggerKind::OnConnect, i);
-                self.focus_term = true;
-            }
-        }
-
+        // 分屏 / 新开标签的 SSH 结果都在面板自己的 `tick` 里收（见
+        // `terminal_view.rs`），这里只处理「整标签级」的 Connecting：
+        // 连上后开一个终端工作区，面板在首帧渲染时装进 dock。
         for i in 0..self.tabs.len() {
             let mut done: Option<std::result::Result<TermPane, String>> = None;
             if let TabContent::Connecting { rx, .. } = &self.tabs[i] {
@@ -1060,9 +1573,9 @@ impl RustTermApp {
             if let Some(result) = done {
                 match result {
                     Ok(pane) => {
-                        self.tabs[i] = TabContent::Terminal(TerminalTab::new(pane));
-                        // SSH 连上后执行「连接时」宏
-                        self.run_trigger_macros(crate::macros::TriggerKind::OnConnect, i);
+                        self.tabs[i] = TabContent::Terminal(TerminalWorkspace::with_pane(pane));
+                        // 「连接时」宏在面板装进 dock 之后执行
+                        // （`ensure_workspace_dock` 里统一处理）
                     }
                     Err(msg) => self.tabs[i] = TabContent::Failed(msg),
                 }
@@ -1070,34 +1583,9 @@ impl RustTermApp {
         }
     }
 
-    /// 执行指定触发方式的宏，发送到第 `tab` 个标签的终端。
-    fn run_trigger_macros(&mut self, kind: crate::macros::TriggerKind, tab: usize) {
-        let idxs = match kind {
-            crate::macros::TriggerKind::OnConnect => self.macros.get_on_connect_macros(),
-            crate::macros::TriggerKind::OnDisconnect => self.macros.get_on_disconnect_macros(),
-            _ => Vec::new(),
-        };
-        if idxs.is_empty() {
-            return;
-        }
-        let mut sent = 0;
-        for i in idxs {
-            let Some(bytes) = self.macros.send_macro_bytes(i) else {
-                continue;
-            };
-            if let Some(pane) = self.tabs.get_mut(tab).and_then(|t| t.terminal_mut()) {
-                pane.write_input(bytes);
-                sent += 1;
-            }
-        }
-        if sent > 0 {
-            let what = match kind {
-                crate::macros::TriggerKind::OnConnect => "连接",
-                _ => "断开",
-            };
-            self.set_toast(format!("已执行 {sent} 个「{what}时」宏"));
-        }
-    }
+    // 「连接时 / 断开时」宏的执行已内联到实际发生连接/断开的地方：
+    // - 连接：`ensure_workspace_dock`（面板装进 dock 后统一执行）
+    // - 断开：`close_focused_pane` / `close_tab`（销毁面板前把字节排进发送队列）
 
     /// 切换语言。
     pub fn toggle_language(&mut self) {
@@ -1112,11 +1600,12 @@ impl RustTermApp {
         });
     }
 
-    /// 当前活动终端的概要（AI 面板展示用）。
-    pub fn active_terminal_hint(&self) -> Option<String> {
-        let tab = self.tabs.get(self.active)?;
-        let pane = tab.terminal()?;
-        Some(match &pane.spawn {
+    /// 当前聚焦终端的概要（AI 面板展示用）。
+    pub fn active_terminal_hint(&self, cx: &App) -> Option<String> {
+        let view = self.focused_view(cx)?;
+        let v = view.read(cx);
+        let spawn = v.spawn()?;
+        Some(match spawn {
             SpawnCfg::Ssh { host, port, user, .. } => format!("SSH {user}@{host}:{port}"),
             SpawnCfg::Tcp { host, port } => format!("Telnet {host}:{port}"),
             SpawnCfg::Command { program, .. } => format!("命令 {program}"),
@@ -1124,16 +1613,16 @@ impl RustTermApp {
         })
     }
 
-    /// 取当前活动终端的最近输出，作为 AI 对话的上下文。
-    pub fn current_terminal_context(&self) -> Option<String> {
-        let tab = self.tabs.get(self.active)?;
-        let pane = tab.terminal()?;
-        let text =
-            pane.context_text(self.config.ai.context_lines, self.config.ai.context_max_line_len);
+    /// 取当前聚焦终端的最近输出，作为 AI 对话的上下文。
+    pub fn current_terminal_context(&self, cx: &App) -> Option<String> {
+        let view = self.focused_view(cx)?;
+        let v = view.read(cx);
+        let spawn = v.spawn()?;
+        let text = v.context_text(self.config.ai.context_lines, self.config.ai.context_max_line_len);
         if text.trim().is_empty() {
             return None;
         }
-        let header = match &pane.spawn {
+        let header = match spawn {
             SpawnCfg::Ssh { host, port, user, .. } => {
                 format!("【终端信息】SSH 连接 {}@{}:{}（远端）\n", user, host, port)
             }
@@ -1275,6 +1764,31 @@ impl RustTermApp {
         state.update(cx, |s, cx| s.set_value(text.to_string(), window, cx));
     }
 
+    /// 异步弹出「选择目录」对话框，选中后回调写回界面。
+    ///
+    /// 不能在 UI 线程直接调 `rfd::FileDialog::pick_folder()`：Windows 上 rfd 会
+    /// 在当前线程里跑一个嵌套消息循环，GPUI 会借机把事件派发进 App，撞上外层
+    /// 已经持有的 RefCell 借用 → `RefCell already borrowed` panic（release 下
+    /// panic = abort，表现就是整个程序闪退）。
+    /// 这里把对话框放到后台线程，结果再回前台线程应用。
+    pub(crate) fn pick_folder_async(
+        cx: &mut Context<Self>,
+        window: &Window,
+        on_pick: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>, String) + 'static,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async { rfd::FileDialog::new().pick_folder() })
+                .await;
+            let Some(dir) = picked else { return };
+            let path = dir.display().to_string();
+            this.update_in(cx, |this, window, cx| on_pick(this, window, cx, path))
+                .ok();
+        })
+        .detach();
+    }
+
     /// 顶部菜单栏（对应旧 egui 版的 6 个下拉菜单：终端 / 会话 / 视图 /
     /// 工具 / 设置 / 帮助）。
     ///
@@ -1316,7 +1830,7 @@ impl RustTermApp {
                     tr(lang, "tb.sync"),
                     None,
                     false,
-                    |this, _cx| this.toggle_sync_input(),
+                    |this, cx| this.toggle_sync_input(cx),
                 ));
                 m = m.item(menu_item(
                     &app,
@@ -1338,41 +1852,50 @@ impl RustTermApp {
                 m = m.separator();
                 m = m.item(menu_item(
                     &app,
-                    "查找（Ctrl+F）",
+                    tr(lang, "item.find"),
                     Some(Box::new(FindInTerminal)),
                     false,
-                    |this, _cx| this.toggle_find(),
+                    |this, cx| this.toggle_find(cx),
                 ));
                 m = m.item(menu_item(
                     &app,
-                    "复制选区（Ctrl+Shift+C）",
+                    tr(lang, "item.copy_sel"),
                     None,
                     false,
                     |this, cx| {
-                        let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                        if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                            if pane.copy_selection(cx) {
-                                this.set_toast("已复制到剪贴板");
+                        let copied = this
+                            .focused_view(cx)
+                            .map(|v| v.update(cx, |v, vcx| v.copy_selection(vcx)))
+                            .unwrap_or(false);
+                        let lang = this.i18n.lang;
+                        this.set_toast(tr(
+                            lang,
+                            if copied {
+                                "toast.copied"
                             } else {
-                                this.set_toast("没有选中内容");
-                            }
-                        }
+                                "toast.no_selection"
+                            },
+                        ));
                     },
                 ));
-                m = m.item(menu_item(&app, "粘贴（Ctrl+V）", None, false, |this, cx| {
-                    let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                    if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                        if pane.paste_clipboard(cx) {
-                            this.set_toast("已粘贴");
+                m = m.item(menu_item(&app, tr(lang, "item.paste_clip"), None, false, |this, cx| {
+                    let pasted = match this.focused_view(cx) {
+                        Some(v) => v.update(cx, |v, vcx| v.paste_clipboard(vcx)),
+                        None => false,
+                    };
+                    let lang = this.i18n.lang;
+                    this.set_toast(tr(
+                        lang,
+                        if pasted {
+                            "toast.pasted"
                         } else {
-                            this.set_toast("剪贴板没有文本");
-                        }
-                    }
+                            "toast.clipboard_empty"
+                        },
+                    ));
                 }));
-                m = m.item(menu_item(&app, "全选", None, false, |this, _cx| {
-                    let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                    if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                        pane.select_all();
+                m = m.item(menu_item(&app, tr(lang, "item.select_all"), None, false, |this, cx| {
+                    if let Some(v) = this.focused_view(cx) {
+                        v.update(cx, |v, _| v.select_all());
                     }
                 }));
                 m = m.separator();
@@ -1381,28 +1904,30 @@ impl RustTermApp {
                     tr(lang, "item.split_right"),
                     Some(Box::new(SplitRight)),
                     false,
-                    |this, cx| this.split_active_pane(Axis::Horizontal, false, cx),
+                    |this, _cx| this.pending_pane_action = Some(PaneAction::Split(Placement::Right)),
                 ));
                 m = m.item(menu_item(
                     &app,
                     tr(lang, "item.split_down"),
                     Some(Box::new(SplitDown)),
                     false,
-                    |this, cx| this.split_active_pane(Axis::Vertical, false, cx),
+                    |this, _cx| {
+                        this.pending_pane_action = Some(PaneAction::Split(Placement::Bottom))
+                    },
                 ));
                 m = m.item(menu_item(
                     &app,
                     tr(lang, "item.next_pane"),
                     Some(Box::new(NextPane)),
                     false,
-                    |this, cx| this.focus_next_pane(cx),
+                    |this, _cx| this.pending_pane_action = Some(PaneAction::Next),
                 ));
                 m = m.item(menu_item(
                     &app,
                     tr(lang, "item.close_pane"),
                     Some(Box::new(ClosePane)),
                     false,
-                    |this, cx| this.close_active_pane(cx),
+                    |this, _cx| this.pending_pane_action = Some(PaneAction::Close),
                 ));
                 m = m.separator();
                 m = m.item(menu_item(
@@ -1410,9 +1935,9 @@ impl RustTermApp {
                     tr(lang, "item.close_tab"),
                     Some(Box::new(CloseTab)),
                     false,
-                    |this, _cx| {
+                    |this, cx| {
                         if !this.tabs.is_empty() {
-                            this.close_tab(this.active);
+                            this.close_tab(this.active, cx);
                         }
                     },
                 ));
@@ -1562,21 +2087,21 @@ impl RustTermApp {
                     tr(lang, "item.ping"),
                     None,
                     false,
-                    |this, _cx| this.run_tool_action(ToolAction::Ping),
+                    |this, cx| this.run_tool_action(ToolAction::Ping, cx),
                 ));
                 m = m.item(menu_item(
                     &app,
                     tr(lang, "item.telnet"),
                     None,
                     false,
-                    |this, _cx| this.run_tool_action(ToolAction::TelnetClient),
+                    |this, cx| this.run_tool_action(ToolAction::TelnetClient, cx),
                 ));
                 m = m.item(menu_item(
                     &app,
                     tr(lang, "item.portscan"),
                     None,
                     false,
-                    |this, _cx| this.run_tool_action(ToolAction::PortScan),
+                    |this, cx| this.run_tool_action(ToolAction::PortScan, cx),
                 ));
                 m = m.separator();
                 m = m.item(menu_item(
@@ -1584,7 +2109,7 @@ impl RustTermApp {
                     tr(lang, "item.macro_manager"),
                     None,
                     false,
-                    |this, _cx| this.run_tool_action(ToolAction::Macro),
+                    |this, cx| this.run_tool_action(ToolAction::Macro, cx),
                 ));
                 let _ = (window, cx);
                 m
@@ -1792,7 +2317,7 @@ impl RustTermApp {
                     *icon,
                     label.clone(),
                     false,
-                    move |this, _win, _cx| this.run_tool_action(action),
+                    move |this, _win, cx| this.run_tool_action(action, cx),
                 ));
             }
         }
@@ -2218,6 +2743,7 @@ impl RustTermApp {
         let password = Self::mk_password("密码", window, cx);
         let key_path = Self::mk_input("私钥路径", window, cx);
         let domain = Self::mk_input("域（RDP）", window, cx);
+        let share = Self::mk_input("共享目录（RDP，可空）", window, cx);
         self.add_form = Some(AddFormInputs {
             name,
             host,
@@ -2226,6 +2752,8 @@ impl RustTermApp {
             password,
             key_path,
             domain,
+            share,
+            legacy_compat: false,
             kind: SessionKind::Ssh,
             auth_key: false,
             editing: None,
@@ -2245,6 +2773,7 @@ impl RustTermApp {
         let password = Self::mk_password("密码", window, cx);
         let key_path = Self::mk_input("私钥路径", window, cx);
         let domain = Self::mk_input("域（RDP）", window, cx);
+        let share = Self::mk_input("共享目录（RDP，可空）", window, cx);
         Self::set_input(&name, &s.name, window, cx);
         Self::set_input(&host, &s.host, window, cx);
         Self::set_input(&port, &s.port.to_string(), window, cx);
@@ -2252,6 +2781,7 @@ impl RustTermApp {
         Self::set_input(&password, &s.password, window, cx);
         Self::set_input(&key_path, &s.key_path, window, cx);
         Self::set_input(&domain, &s.domain, window, cx);
+        Self::set_input(&share, &s.share_dir, window, cx);
         self.add_form = Some(AddFormInputs {
             name,
             host,
@@ -2260,6 +2790,8 @@ impl RustTermApp {
             password,
             key_path,
             domain,
+            share,
+            legacy_compat: s.legacy_compat,
             kind: s.kind,
             auth_key: s.uses_key(),
             editing: Some(s.id),
@@ -2285,7 +2817,7 @@ impl RustTermApp {
                 Button::new(SharedString::from(format!("tool-{i}")))
                     .label(label)
                     .compact()
-                    .on_click(cx.listener(move |this, _, _, _| this.run_tool_action(action))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.run_tool_action(action, cx))),
             );
         }
         list.into_any_element()
@@ -2329,8 +2861,8 @@ impl RustTermApp {
                                 .icon(ic(IconName::Play))
                                 .compact()
                                 .disabled(!enabled)
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.send_macro_to_active(i);
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.send_macro_to_active(i, cx);
                                 })),
                         ),
                 )
@@ -2374,6 +2906,17 @@ impl RustTermApp {
         let border = theme.colors.border;
         let dim = theme.colors.muted_foreground;
 
+        // 重命名 / 拖拽状态里的索引可能因为关标签而失效，先自查
+        if self.tab_rename.map(|i| i >= self.tabs.len()).unwrap_or(false) {
+            self.tab_rename = None;
+            self.tab_rename_input = None;
+        }
+        if self.tab_drag.map(|i| i >= self.tabs.len()).unwrap_or(false) {
+            self.tab_drag = None;
+        }
+        let renaming = self.tab_rename;
+        let drag_from = self.tab_drag;
+
         struct Row {
             label: String,
             icon: Option<IconName>,
@@ -2386,22 +2929,28 @@ impl RustTermApp {
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let (label, icon) = match tab {
+                let (default_label, icon) = match tab {
                     TabContent::Connecting { title, .. } => (title.clone(), Some(IconName::Loader)),
-                    TabContent::Terminal(t) => {
-                        if t.active_dead() {
-                            (format!("{} 已断开", t.title()), Some(IconName::X))
+                    TabContent::Terminal(ws) => {
+                        if ws.any_dead(cx).unwrap_or(false) {
+                            (format!("{} 已断开", ws.title(cx)), Some(IconName::X))
                         } else {
-                            (t.title(), Some(IconName::SquareTerminal))
+                            (ws.title(cx), Some(IconName::SquareTerminal))
                         }
                     }
                     TabContent::Failed(_) => ("连接失败".to_string(), Some(IconName::TriangleAlert)),
-                    TabContent::Browser(_) => (tab.title(), Some(IconName::Globe)),
-                    TabContent::RemoteDesktop(_) => (tab.title(), Some(IconName::Monitor)),
-                    TabContent::LocalFiles(_) => (tab.title(), Some(IconName::Folder)),
-                    TabContent::Macro => (tab.title(), Some(IconName::Keyboard)),
-                    TabContent::PortScan => (tab.title(), Some(IconName::Radar)),
+                    TabContent::Browser(_) => (tab.title(cx), Some(IconName::Globe)),
+                    TabContent::RemoteDesktop(_) => (tab.title(cx), Some(IconName::Monitor)),
+                    TabContent::LocalFiles(_) => (tab.title(cx), Some(IconName::Folder)),
+                    TabContent::Macro => (tab.title(cx), Some(IconName::Keyboard)),
+                    TabContent::PortScan => (tab.title(cx), Some(IconName::Radar)),
                 };
+                // 用户重命名过的优先（平行的标题数组，None 表示用默认）
+                let label = self
+                    .tab_titles
+                    .get(i)
+                    .and_then(|t| t.clone())
+                    .unwrap_or(default_label);
                 Row {
                     label,
                     icon,
@@ -2414,8 +2963,26 @@ impl RustTermApp {
 
         let mut strip = div().h_flex().items_center().gap_1().px_2().overflow_x_scrollbar();
         for (i, r) in rows.iter().enumerate() {
-            let color = if r.failed { theme.colors.danger } else { dim };
             let idx = i;
+
+            // 正在重命名的那一格：换成输入框（回车提交，点击别处也提交）
+            if renaming == Some(idx) {
+                if let Some(input) = self.tab_rename_input.clone() {
+                    strip = strip.child(
+                        div()
+                            .h_flex()
+                            .items_center()
+                            .px_2()
+                            .h(px(TABS_H - 6.0))
+                            .rounded(px(6.0))
+                            .bg(theme.colors.secondary)
+                            .child(Input::new(&input).w(px(150.0)).text_size(px(12.0))),
+                    );
+                }
+                continue;
+            }
+
+            let color = if r.failed { theme.colors.danger } else { dim };
             strip = strip.child(
                 div()
                     .id(SharedString::from(format!("tab-{i}")))
@@ -2428,8 +2995,40 @@ impl RustTermApp {
                     .rounded(px(6.0))
                     .text_size(px(12.0))
                     .when(r.active, |d| d.bg(theme.colors.secondary))
+                    // 拖动中的源标签淡一点，让用户知道「正在搬这一格」
+                    .when(drag_from == Some(idx), |d| d.opacity(0.45))
                     .hover(|d| d.bg(theme.colors.secondary_hover))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    // 拖拽排序：按下记源、松开落在哪一格就插到哪一格
+                    // （不用拖影/阈值：标签条本来就是等宽小块，直接换位最直观）
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.tab_drag = Some(idx);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            let from = this.tab_drag.take();
+                            if let Some(from) = from {
+                                if from != idx {
+                                    this.move_tab(from, idx);
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                        // 双击标签 → 内联重命名
+                        if ev.click_count() >= 2 {
+                            this.begin_tab_rename(idx, window, cx);
+                            return;
+                        }
+                        // 单击别处时，先落定上一次重命名
+                        if this.tab_rename.is_some() {
+                            this.commit_tab_rename(cx);
+                        }
                         this.active = idx;
                         cx.notify();
                     }))
@@ -2456,7 +3055,7 @@ impl RustTermApp {
                                 .tooltip("关闭标签")
                                 .compact()
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_tab(idx);
+                                    this.close_tab(idx, cx);
                                     window.blur(cx);
                                 })),
                         )
@@ -2487,6 +3086,54 @@ impl RustTermApp {
             .border_color(border)
             .child(strip)
             .into_any_element()
+    }
+
+    /// 进入标签重命名：创建输入框、填入当前标题并聚焦。
+    fn begin_tab_rename(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let current = self
+            .tab_titles
+            .get(idx)
+            .and_then(|t| t.clone())
+            .unwrap_or_else(|| self.tabs[idx].title(cx));
+        let input = Self::mk_input("标签名", window, cx);
+        Self::set_input(&input, &current, window, cx);
+        // 全选：双击重命名的心理预期是「直接打字覆盖」
+        let handle = input.read(cx).focus_handle(cx).clone();
+        input.update(cx, |state, cx| state.select_all(window, cx));
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::PressEnter { .. } => this.commit_tab_rename(cx),
+                // 点到别处也算改完（否则输入框一直挂着）
+                InputEvent::Blur => this.commit_tab_rename(cx),
+                _ => {}
+            }
+        })
+        .detach();
+        self.tab_rename = Some(idx);
+        self.tab_rename_input = Some(input);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// 提交重命名（空字符串 = 恢复默认标题）。
+    fn commit_tab_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(idx) = self.tab_rename.take() else {
+            return;
+        };
+        let text = Self::input_value(&self.tab_rename_input, cx);
+        if idx < self.tab_titles.len() {
+            let t = text.trim();
+            self.tab_titles[idx] = if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            };
+        }
+        self.tab_rename_input = None;
+        cx.notify();
     }
 
     // ------------------------------------------------------------------
@@ -2573,7 +3220,18 @@ impl RustTermApp {
                                 .text_color(dim)
                                 .child(tr(lang, "welcome.desc")),
                         )
-                        .child(chips),
+                        .child(chips)
+                        .child(
+                            // 「恢复上次会话」：上次退出时开着哪些标签就重开哪些。
+                            // 没记录时不隐藏按钮，点了给个明确提示 —— 灰按钮更容易被当成坏了
+                            Button::new("welcome-restore")
+                                .icon(ic(IconName::RotateCcw))
+                                .label(tr(lang, "welcome.restore"))
+                                .compact()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.restore_last_session(cx);
+                                })),
+                        ),
                 )
                 .into_any_element();
         }
@@ -2974,20 +3632,23 @@ impl RustTermApp {
         }
     }
 
-    /// 终端标签页：canvas 绘制 + 键盘/鼠标事件 + 查找栏。
-    /// 终端区：可分屏的若干终端格。
+    /// 终端标签页：dock 区域 + 查找栏 + 键盘事件。
     ///
-    /// 结构：`term-area`（键盘 + 鼠标命中路由）→ 分屏树（`h_resizable` /
-    /// `v_resizable` 递归）→ 每个叶子一个 `pane-*` div（canvas 画该格快照）。
-    ///
-    /// 关键变化：每个窗格的尺寸**不再用视口估算**。canvas 的 prepaint 把本格
-    /// bounds 写进 `pane_areas`，下一帧据此 `fit_to`，所以分屏后每格各自算列数/
-    /// 行数。首帧还没有测量值时才退回「视口减去各固定栏」的估算。
+    /// 终端的绘制、吸数据、鼠标都由各面板自己负责（见 `terminal_view.rs`）；
+    /// 这里只保留**键盘**：宏快捷键与查找栏 Esc 要在这一层处理，而按键会从
+    /// 聚焦的面板冒泡到这个容器。
     fn terminal_area_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let _theme = Theme::global(cx).clone();
-        let focus = self.term_focus.clone();
+        let idx = self.active.min(self.tabs.len().saturating_sub(1));
+        // dock 需要 window 才能创建：首帧在这里落地
+        self.ensure_workspace_dock(idx, window, cx);
 
-        // 键盘/鼠标事件处理用的快照句柄（App 内已持有，直接从 self 取）
+        let focus = self.term_focus.clone();
+        let dock = self
+            .tabs
+            .get(idx)
+            .and_then(|t| t.workspace())
+            .and_then(|ws| ws.dock.clone());
+
         let mut area = div()
             .id("term-area")
             .flex_1()
@@ -2996,21 +3657,13 @@ impl RustTermApp {
             .relative()
             .overflow_hidden()
             .bg(crate::term::bg_color())
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                if let Some(f) = this.term_focus.clone() {
-                    window.focus(&f, cx);
-                }
-            }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                // 只有键盘焦点真在终端上时才往 pty 送字节。
-                // 这个 div 是查找输入框的祖先，按键会冒泡上来；不判断的话
-                // 在查找框里打字会同时打进 shell（也就是「输入不进去/乱码」）。
-                let term_focused = this
-                    .term_focus
-                    .as_ref()
-                    .map(|f| f.is_focused(window))
-                    .unwrap_or(false);
-                if !term_focused {
+                // 焦点不在终端面板上时不要往 pty 送字节（查找框、菜单里的按键
+                // 也会冒泡到这里）
+                let Some(view) = this.focused_view(cx) else {
+                    return;
+                };
+                if !view.read(cx).focused(window) {
                     return;
                 }
                 // 查找栏开着时 Esc 直接关掉（焦点又回到终端的情况）
@@ -3022,58 +3675,41 @@ impl RustTermApp {
                 // 宏快捷键优先：命中就把这次按键吃掉，改为执行宏。
                 // （宏面板里「触发方式 = 快捷键」的宏在这里生效）
                 let hotkey = crate::macros::hotkey_of(&ev.keystroke);
-                if let Some(idx) = this.macros.get_macro_by_hotkey(&hotkey) {
-                    this.send_macro_to_active(idx);
+                if let Some(macro_ix) = this.macros.get_macro_by_hotkey(&hotkey) {
+                    this.send_macro_to_active(macro_ix, cx);
                     cx.notify();
                     return;
                 }
-                // 输入一律进**活动窗格**：分屏后每格一个 pty，不能发错人
-                let active = this.active.min(this.tabs.len().saturating_sub(1));
-                if let Some(pane) = this.tabs.get_mut(active).and_then(|t| t.terminal_mut()) {
-                    pane.handle_keystroke(&ev.keystroke, cx);
+                // 其余按键交给**聚焦的那个面板**（分屏后每格一个 pty，不能发错人）
+                view.update(cx, |v, vcx| v.handle_key(&ev.keystroke, vcx));
+                cx.notify();
+            }))
+            // 右键菜单的**唯一入口**：终端面板自己不消费右键（鼠标上报模式除外，
+            // 那种情况面板会 stop_propagation），事件冒泡到这里才开菜单。
+            // 位置直接用窗口坐标 —— 菜单挂在覆盖层，left/top 就是窗口坐标。
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    this.term_menu = Some(ev.position);
                     cx.notify();
-                }
-            }))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                if let Some(f) = this.term_focus.clone() {
-                    window.focus(&f, cx);
-                }
-                this.term_mouse(ev.button, ev.position, true, ev.modifiers, cx);
-            }))
-            .on_mouse_down(MouseButton::Middle, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.term_mouse(ev.button, ev.position, true, ev.modifiers, cx);
-            }))
-            .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                this.term_mouse(ev.button, ev.position, true, ev.modifiers, cx);
-            }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                this.term_mouse_up(ev.button, ev.position, ev.modifiers, cx);
-            }))
-            .on_mouse_up(MouseButton::Middle, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                this.term_mouse_up(ev.button, ev.position, ev.modifiers, cx);
-            }))
-            .on_mouse_up(MouseButton::Right, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                this.term_mouse_up(ev.button, ev.position, ev.modifiers, cx);
-            }))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                this.term_mouse_move(ev.position, ev.pressed_button, cx);
-            }))
-            .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
-                this.term_scroll(ev.delta, ev.position, cx);
-            }));
+                }),
+            );
 
         if let Some(f) = focus.clone() {
             area = area.track_focus(&f).key_context("Terminal");
         }
 
-        // 分屏树（叶子 = 一个终端格；canvas 的 prepaint 记录本格 bounds）
-        area = area.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .child(self.pane_tree_element(cx)),
-        );
+        if let Some(dock) = dock {
+            // 包一层显式 flex 列：dock 自身是 size_full，父层要有确定高度
+            area = area.child(
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(dock.into_any_element()),
+            );
+        }
 
         // 查找栏：停靠在终端上方（不再压在终端底部遮挡命令行），
         // 独立于 term-area 之外——点击/键盘都不会被终端抢走焦点。
@@ -3084,249 +3720,8 @@ impl RustTermApp {
         column.child(area).into_any_element()
     }
 
-    /// 递归构建分屏树元素。
-    ///
-    /// 同一个分割节点每帧都拿到**同一个 ElementId**（`("pane-split", node_id)`），
-    /// 于是 `ResizablePanelGroup` 内部按 id 缓存的 `ResizableState` 不会被重建，
-    /// 用户拖出来的比例在重绘 / 切标签后仍然保留。
-    fn pane_tree_element(&self, cx: &App) -> AnyElement {
-        let Some(tab) = self
-            .tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            .and_then(|t| t.terminal_tab())
-        else {
-            return div().flex_1().min_h_0().into_any_element();
-        };
-        self.split_node_element(tab, tab.layout.root(), cx)
-    }
-
-    fn split_node_element(&self, tab: &TerminalTab, node: &SplitNode, cx: &App) -> AnyElement {
-        match node {
-            SplitNode::Leaf { pane, .. } => self.pane_element(tab, *pane, cx),
-            SplitNode::Split {
-                node: id,
-                axis,
-                children,
-            } => {
-                let panels = children
-                    .iter()
-                    .map(|child| resizable_panel().child(self.split_node_element(tab, child, cx)));
-                let group = match axis {
-                    Axis::Horizontal => h_resizable(("pane-split", *id)),
-                    Axis::Vertical => v_resizable(("pane-split", *id)),
-                };
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(group.children(panels))
-                    .into_any_element()
-            }
-        }
-    }
-
-    /// 单个终端格：已连上画快照；连接中 / 失败画占位。
-    fn pane_element(&self, tab: &TerminalTab, id: PaneId, cx: &App) -> AnyElement {
-        let theme = Theme::global(cx).clone();
-        let dim = theme.colors.muted_foreground;
-        let is_active = tab.active == id;
-        let multi = tab.is_split();
-
-        let base = div()
-            .id(("term-pane", id))
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .relative()
-            .overflow_hidden()
-            // 分屏时才描边：单格保持原来的观感；非活动格用全透明（几何不变，
-            // 只有颜色变，避免切换焦点时终端网格跳 1px）
-            .when(multi, |d| {
-                d.border_1().border_color(if is_active {
-                    theme.colors.primary
-                } else {
-                    gpui_kit::hsla(0.0, 0.0, 0.0, 0.0)
-                })
-            });
-
-        match tab.slot(id).map(|s| &s.state) {
-            Some(PaneState::Live(_)) => {
-                let area_rc = self
-                    .pane_areas
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| Rc::new(Cell::new(Bounds::default())));
-                let snap = self.pane_snaps.get(&id).cloned();
-                let prepaint_area = area_rc;
-                let paint_snap = snap;
-                base.child(
-                    canvas(
-                        move |bounds, _window, _cx| {
-                            // 记录本格「终端绘制区」的原始 bounds（含内边距）。
-                            // 文本网格原点 = 该 bounds 左上 + TERM_PAD，
-                            // 下一帧 fit_to 与鼠标列/行换算都用这一份数据。
-                            prepaint_area.set(bounds);
-                        },
-                        move |bounds, (), window, cx| {
-                            if let Some(snap) = &paint_snap {
-                                let origin = Point::new(
-                                    bounds.origin.x + px(TERM_PAD),
-                                    bounds.origin.y + px(TERM_PAD),
-                                );
-                                crate::term::paint_snapshot(snap, origin, window, cx);
-                            }
-                        },
-                    )
-                    .size_full(),
-                )
-                .into_any_element()
-            }
-            Some(PaneState::Connecting { title, .. }) => base
-                .v_flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(ic(IconName::Loader).small().text_color(dim))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.colors.foreground)
-                        .child(format!("{title} 正在连接…")),
-                )
-                .into_any_element(),
-            Some(PaneState::Failed { msg, .. }) => base
-                .v_flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_4()
-                .child(ic(IconName::TriangleAlert).small().text_color(theme.colors.danger))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.colors.danger)
-                        .child("连接失败"),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(dim)
-                        .max_w(px(420.0))
-                        .child(msg.clone()),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(dim)
-                        .child("用 Ctrl+Shift+W 关闭该窗格"),
-                )
-                .into_any_element(),
-            None => base.into_any_element(),
-        }
-    }
-
-    /// 命中判定：鼠标位置落在哪个窗格里。
-    ///
-    /// 与分割条抢事件的处理：分割条约 4px 宽、压在相邻两格的公共边界上，而
-    /// 事件会从分割条冒泡到容器（本函数所在层的监听器）。因此对**内部边界**
-    /// （与兄弟格共享的那条边）向内缩 [`SPLIT_GRIP`] 像素：落在这一带就判定为
-    /// 「哪格都没命中」，拖分割条不会顺手在终端里起一个选区。外边界不缩，
-    /// 免得贴着侧栏/状态栏的边缘出现点不动的死区。
-    fn pane_at(&self, pos: Point<Pixels>) -> Option<PaneId> {
-        let tab = self
-            .tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))?
-            .terminal_tab()?;
-        let rects: Vec<(PaneId, Bounds<Pixels>)> = tab
-            .leaf_ids()
-            .into_iter()
-            .filter_map(|id| self.pane_areas.get(&id).map(|rc| (id, rc.get())))
-            .filter(|(_, b)| b.size.width.as_f32() > 1.0 && b.size.height.as_f32() > 1.0)
-            .collect();
-
-        let grip = px(SPLIT_GRIP);
-        let near = |a: Pixels, b: Pixels| (a - b).as_f32().abs() <= 1.0;
-
-        for (id, r) in rects.iter() {
-            let left = if rects
-                .iter()
-                .any(|(o, s)| o != id && near(s.right(), r.left()))
-            {
-                r.left() + grip
-            } else {
-                r.left()
-            };
-            let right = if rects
-                .iter()
-                .any(|(o, s)| o != id && near(s.left(), r.right()))
-            {
-                r.right() - grip
-            } else {
-                r.right()
-            };
-            let top = if rects
-                .iter()
-                .any(|(o, s)| o != id && near(s.bottom(), r.top()))
-            {
-                r.top() + grip
-            } else {
-                r.top()
-            };
-            let bottom = if rects
-                .iter()
-                .any(|(o, s)| o != id && near(s.top(), r.bottom()))
-            {
-                r.bottom() - grip
-            } else {
-                r.bottom()
-            };
-            if right <= left || bottom <= top {
-                continue;
-            }
-            let hit = Bounds::new(
-                Point::new(left, top),
-                size(right - left, bottom - top),
-            );
-            if hit.contains(&pos) {
-                return Some(*id);
-            }
-        }
-        None
-    }
-
-    /// 某个窗格的（单元格尺寸, 文本网格原点）。两者都来自上一帧快照/测量。
-    fn pane_cell_origin(&self, id: PaneId) -> Option<(Size<Pixels>, Point<Pixels>)> {
-        let area = self.pane_areas.get(&id)?.get();
-        let snap = self.pane_snaps.get(&id)?;
-        Some((
-            snap.cell,
-            Point::new(
-                area.origin.x + px(TERM_PAD),
-                area.origin.y + px(TERM_PAD),
-            ),
-        ))
-    }
-
-    /// 本次鼠标事件的投递目标。
-    ///
-    /// `during_drag = true` 时优先用按下时锁定的窗格 —— 拖动选区拖出本格
-    /// （甚至拖到分割条上）也仍然投给起始格，不会中途换手。
-    fn mouse_target(&self, pos: Point<Pixels>, during_drag: bool) -> Option<PaneId> {
-        if during_drag {
-            if let Some(id) = self.mouse_pane {
-                return Some(id);
-            }
-        }
-        self.pane_at(pos)
-    }
-
-    /// 活动窗格 id（滚动等没有明确落点时用）。
-    fn active_pane_id(&self) -> Option<PaneId> {
-        self.tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            .and_then(|t| t.terminal_tab())
-            .map(|tab| tab.active_id())
-    }
+    /// 鼠标命中判定 / 逐格画布这些都随「面板自己画自己」搬到 `terminal_view.rs`，
+    /// 这里不再需要分屏树、pane 元素构建与命中路由。
 
     /// 终端查找栏：输入即搜，Enter 下一个 / Shift+Enter 上一个 / Esc 关闭。
     fn find_bar_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -3338,11 +3733,8 @@ impl RustTermApp {
                 match event {
                     InputEvent::Change => {
                         let needle = Self::input_value(&this.find_input, cx);
-                        let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                        if let Some(pane) =
-                            this.tabs.get_mut(idx).and_then(|t| t.terminal_mut())
-                        {
-                            pane.set_search(&needle);
+                        if let Some(view) = this.focused_view(cx) {
+                            view.update(cx, |v, _| v.set_search(&needle));
                         }
                         cx.notify();
                     }
@@ -3364,17 +3756,10 @@ impl RustTermApp {
             window.focus(&handle, cx);
         }
 
-        let (idx, total) = {
-            let i = self.active.min(self.tabs.len().saturating_sub(1));
-            self.tabs
-                .get(i)
-                .and_then(|t| t.terminal())
-                .map(|p| {
-                    let n = p.search_matches.len();
-                    (if n == 0 { 0 } else { p.search_index + 1 }, n)
-                })
-                .unwrap_or((0, 0))
-        };
+        let (idx, total) = self
+            .focused_view(cx)
+            .map(|v| v.read(cx).search_progress())
+            .unwrap_or((0, 0));
         let counter = if total == 0 {
             "无匹配".to_string()
         } else {
@@ -3449,15 +3834,16 @@ impl RustTermApp {
     /// 表现就是「点下一个没反应 / 只跳一次」。
     fn search_step(&mut self, forward: bool, cx: &mut Context<Self>) {
         let needle = Self::input_value(&self.find_input, cx);
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        if let Some(pane) = self.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-            if pane.search != needle {
-                pane.set_search(&needle);
-            } else if forward {
-                pane.search_next();
-            } else {
-                pane.search_prev();
-            }
+        if let Some(view) = self.focused_view(cx) {
+            view.update(cx, |v, _| {
+                if v.search_needle() != needle {
+                    v.set_search(&needle);
+                } else if forward {
+                    v.search_next();
+                } else {
+                    v.search_prev();
+                }
+            });
         }
         cx.notify();
     }
@@ -3465,33 +3851,32 @@ impl RustTermApp {
     /// 关闭查找栏：清空高亮，焦点交回终端。
     fn close_find(&mut self, cx: &mut Context<Self>) {
         self.find_open = false;
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        if let Some(pane) = self.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-            pane.clear_search();
+        if let Some(view) = self.focused_view(cx) {
+            view.update(cx, |v, _| v.clear_search());
         }
         self.focus_term = true;
         cx.notify();
     }
 
-    /// 终端右键菜单：复制 / 粘贴 / 全选。
+    /// 终端右键菜单：复制 / 粘贴 / 全选 / 分屏四项。
     ///
     /// 键盘快捷键之外再给一条纯鼠标路径——不同输入法/键盘布局下
     /// Ctrl+Shift+C 未必到得了终端，菜单永远可用。
     fn term_context_menu_ui(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let pos = self.term_menu?;
+        let lang = self.i18n.lang;
         let theme = Theme::global(cx).clone();
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        let (has_sel, has_text) = self
-            .tabs
-            .get(idx)
-            .and_then(|t| t.terminal())
-            .map(|p| (p.has_selection(), true))
-            .unwrap_or((false, false));
+        let target = self.focused_view(cx);
+        let has_sel = target
+            .as_ref()
+            .map(|v| v.read(cx).has_selection())
+            .unwrap_or(false);
+        let has_text = target.is_some();
 
         let dim = theme.colors.muted_foreground;
         let fg = theme.colors.foreground;
 
-        let item = |id: &'static str, label: &'static str, enabled: bool| {
+        let item = |id: &'static str, label: String, enabled: bool| {
             let color = if enabled { fg } else { dim };
             div()
                 .id(id)
@@ -3521,31 +3906,41 @@ impl RustTermApp {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
 
-        menu = menu.child(item("term-menu-copy", "复制", has_sel).on_click(cx.listener(
-            |this, _, _, cx| {
-                let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                    if pane.copy_selection(cx) {
-                        this.set_toast("已复制到剪贴板");
+        menu = menu.child(item("term-menu-copy", tr(lang, "item.copy"), has_sel).on_click(
+            cx.listener(|this, _, _, cx| {
+                let copied = this
+                    .focused_view(cx)
+                    .map(|v| v.update(cx, |v, vcx| v.copy_selection(vcx)))
+                    .unwrap_or(false);
+                let lang = this.i18n.lang;
+                this.set_toast(tr(
+                    lang,
+                    if copied {
+                        "toast.copied"
                     } else {
-                        this.set_toast("没有选中内容");
-                    }
-                }
+                        "toast.no_selection"
+                    },
+                ));
                 this.term_menu = None;
                 this.focus_term = true;
                 cx.notify();
             },
         )));
-        menu = menu.child(item("term-menu-paste", "粘贴", has_text).on_click(cx.listener(
-            |this, _, _, cx| {
-                let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                    if pane.paste_clipboard(cx) {
-                        this.set_toast("已粘贴");
+        menu = menu.child(item("term-menu-paste", tr(lang, "item.paste"), has_text).on_click(
+            cx.listener(|this, _, _, cx| {
+                let pasted = match this.focused_view(cx) {
+                    Some(v) => v.update(cx, |v, vcx| v.paste_clipboard(vcx)),
+                    None => false,
+                };
+                let lang = this.i18n.lang;
+                this.set_toast(tr(
+                    lang,
+                    if pasted {
+                        "toast.pasted"
                     } else {
-                        this.set_toast("剪贴板没有文本");
-                    }
-                }
+                        "toast.clipboard_empty"
+                    },
+                ));
                 this.term_menu = None;
                 this.focus_term = true;
                 cx.notify();
@@ -3560,19 +3955,19 @@ impl RustTermApp {
                 .into_any_element(),
         );
         menu = menu.child(
-            item("term-menu-all", "全选", has_text).on_click(cx.listener(|this, _, _, cx| {
-                let idx = this.active.min(this.tabs.len().saturating_sub(1));
-                if let Some(pane) = this.tabs.get_mut(idx).and_then(|t| t.terminal_mut()) {
-                    pane.select_all();
-                }
-                this.term_menu = None;
-                this.focus_term = true;
-                cx.notify();
-            })),
+            item("term-menu-all", tr(lang, "item.select_all"), has_text).on_click(
+                cx.listener(|this, _, _, cx| {
+                    if let Some(v) = this.focused_view(cx) {
+                        v.update(cx, |v, _| v.select_all());
+                    }
+                    this.term_menu = None;
+                    this.focus_term = true;
+                    cx.notify();
+                }),
+            ),
         );
 
         // 分屏：右键菜单是分屏最容易被发现的地方（菜单栏也有同样四项）。
-        // 文案沿用这个弹出菜单的既有风格（中文硬编码，与「复制/粘贴/全选」一致）。
         menu = menu.child(
             div()
                 .h(px(1.0))
@@ -3581,37 +3976,37 @@ impl RustTermApp {
                 .bg(theme.colors.border)
                 .into_any_element(),
         );
-        let can_split = self.can_split();
-        let multi = self.has_multiple_panes();
+        let can_split = self.can_split(cx);
+        let multi = self.has_multiple_panes(cx);
         menu = menu.child(
-            item("term-menu-split-r", "向右分屏（Ctrl+Shift+D）", can_split).on_click(cx.listener(
-                |this, _, _, cx| {
+            item("term-menu-split-r", tr(lang, "ctx.split_right"), can_split).on_click(
+                cx.listener(|this, _, window, cx| {
                     this.term_menu = None;
-                    this.split_active_pane(Axis::Horizontal, false, cx);
-                },
-            )),
+                    this.split_focused(Placement::Right, window, cx);
+                }),
+            ),
         );
         menu = menu.child(
-            item("term-menu-split-d", "向下分屏（Ctrl+Shift+U）", can_split).on_click(cx.listener(
-                |this, _, _, cx| {
+            item("term-menu-split-d", tr(lang, "ctx.split_down"), can_split).on_click(
+                cx.listener(|this, _, window, cx| {
                     this.term_menu = None;
-                    this.split_active_pane(Axis::Vertical, false, cx);
-                },
-            )),
+                    this.split_focused(Placement::Bottom, window, cx);
+                }),
+            ),
         );
         menu = menu.child(
-            item("term-menu-pane-next", "下一个窗格（Ctrl+Shift+P）", multi).on_click(cx.listener(
-                |this, _, _, cx| {
+            item("term-menu-pane-next", tr(lang, "ctx.next_pane"), multi).on_click(
+                cx.listener(|this, _, window, cx| {
                     this.term_menu = None;
-                    this.focus_next_pane(cx);
-                },
-            )),
+                    this.focus_next_pane(window, cx);
+                }),
+            ),
         );
         menu = menu.child(
-            item("term-menu-pane-close", "关闭当前窗格（Ctrl+Shift+W）", multi).on_click(
-                cx.listener(|this, _, _, cx| {
+            item("term-menu-pane-close", tr(lang, "ctx.close_pane"), multi).on_click(
+                cx.listener(|this, _, window, cx| {
                     this.term_menu = None;
-                    this.close_active_pane(cx);
+                    this.close_focused_pane(window, cx);
                 }),
             ),
         );
@@ -3635,160 +4030,8 @@ impl RustTermApp {
         )
     }
 
-    /// 把窗口坐标换算成某格的（列, 行）。
-    fn pane_col_row(&self, id: PaneId, pos: Point<Pixels>) -> Option<(usize, i32)> {
-        let (cell, origin) = self.pane_cell_origin(id)?;
-        let col = ((pos.x - origin.x).as_f32() / cell.width.as_f32())
-            .floor()
-            .max(0.0) as usize;
-        let row = ((pos.y - origin.y).as_f32() / cell.height.as_f32())
-            .floor()
-            .max(0.0) as i32;
-        Some((col, row))
-    }
-
-    /// 终端区鼠标按下（列/行换算 + 鼠标报告 + 右键菜单）。
-    ///
-    /// 目标窗格由命中判定决定（落在分割条上会被判为「无命中」而整体忽略），
-    /// 按下时把该格设为**活动窗格**：键盘输入与随后弹出的右键菜单都作用于它。
-    fn term_mouse(
-        &mut self,
-        button: MouseButton,
-        pos: Point<Pixels>,
-        pressed: bool,
-        mods: Modifiers,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(id) = self.mouse_target(pos, false) else {
-            return;
-        };
-        let Some((col, row)) = self.pane_col_row(id, pos) else {
-            return;
-        };
-
-        let mut consumed = false;
-        {
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-            if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                tab.set_active(id);
-                if let Some(pane) = tab.pane_mut(id) {
-                    consumed = match button {
-                        MouseButton::Left => pane.mouse_down(col, row, &mods),
-                        MouseButton::Middle => pane.mouse_middle(col, row, &mods, pressed),
-                        MouseButton::Right => pane.mouse_right(col, row, &mods, pressed),
-                        _ => false,
-                    };
-                }
-            }
-        }
-        // 锁定本次拖拽的窗格：拖出本格（甚至拖到分割条上）也继续投给它
-        self.mouse_pane = Some(id);
-        // 非鼠标报告模式：右键弹出「复制/粘贴」菜单（终端里右键菜单比
-        // 直接粘贴更安全，也不会把剪贴板内容意外打进远端 shell）。
-        if !consumed && button == MouseButton::Right && pressed {
-            self.term_menu = Some(pos);
-            self.focus_term = true;
-        }
-        cx.notify();
-    }
-
-    fn term_mouse_up(
-        &mut self,
-        button: MouseButton,
-        pos: Point<Pixels>,
-        mods: Modifiers,
-        cx: &mut Context<Self>,
-    ) {
-        let target = self.mouse_pane.or_else(|| self.pane_at(pos));
-        let Some(id) = target else {
-            self.mouse_pane = None;
-            return;
-        };
-        let Some((col, row)) = self.pane_col_row(id, pos) else {
-            self.mouse_pane = None;
-            return;
-        };
-        {
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-            if let Some(pane) = self
-                .tabs
-                .get_mut(idx)
-                .and_then(|t| t.terminal_tab_mut())
-                .and_then(|tab| tab.pane_mut(id))
-            {
-                match button {
-                    MouseButton::Left => {
-                        pane.mouse_up(col, row, &mods);
-                    }
-                    MouseButton::Middle => {
-                        pane.mouse_middle(col, row, &mods, false);
-                    }
-                    MouseButton::Right => {
-                        pane.mouse_right(col, row, &mods, false);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        self.mouse_pane = None;
-        cx.notify();
-    }
-
-    fn term_mouse_move(
-        &mut self,
-        pos: Point<Pixels>,
-        pressed: Option<MouseButton>,
-        cx: &mut Context<Self>,
-    ) {
-        // 拖动中（有按键按下）沿用按下时锁定的窗格；纯悬停按落点判定
-        let Some(id) = self.mouse_target(pos, pressed.is_some()) else {
-            return;
-        };
-        let Some((col, row)) = self.pane_col_row(id, pos) else {
-            return;
-        };
-        let mut consumed = false;
-        {
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-            if let Some(pane) = self
-                .tabs
-                .get_mut(idx)
-                .and_then(|t| t.terminal_tab_mut())
-                .and_then(|tab| tab.pane_mut(id))
-            {
-                consumed = match pressed {
-                    Some(_) => pane.mouse_drag(col, row, &Modifiers::default()),
-                    None => pane.mouse_motion(col, row),
-                };
-            }
-        }
-        if consumed {
-            cx.notify();
-        }
-    }
-
-    /// 滚轮回看：落在哪一格就滚哪一格（落点不确定时退回活动窗格）。
-    fn term_scroll(&mut self, delta: ScrollDelta, pos: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(id) = self.pane_at(pos).or_else(|| self.active_pane_id()) else {
-            return;
-        };
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        let mut scrolled = false;
-        {
-            if let Some(pane) = self
-                .tabs
-                .get_mut(idx)
-                .and_then(|t| t.terminal_tab_mut())
-                .and_then(|tab| tab.pane_mut(id))
-            {
-                pane.scroll(delta);
-                scrolled = true;
-            }
-        }
-        if scrolled {
-            cx.notify();
-        }
-    }
+    // 终端的列/行换算与全部鼠标处理都在 `terminal_view.rs`：
+    // 每个面板自己收自己的鼠标事件，不再需要「命中判定 → 投递给某一格」这一层。
 
     // ------------------------------------------------------------------
     // 状态栏 / AI 面板
@@ -3808,7 +4051,7 @@ impl RustTermApp {
                 "{} [{}] {}",
                 t.tab_type().icon(),
                 t.tab_type().label(),
-                t.title()
+                t.title(cx)
             )
         };
 
@@ -3817,7 +4060,7 @@ impl RustTermApp {
         } else {
             match &self.tabs[self.active.min(self.tabs.len() - 1)] {
                 TabContent::Terminal(t) => {
-                    if t.active_dead() {
+                    if t.any_dead(cx).unwrap_or(false) {
                         (format!("● {}", tr(lang, "status.disconnected")), theme.colors.danger)
                     } else {
                         (format!("● {}", tr(lang, "status.connected")), theme.colors.success)
@@ -3882,61 +4125,52 @@ impl RustTermApp {
             .flex_none()
             .text_size(px(10.0));
 
-        if let Some(tab) = self
-            .tabs
-            .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            .and_then(|t| t.terminal_tab())
-        {
-            // 尺寸 / 光标行列为**活动窗格**的数据；分屏时额外标一个格数
-            let active_id = tab.active_id();
-            if let Some(pane) = tab.active_pane() {
+        // 尺寸 / 光标行列为**聚焦终端**的数据；分屏时额外标一个格数
+        if let Some(view) = self.focused_view(cx) {
+            let v = view.read(cx);
+            let (cols, rows) = v.dims();
+            right = right.child(
+                div()
+                    .text_color(dim)
+                    .text_size(px(10.0))
+                    .child(format!("{cols}×{rows}")),
+            );
+            let panes = self
+                .active_workspace_dock()
+                .map(|d| dock_panels(&d, cx).len())
+                .unwrap_or(1);
+            if panes > 1 {
                 right = right.child(
                     div()
                         .text_color(dim)
                         .text_size(px(10.0))
-                        .child(format!("{}×{}", pane.dims.cols, pane.dims.rows)),
+                        .child(format!("{panes} 格")),
                 );
             }
-            if tab.is_split() {
+            if let Some((r, c)) = v.cursor_row_col() {
                 right = right.child(
                     div()
                         .text_color(dim)
                         .text_size(px(10.0))
-                        .child(format!("{} 格", tab.layout.len())),
+                        .child(format!("行:{r}, 列:{c}")),
                 );
             }
-            if let Some(snap) = self.pane_snaps.get(&active_id) {
-                if let Some(cur) = &snap.cursor {
-                    let r = (cur.bounds.origin.y.as_f32() / snap.cell.height.as_f32()).floor()
-                        as i32
-                        + 1;
-                    let c = (cur.bounds.origin.x.as_f32() / snap.cell.width.as_f32()).floor()
-                        as i32
-                        + 1;
-                    right = right.child(
-                        div()
-                            .text_color(dim)
-                            .text_size(px(10.0))
-                            .child(format!("行:{r}, 列:{c}")),
-                    );
-                }
-                // 终端模式提示：备用屏（vim/top 之类）与鼠标跟踪
-                if snap.alt_screen {
-                    right = right.child(
-                        div()
-                            .text_color(theme.colors.warning)
-                            .text_size(px(10.0))
-                            .child("备用屏"),
-                    );
-                }
-                if snap.mouse_mode {
-                    right = right.child(
-                        div()
-                            .text_color(theme.colors.info)
-                            .text_size(px(10.0))
-                            .child("鼠标跟踪"),
-                    );
-                }
+            // 终端模式提示：备用屏（vim/top 之类）与鼠标跟踪
+            if v.alt_screen() {
+                right = right.child(
+                    div()
+                        .text_color(theme.colors.warning)
+                        .text_size(px(10.0))
+                        .child("备用屏"),
+                );
+            }
+            if v.mouse_mode() {
+                right = right.child(
+                    div()
+                        .text_color(theme.colors.info)
+                        .text_size(px(10.0))
+                        .child("鼠标跟踪"),
+                );
             }
         } else if !self.tabs.is_empty() {
             right = right.child(
@@ -4303,7 +4537,47 @@ impl RustTermApp {
             .child(field("用户", &form.user))
             .child(pw_field("密码", &form.password))
             .child(field("私钥", &form.key_path))
-            .child(field("域", &form.domain))
+            .child(field("域", &form.domain));
+        // 共享目录只对 RDP 有意义：VNC / SPICE 协议里没有文件通道
+        let content = if form.kind == SessionKind::Rdp {
+            content
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(52.0)).text_size(px(12.0)).child("共享目录"))
+                        .child(Input::new(&form.share).flex_1().text_size(px(12.0)))
+                        .child(
+                            Button::new("add-share-pick")
+                                .label("浏览…")
+                                .compact()
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    Self::pick_folder_async(cx, window, |this, window, cx, path| {
+                                        if let Some(f) = this.add_form.as_mut() {
+                                            let input = f.share.clone();
+                                            input.update(cx, |s, cx| s.set_value(path.clone(), window, cx));
+                                        }
+                                        cx.notify();
+                                    });
+                                })),
+                        ),
+                )
+                .child(
+                    Checkbox::new("add-rd-legacy")
+                        .label("旧版服务器兼容（Server 2008：禁用 NLA，仅用 TLS）")
+                        .checked(form.legacy_compat)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            if let Some(f) = this.add_form.as_mut() {
+                                f.legacy_compat = *checked;
+                            }
+                            cx.notify();
+                        })),
+                )
+        } else {
+            content
+        };
+        let content = content
             .child(
                 Checkbox::new("add-auth-key")
                     .label("密钥认证")
@@ -4367,13 +4641,29 @@ impl RustTermApp {
         let password = Self::input_value(&Some(form.password.clone()), cx);
         let key_path = Self::input_value(&Some(form.key_path.clone()), cx);
         let domain = Self::input_value(&Some(form.domain.clone()), cx);
+        let share_dir = if form.kind == SessionKind::Rdp {
+            Self::input_value(&Some(form.share.clone()), cx)
+                .trim()
+                .to_string()
+        } else {
+            // 切到 VNC/SPICE 时把旧目录丢掉，避免 json 里留下无意义的路径
+            String::new()
+        };
+        let legacy_compat = form.kind == SessionKind::Rdp && form.legacy_compat;
 
         if host.trim().is_empty() {
             self.set_toast("主机不能为空");
             return;
         }
+        let id = form.editing.clone().unwrap_or_else(crate::sessions::SessionEntry::new_id);
+        // 分组在表单里没有输入框：编辑时必须沿用原值，否则一保存就掉进默认分组
+        let group = self
+            .sessions
+            .by_id(&id)
+            .map(|s| s.group.clone())
+            .unwrap_or_else(crate::sessions::default_group);
         let entry = crate::sessions::SessionEntry {
-            id: form.editing.unwrap_or_else(crate::sessions::SessionEntry::new_id),
+            id,
             name,
             kind: form.kind,
             host,
@@ -4383,7 +4673,9 @@ impl RustTermApp {
             auth_method: if form.auth_key { "key" } else { "password" }.to_string(),
             key_path,
             domain,
-            group: String::new(),
+            share_dir,
+            legacy_compat,
+            group,
         };
         self.sessions.update(entry);
         if let Err(e) = self.sessions.save() {
@@ -4537,13 +4829,9 @@ impl RustTermApp {
         }
         let input = self.batch_cmd.clone().unwrap();
         let n_alive = self
-            .tabs
+            .all_term_views(cx)
             .iter()
-            .filter(|t| {
-                t.terminal()
-                    .map(|p| !p.dead)
-                    .unwrap_or(false)
-            })
+            .filter(|v| !v.read(cx).is_dead())
             .count();
         let content = div()
             .v_flex()
@@ -4572,7 +4860,7 @@ impl RustTermApp {
                             .compact()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let cmd = Self::input_value(&this.batch_cmd, cx);
-                                this.send_batch_command(cmd);
+                                this.send_batch_command(cmd, cx);
                             })),
                     ),
             );
@@ -4774,15 +5062,8 @@ impl RustTermApp {
 // Render
 // ---------------------------------------------------------------------------
 
-// 终端 canvas 四周留出的内边距（绘制与鼠标映射共用）
-const TERM_PAD: f32 = 6.0;
-
-/// 分屏命中判定时，公共边界向两侧各让出的像素。
-///
-/// 分割条的拖拽带是 `HANDLE_SIZE(1px) + HANDLE_PADDING(4px) × 2`，压在相邻两格
-/// 的公共边界上；事件会从它冒泡到终端容器。留出这么宽的一圈不看，拖分割条就
-/// 不会误在终端里起选区。
-const SPLIT_GRIP: f32 = 5.0;
+// 终端 canvas 的内边距常量已挪到 `term.rs`（`term::TERM_PAD`），
+// 面板视图与绘制共用一份。
 
 const MENUBAR_H: f32 = 30.0;
 const TOOLBAR_H: f32 = 50.0;
@@ -4819,31 +5100,48 @@ impl Render for RustTermApp {
         }
 
         self.poll_connecting();
-        self.pump_sync_input();
+        self.pump_sync_input(cx);
+        // 标签集合变化就更新「上次会话」快照（两秒节流，写在 render 里是因为
+        // 开/关标签的入口太多，逐个接线容易漏；这里天然覆盖所有路径）
+        self.maybe_save_last_session(cx);
+        // 记录键盘焦点落在哪个终端面板（菜单项 / AI / SFTP 都按它取目标）
+        self.track_terminal_focus(window, cx);
+
+        // 菜单栏发起的窗格操作（分屏 / 关闭 / 切换）：需要 window，延后到这一帧
+        if let Some(action) = self.pending_pane_action.take() {
+            match action {
+                PaneAction::Split(placement) => self.split_focused(placement, window, cx),
+                PaneAction::Close => self.close_focused_pane(window, cx),
+                PaneAction::Next => self.focus_next_pane(window, cx),
+            }
+        }
+
+        // 字号改了：推给所有终端面板（面板自己重测格子）
+        if (self.pushed_font_size - self.config.font_size).abs() > f32::EPSILON {
+            self.pushed_font_size = self.config.font_size;
+            let size = self.config.font_size;
+            for view in self.all_term_views(cx) {
+                view.update(cx, |v, vcx| v.set_font_size(size, vcx));
+            }
+        }
 
         // 关闭查找栏后把焦点交回终端（否则按键没人接，终端像「死了」一样）
         if std::mem::take(&mut self.focus_term) {
-            // 只要活动标签是终端就交还焦点：分屏窗格可能还在连接中
-            // （那时 terminal() 返回 None，但不该因此丢掉键盘焦点）
-            let has_term = self
-                .tabs
-                .get(self.active.min(self.tabs.len().saturating_sub(1)))
-                .and_then(|t| t.terminal_tab())
-                .is_some();
-            if has_term {
-                if let Some(f) = self.term_focus.clone() {
-                    window.focus(&f, cx);
-                }
+            // 聚焦面板优先；没有就交给当前工作区的第一个面板
+            let target = self
+                .focused_view(cx)
+                .or_else(|| self.tab_first_view(self.active, cx));
+            if let Some(view) = target {
+                let handle = view.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
             }
         }
 
         // 切到 SSH 标签自动弹出 SFTP，切走自动收起
         {
             let ssh_key = self
-                .tabs
-                .get(self.active.min(self.tabs.len().saturating_sub(1)))
-                .and_then(|t| t.terminal())
-                .and_then(|p| p.ssh_handle())
+                .focused_view(cx)
+                .and_then(|v| v.read(cx).ssh_handle())
                 .map(|h| Arc::as_ptr(&h) as *const u8 as usize);
             if ssh_key != self.last_ssh_key {
                 self.last_ssh_key = ssh_key;
@@ -4856,21 +5154,14 @@ impl Render for RustTermApp {
             }
         }
 
-        // SFTP 绑定当前活动 SSH 会话
+        // SFTP 绑定当前聚焦的 SSH 会话
         {
-            let (label, ssh) = match self
-                .tabs
-                .get(self.active.min(self.tabs.len().saturating_sub(1)))
-            {
-                Some(TabContent::Terminal(tab)) => {
-                    // SFTP 跟随**活动窗格**：分屏时哪一格聚焦就绑哪一格的会话
-                    let pane = tab.active_pane();
-                    (
-                        pane.map(|p| p.title.clone()).unwrap_or_default(),
-                        pane.and_then(|p| p.ssh_handle()),
-                    )
+            let (label, ssh) = match self.focused_view(cx) {
+                Some(view) => {
+                    let v = view.read(cx);
+                    (v.title(), v.ssh_handle())
                 }
-                _ => (String::new(), None),
+                None => (String::new(), None),
             };
             self.sftp
                 .bind(&self.runtime_handle(), &label, ssh);
@@ -4898,111 +5189,14 @@ impl Render for RustTermApp {
             }
         }
 
-        // 终端数据泵 + 快照（活动标签的**每一个**窗格都要走一遍）
-        {
-            let focused = self
-                .term_focus
-                .as_ref()
-                .map(|f| f.is_focused(window))
-                .unwrap_or(false);
-            let mut dirty = false;
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-
-            // 首帧还没有测量值时的兜底：视口减去各固定栏（分屏后只当临时值，
-            // 下一帧就会被各格自己的 bounds 取代）
-            let vp = window.viewport_size();
-            let mut est_w = vp.width.as_f32() - SIDEBAR_W;
-            if self.sftp.open {
-                est_w -= SFTP_W;
-            }
-            if self.ai_assistant.open {
-                est_w -= AI_W;
-            }
-            let est_h = vp.height.as_f32()
-                - MENUBAR_H
-                - TOOLBAR_H
-                - QUICK_H
-                - TABS_H
-                - if self.find_open { FIND_BAR_H } else { 0.0 }
-                - if self.config.show_status_bar { STATUS_H } else { 0.0 };
-            let estimate = size(
-                px((est_w - TERM_PAD * 2.0).max(80.0)),
-                px((est_h - TERM_PAD * 2.0).max(80.0)),
-            );
-
-            let font_size = self.config.font_size;
-            // 查找栏开着：切换窗格后要把高亮补到新格上（查找状态是每格一份的）
-            let needle = if self.find_open {
-                Self::input_value(&self.find_input, cx)
-            } else {
-                String::new()
-            };
-            if let Some(tab) = self.tabs.get_mut(idx).and_then(|t| t.terminal_tab_mut()) {
-                let active_id = tab.active_id();
-                for slot in tab.panes.iter_mut() {
-                    let PaneState::Live(pane) = &mut slot.state else {
-                        continue;
-                    };
-                    let id = slot.id;
-                    // 分屏的每个窗格各自一条连接：标题 / OSC52 / 数据都要各自吸
-                    let (_title_changed, clip) = pane.drain_pane_events();
-                    if let Some(text) = clip {
-                        term::copy_to_clipboard(cx, text);
-                    }
-                    dirty |= pane.pump();
-
-                    // 本格可用空间：优先用上一帧量到的 bounds（分屏后各格不同），
-                    // 首帧才退回视口估算
-                    let avail = self
-                        .pane_areas
-                        .get(&id)
-                        .map(|rc| rc.get())
-                        .filter(|b| b.size.width.as_f32() > 1.0 && b.size.height.as_f32() > 1.0)
-                        .map(|b| {
-                            size(
-                                px((b.size.width.as_f32() - TERM_PAD * 2.0).max(80.0)),
-                                px((b.size.height.as_f32() - TERM_PAD * 2.0).max(80.0)),
-                            )
-                        })
-                        .unwrap_or(estimate);
-                    dirty |= pane.fit_to(window, font_size, avail);
-
-                    // 焦点状态写回窗格：只有「终端区有焦点 + 本格是活动格」才画实心光标
-                    pane.has_focus = focused && id == active_id;
-                    if !needle.is_empty() && pane.search != needle {
-                        pane.set_search(&needle);
-                    }
-                    self.pane_snaps
-                        .insert(id, Arc::new(pane.snapshot()));
-                    // 保证本格有测量槽位（canvas prepaint 会把 bounds 写进来）
-                    self.pane_areas
-                        .entry(id)
-                        .or_insert_with(|| Rc::new(Cell::new(Bounds::default())));
-                }
-            }
-
-            // 清掉已经消失的窗格（关分屏 / 关标签）留下的测量与快照
-            let live: Vec<PaneId> = self
-                .tabs
-                .iter()
-                .filter_map(|t| t.terminal_tab())
-                .flat_map(|tab| tab.leaf_ids())
-                .collect();
-            self.pane_snaps.retain(|id, _| live.contains(id));
-            self.pane_areas.retain(|id, _| live.contains(id));
-            if self.mouse_pane.map(|id| !live.contains(&id)).unwrap_or(false) {
-                self.mouse_pane = None;
-            }
-
-            if dirty {
-                cx.notify();
-            }
-        }
+        // 终端数据泵 / 尺寸 fit / 快照都在各面板自己的 render 里完成
+        // （见 `terminal_view.rs`）：一屏多个终端时各自管各自的数据与画面。
+        // 帧的持续由文件末尾的 `request_animation_frame` 保证。
 
         // AI 面板上下文提示 + 待发送
-        self.ai_assistant.attach_hint = self.active_terminal_hint();
+        self.ai_assistant.attach_hint = self.active_terminal_hint(cx);
         if self.ai_assistant.take_pending_send() {
-            let context = self.current_terminal_context();
+            let context = self.current_terminal_context(cx);
             let ai = self.config.ai.clone();
             self.ai_assistant.send(&ai, context, window, cx);
         }
@@ -5013,9 +5207,15 @@ impl Render for RustTermApp {
                 self.set_toast("只读模式：写命令已被禁用");
             } else if dangerous {
                 self.set_toast(format!("⚠ 危险命令已拦截: {cmd}"));
-            } else if let Some(pane) = self.tabs.get_mut(self.active).and_then(|t| t.terminal_mut()) {
-                if !pane.dead {
-                    pane.write_input(format!("{cmd}\r").into_bytes());
+            } else if let Some(view) = self.focused_view(cx) {
+                let sent = view.update(cx, |v, _| {
+                    if v.is_dead() {
+                        return false;
+                    }
+                    v.write_input(format!("{cmd}\r").into_bytes());
+                    true
+                });
+                if sent {
                     self.set_toast("命令已发送到终端");
                 }
             }
@@ -5068,7 +5268,7 @@ impl Render for RustTermApp {
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if !this.tabs.is_empty() {
-                    this.close_tab(this.active);
+                    this.close_tab(this.active, cx);
                     window.blur(cx);
                 }
             }))
@@ -5156,15 +5356,19 @@ impl Render for RustTermApp {
                     this.move_tab(cur, cur + 1);
                 }
             }))
-            // 分屏（light：只分当前窗格，不新开标签）
-            .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
-                this.split_active_pane(Axis::Horizontal, false, cx)
+            // 分屏（dock：任意嵌套 / 拖到边缘 / 标签组 / 单格缩放）
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split_focused(Placement::Right, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
-                this.split_active_pane(Axis::Vertical, false, cx)
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.split_focused(Placement::Bottom, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ClosePane, _, cx| this.close_active_pane(cx)))
-            .on_action(cx.listener(|this, _: &NextPane, _, cx| this.focus_next_pane(cx)));
+            .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
+                this.close_focused_pane(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextPane, window, cx| {
+                this.focus_next_pane(window, cx)
+            }));
 
         root = root
             .child(self.menu_bar_ui(window, cx))

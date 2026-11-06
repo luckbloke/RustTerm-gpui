@@ -87,7 +87,7 @@ impl WindowsRdpdrBackend {
         }
 
         let root = RootDirectory::open(drive.root_path())
-            .map_err(|error| pdu_other_err!("open configured Windows RDPDR volume root").with_source(error))?;
+            .map_err(|error| pdu_other_err!("open configured RDPDR share root").with_source(error))?;
         let previous = self.roots.insert(
             device_id,
             RedirectedRoot {

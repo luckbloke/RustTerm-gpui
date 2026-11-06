@@ -72,3 +72,24 @@ pub(crate) fn raw_hwnd_from_window(window: &gpui_kit::Window) -> Option<isize> {
 pub(crate) fn raw_hwnd_from_window(_window: &gpui_kit::Window) -> Option<isize> {
     None
 }
+
+/// 本机 CapsLock 是否开启。
+///
+/// 远程桌面要知道这个状态：RFB 与 RDP 都**没有**「远端锁定键状态」的回传
+/// 通道（没有 LED 反馈），客户端只能假定远端初始为关，之后发现本地开灯/关灯
+/// 就补发一次 Caps_Lock 让远端跟上。否则会出现「本地大写、远端小写」
+/// 的输入错位。
+///
+/// 用 `GetKeyState` 而不是 `GetAsyncKeyState`：调用点在 UI 线程的按键回调里，
+/// 此时系统已经把这次按键的 toggle 状态写进了本线程的输入队列，
+/// `GetKeyState` 读到的就是「按下之后」的状态，直接可用于同步。
+#[cfg(windows)]
+pub(crate) fn caps_lock_on() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CAPITAL};
+    unsafe { GetKeyState(VK_CAPITAL as i32) & 1 != 0 }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn caps_lock_on() -> bool {
+    false
+}

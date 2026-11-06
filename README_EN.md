@@ -34,6 +34,7 @@
 - **Session management**: `sessions.json` persistence for SSH / VNC / RDP / SPICE sessions (host, port, user, password, key path, domain); the sidebar list supports click-to-select, **double-click to connect**, inline connect / edit / delete, search filtering, 8 recent sessions and seeded examples on first run
 - **Quick-connect bar**: address | jump host | password / key | credentials | connect
 - **Unified tab strip**: terminals, browser, remote desktop, local files, macros and port scanning live side by side with click-to-switch, active highlight and a close button (**no drag reordering or double-click rename yet**)
+- **Split panes**: `Ctrl+Shift+D` splits right and `Ctrl+Shift+U` splits down beside the current pane — the new pane **clones the current session's spawn config** (an SSH split opens its own connection rather than sharing the channel; local/Telnet/command panes are reused the same way). The active pane is outlined, dividers drag to resize, and each pane has **its own measured size, its own pty, and its own selection and search state**; the keyboard follows the active pane while the mouse is routed by hit-testing. No drag-to-reorder or layout persistence (see Known gaps)
 - **Batch execution** (one command to every terminal), **synchronized input** (mirror the active terminal's keystrokes to the others), **find** (Ctrl+F highlight with next/previous), **key macros** (manual / hotkey / on-connect / on-disconnect triggers)
 - **Terminal rendering**: each frame builds a `TermSnapshot` (visible rows with text + colour runs, plus selection / search / cursor overlays) that a canvas paints; 10k-line scrollback, selection copy (Ctrl+C smart copy), bracketed paste, mouse reporting (click / drag / motion), OSC 52 clipboard *writes* (read requests answer with an empty string so remote programs never hang)
 - Terminal device queries (DA, colour requests, …) are answered through `PtyProxy` instead of leaking into the log
@@ -102,6 +103,10 @@
 | `Ctrl+Shift+B` | Embedded browser |
 | `Ctrl+Shift+A` | AI assistant |
 | `Ctrl+W` | Close the current tab |
+| `Ctrl+Shift+D` | Split the current pane to the right |
+| `Ctrl+Shift+U` | Split the current pane downwards |
+| `Ctrl+Shift+P` | Focus the next pane |
+| `Ctrl+Shift+W` | Close the current pane (no-op with a single pane) |
 | `Ctrl+F` | Find in terminal (terminal tabs only) |
 | `Ctrl+L` | Focus the browser address bar |
 | `F11` | Fullscreen |
@@ -118,7 +123,7 @@ cargo build --release        # produce the executable
 cargo test                   # pure-logic unit tests
 ```
 
-`cargo test` covers everything that needs no window: i18n strings and language fallback, macro hotkey normalisation and trigger round-trips, Telnet IAC negotiation, port-scan parsing and SFTP path utilities (17 cases in total, written with plain `#[test]`).
+`cargo test` covers everything that needs no window: i18n strings and language fallback, macro hotkey normalisation and trigger round-trips, Telnet IAC negotiation, port-scan parsing, SFTP path utilities and the split tree's insert / remove / collapse rules (22 cases in total, written with plain `#[test]`).
 
 - `browser` (wry / WebView2) is on by default. To build without the embedded browser: `cargo build --release --no-default-features`
 - The devtools binaries are not part of the default build; enable the `devtools` feature explicitly:
@@ -150,7 +155,8 @@ src/
   main.rs         entry: 32MB stack thread + crash log + DComp off + window geometry + icon assets
   app.rs          shell: menus / toolbar / quick connect / sidebar / tab strip / central area / status bar / overlay dialogs
   term.rs         terminal core: Term state machine, TermSnapshot build & paint, keyboard/mouse → VT encoding, selection / paste / find
-  tabs.rs         tab model and kinds (Terminal / Browser / RemoteDesktop / LocalFiles / Macro / PortScan)
+  split.rs        split layout tree: leaf / split nodes with stable node ids (which is what keeps ratios on ResizableState)
+  tabs.rs         tab model + terminal tab (several panes + split tree + active pane id)
   config.rs       AppConfig + AiSettings (serde defaults, migration, fallback path)
   sessions.rs     session model + sessions.json (recent list, first-run examples)
   backends/
@@ -187,6 +193,8 @@ src/
 
 - Terminal: `pty/ssh → mpsc → vte Processor.advance(Term) → renderable_content() → TermSnapshot → canvas`
 - Terminal input: `GPUI events → VT sequences → mpsc → pty/ssh` (device-query replies loop back through `PtyProxy`)
+- Pane sizing: `canvas prepaint records this pane's bounds → pane_areas → next frame's fit_to(pane)`,
+  so every pane derives its own cols/rows; mouse events are hit-tested against `pane_areas` first
 - Remote desktop: `backend thread → RdEvent{Frame dirty rect} → FrameBuffer → BGRA → RenderImage → canvas`
 - Browser: `gpui main thread ⇄ channel ⇄ dedicated WebView thread (own message pump) ⇄ WebView2`
 
@@ -213,6 +221,11 @@ The phases follow `main.rs`'s own module documentation:
 6. **Compute the terminal origin once.** A canvas prepaint writes the text-grid origin into the global `TermArea`, and both painting and mouse column/row math use that same origin, so selection can never drift.
 7. **Native child windows always paint above gpui.** Whenever an overlay (dialog / menu / context menu) opens, the WebView area must be hidden or clamped or it covers the UI.
 8. **Dialogs are same-frame overlays.** egui's separate viewport windows became absolutely positioned overlay layers that stay out of the main layout; `overlay_open()` is the single check for "an overlay is up", used for hiding the WebView and gating shortcuts.
+9. **Three details that make splitting work:**
+   - **Sizing cannot come from the viewport any more.** Each pane uses its own bounds from the previous frame (a canvas prepaint writes them into `pane_areas`) to derive cols/rows, or the second pane would size itself to the whole window.
+   - **Dividers and terminal selection compete for events.** A divider's drag band straddles the shared edge between two panes, and its events still bubble to the terminal container. Hit-testing therefore insets the **shared** edges by `SPLIT_GRIP` (5px): a point in that band counts as "no pane", so dragging a divider can never start a terminal selection.
+   - **Node ids must stay stable.** Drag ratios live in the `ResizableState` that `ResizablePanelGroup` caches by ElementId; renumbering nodes when panes are added or removed would snap the user's ratio back to an even split on the next frame (so `SplitNode` carries its own id and a new pane reuses the original node).
+10. **`div()` is a block, not a flex container** (`Style::default().display = Display::Block`): only `.flex()` / `.h_flex()` / `.v_flex()` create a flex context. Miss that on an intermediate layer and a child's `flex_1` silently does nothing while its `height:100%` resolves against an auto height — the box collapses to zero, which is **what actually blanked the terminal canvas**. Splitting makes this easy to hit: every wrapper you add has to be checked, and the leaf's canvas should take its height from `flex_1` rather than a percentage.
 
 ## Known gaps
 
@@ -222,8 +235,9 @@ The phases follow `main.rs`'s own module documentation:
 - **No tab drag-reordering or double-click rename**: only click-to-switch and a close button (the egui version had both)
 - **Remote-desktop clipboard sync**: only the `clipboard_sync` toggle exists; nothing is connected behind it
 - **SPICE** composites the primary surface only (no multi-surface or cursor compositing); **VNC** does not sync CapsLock; **Telnet** ignores NAWS window negotiation
-- **Terminal performance**: one `shape_line` per row per frame with no row-level shaping cache, and the whole-screen snapshot is rebuilt every frame — row caching or a GPU vertex cache are the obvious next steps
-- **Split panes are not implemented**: gpui-kit ships `resizable` (`h_resizable` / `v_resizable`) and a full `dock` (recursive PaneTree splitting + drag & drop + layout dump/load), but this project still assumes a single terminal for sizing, focus and input (`fit_to` estimates from the viewport, one `term_focus` / `term_snap`, a global `TermArea`), so that layer has to be taken apart first
+- **Terminal performance**: one `shape_line` per row per frame with no row-level shaping cache, and the whole-screen snapshot is rebuilt every frame — row caching or a GPU vertex cache are the obvious next steps, and each split pane repeats that work
+- **Split panes (implemented, but the "light" version)**: you can split right/down, drag dividers, and switch or close panes; there is **no** drag-to-reorder, no layout persistence (a restart comes back as a single pane), and no keyboard-driven directional navigation (only `Ctrl+Shift+P` cycling)
+- **The context menu and dialog bodies are not localised**: the popup's labels (copy / paste / select all / the four split entries) are hardcoded Chinese even in the English UI
 - **Packaging**: no installer or distribution script
 - **Leftovers**: `src/status.rs` is dead code (the status bar moved into `app.rs`), and `check-msvc.bat` / `run-msvc.bat` still point at the old egui directory
 

@@ -405,10 +405,36 @@ where
     let keep_for_task = keep.clone();
 
     tokio::spawn(async move {
+        let handle = keep_for_task.clone(); // 心跳用它（Handle 是 Arc，发包不占通道）
         let _keep_alive = (keep_for_task, keep_jump);
+
+        // 心跳：SSH 服务器 / NAT / 墙上的空闲连接常常几分钟就被回收。
+        // 每秒醒一次读当前配置（用户可能刚在配置面板改过间隔），
+        // 攒够 `keep_alive_interval` 秒**且这段时间真的没数据**才发一个
+        // `keepalive@openssh.com`（want_reply=true 顺带探活）。
+        // 0 = 关闭心跳。
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(1));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut idle_secs: u64 = 0;
+
         loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    let every = crate::config::keep_alive_interval();
+                    if every == 0 {
+                        idle_secs = 0;
+                        continue;
+                    }
+                    idle_secs += 1;
+                    if idle_secs >= every {
+                        idle_secs = 0;
+                        // 发不出去说明连接已经死了：让 channel.wait() 那边收尾，
+                        // 这里不 break（否则收不到「SSH 连接已断开」的提示）
+                        let _ = handle.send_keepalive(true).await;
+                    }
+                }
                 msg = channel.wait() => {
+                    idle_secs = 0;
                     match msg {
                         Some(ChannelMsg::Data { ref data }) => {
                             if output_tx.send(data.to_vec()).is_err() {
@@ -425,6 +451,7 @@ where
                     }
                 }
                 Some(data) = input_rx.recv() => {
+                    idle_secs = 0;
                     let _ = channel.data(&data[..]).await;
                 }
                 Some((c, r)) = resize_rx.recv() => {

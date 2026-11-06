@@ -6,7 +6,7 @@
 
 use anyhow::{anyhow, Result};
 use ironrdp::client::config::{
-    ConfigBuilder, Destination, DirectTransport, ServerCertificateVerifier,
+    ClipboardType, ConfigBuilder, Destination, DirectTransport, ServerCertificateVerifier,
     ServerCertificateVerifyFuture, TransportKind,
 };
 use ironrdp::client::rdp::{RdpClient, RdpInputEvent, RdpOutputEvent};
@@ -18,6 +18,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use super::{KeyInput, RdCommand, RdEvent, RdParams, RdState};
+use std::sync::Arc;
+
+use super::rdp_clipboard::{ClipboardBridgeGuard, RdpClipboardBackendFactory, RdpClipboardBridge};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
@@ -55,9 +58,36 @@ fn client_name() -> String {
         .unwrap_or_else(|| "RustTerm".to_string())
 }
 
-fn build_config(params: &RdParams) -> Result<ironrdp::client::config::Config> {
+/// 连接时采用的安全层。
+///
+/// IronRDP 不支持 Standard RDP Security（没有 RC4 安全交换），所以这里只有两种：
+/// - `Nla`：CredSSP/NLA + TLS，现代服务器首选；
+/// - `TlsOnly`：只用 TLS，凭据在 Client Info 里自动登录 —— 旧版
+///   Windows Server 2008 / 2008 R2 的兼容路径。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecurityMode {
+    Nla,
+    TlsOnly,
+}
+
+impl SecurityMode {
+    fn uses_credssp(self) -> bool {
+        matches!(self, SecurityMode::Nla)
+    }
+}
+
+fn build_config(
+    params: &RdParams,
+    security: SecurityMode,
+) -> Result<ironrdp::client::config::Config> {
     let connector_host = params.host.clone();
     let connector_port = params.port;
+    // 只有非空目录才挂盘符：空字符串会让 RDPDR 后端挂一个根目录不明的盘
+    let share_dir = params
+        .share_dir
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let color_depth = match params.color_depth {
         16 => 16u32,
         24 => 24,
@@ -73,12 +103,26 @@ fn build_config(params: &RdParams) -> Result<ironrdp::client::config::Config> {
         .with_desktop_height(params.height)
         .with_desktop_scale_factor(100)
         .with_color_depth(color_depth)
-        .with_credssp(true)
+        // NLA（CredSSP）与 TLS 是两条独立的安全层：旧版服务器只走 TLS。
+        // TLS-only 时服务器会显示登录界面，自动登录标志让它在 Client Info
+        // 里直接用表单里的用户名/密码登录，体验与 mstsc 一致。
+        .with_credssp(security.uses_credssp())
         .with_tls(true)
+        .with_autologon(matches!(security, SecurityMode::TlsOnly))
+        // 剪贴板同步：Enable 时由 ironrdp-client 在 Windows 上自建 WinClipboard
+        // 后端 —— 远端→本机直接写系统剪贴板，本机→远端由它监听系统剪贴板变化，
+        // UI 层不经手数据。Disable 则完全不协商 CLIPRDR 通道。
+        .with_clipboard(if params.clipboard {
+            ClipboardType::Enable
+        } else {
+            ClipboardType::Disable
+        })
         .with_platform(MajorPlatformType::WINDOWS)
         .with_client_build(client_build())
         .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
         .with_client_name(client_name())
+        // 共享目录：必须同时打开 RDPDR 通道（设备重定向）才会协商盘符
+        .with_rdpdr(share_dir.is_some())
         .with_server_certificate_verifier(std::sync::Arc::new(TrustAnyCert))
         // 与参考实现一致：自己拨号，绕开 connector 内部的 DNS/地址处理差异
         .with_direct_transport_connector(std::sync::Arc::new(move |_destination| {
@@ -178,6 +222,59 @@ impl Fb {
     }
 }
 
+/// 共享目录 → 远端资源管理器里显示的名字。
+///
+/// 取目录名（整卷 `D:\` 取盘符，和 mstsc 的习惯一致）。Windows 实际把
+/// RDPDR 的 DeviceData 按 8-bit 字符解析（上游 IronRDP #2342），vendored
+/// 补丁已改为 8-bit 广播，目录名可以完整显示；名字里的非 ASCII 与非法字符
+/// 由广播层替换成 `_`。
+fn share_drive_name(root: &str) -> String {
+    let directory = std::path::Path::new(root)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty());
+    match directory {
+        Some(name) => name,
+        None => root
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase().to_string())
+            .unwrap_or_else(|| "RustTerm".to_string()),
+    }
+}
+
+/// 共享目录 → RDPDR 后端工厂。
+///
+/// IronRDP 的 `rdpdr-native` 已经把「本地目录 ↔ RDPDR 文件 IRP」这一层
+/// 做完了（打开 / 读 / 写 / 列目录 / 查询信息 / 卷信息 / 锁），
+/// 我们只需要指定「哪个目录、挂成什么名字、只读与否」。
+#[cfg(windows)]
+fn rdpdr_factory(root: &str) -> Result<Box<dyn ironrdp::client::rdp::RdpdrBackendFactory + Send>> {
+    use ironrdp_rdpdr_native::{RedirectedDrive, WindowsRdpdrBackendFactory};
+    // 后端把「共享目录」当成 RDPDR 的根句柄，只接受本机绝对路径：
+    // `D:\`、`D:\rustterm` 都行，`D:rustterm`（盘符相对）、`\rustterm`、
+    // `\\server\share`、`\\?\D:\...` 会被解析到别处，这里先拦下来给人话提示。
+    let bytes = root.as_bytes();
+    let is_absolute_drive_path = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    if !is_absolute_drive_path {
+        return Err(anyhow!(
+            "共享目录必须是本机绝对路径，例如 D:\\rustterm（当前填的是“{root}”）"
+        ));
+    }
+    // 设备号 0 保留给智能卡通道，盘符从 1 开始。
+    let drive = RedirectedDrive::new(1, share_drive_name(root), root, false)
+        .map_err(|e| anyhow!("共享目录配置失败（{root}）: {e}"))?;
+    Ok(Box::new(WindowsRdpdrBackendFactory::new(drive)))
+}
+
+#[cfg(not(windows))]
+fn rdpdr_factory(_root: &str) -> Result<Box<dyn ironrdp::client::rdp::RdpdrBackendFactory + Send>> {
+    Err(anyhow!("共享目录目前只在 Windows 客户端上可用"))
+}
+
 /// 把归一化键输入转成 ironrdp 操作。
 fn key_operations(k: &KeyInput) -> Vec<Operation> {
     let extended = k.scancode & 0xFF00 == 0xE000;
@@ -215,192 +312,396 @@ fn flush_ops(
     }
 }
 
+/// 一次连接尝试的失败信息。
+struct AttemptFailed {
+    /// 是否已经真正连上（收到过桌面帧）。连上之后的错误不再回退重试。
+    connected: bool,
+    error: anyhow::Error,
+}
+
+/// 判断错误是否像「NLA 与旧版服务器不兼容」。
+///
+/// Windows Server 2008 / 2008 R2 在 CredSSP 的 NTLM AUTHENTICATE 之后会回
+/// TLS alert 80，或者服务端解析 TSRequest 失败（`invalid sequence tag`）。
+/// 这两种情况下 TLS-only 通常能正常连上，值得自动重试一次。
+///
+/// 凭据错误（密码错、账户锁定等）不算：换 TLS 也解决不了，直接报给用户。
+fn looks_like_nla_failure(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    const CREDENTIAL: &[&str] = &[
+        "logon failure",
+        "status_logon_failure",
+        "wrong password",
+        "password expired",
+        "account disabled",
+        "account restriction",
+        "invalid credentials",
+    ];
+    if CREDENTIAL.iter().any(|needle| text.contains(needle)) {
+        return false;
+    }
+    const NLA: &[&str] = &[
+        "credssp",
+        "tsrequest",
+        "ts_request",
+        "invalid sequence tag",
+        "sequence tag",
+        "tls alert",
+        "alertreceived",
+        "pub_key_auth",
+        "pubkeyauth",
+        "ntlm",
+        "sspi",
+        "nla",
+        "internal_error",
+        "handshake",
+        "output channel closed",
+        "输出通道关闭",
+        "会话终止",
+    ];
+    NLA.iter().any(|needle| text.contains(needle))
+}
+
 pub async fn run(
     params: &RdParams,
     ev: &Sender<RdEvent>,
     cmds: &Receiver<RdCommand>,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    // 勾选兼容模式时直接 TLS-only，不再浪费一次 NLA 握手；
+    // 默认先试 NLA，失败且符合旧服务器特征时自动回退一次。
+    let first = if params.legacy_compat {
+        SecurityMode::TlsOnly
+    } else {
+        SecurityMode::Nla
+    };
+    match run_once(params, first, ev, cmds, cancel).await {
+        Ok(()) => Ok(()),
+        Err(fail)
+            if !fail.connected
+                && first == SecurityMode::Nla
+                && looks_like_nla_failure(&fail.error) =>
+        {
+            eprintln!("[RDP] NLA 握手失败，改用 TLS 兼容模式重试：{}", fail.error);
+            let _ = ev.send(RdEvent::Notice(
+                "NLA 握手失败，正在用 TLS 兼容模式重试…".to_string(),
+            ));
+            run_once(params, SecurityMode::TlsOnly, ev, cmds, cancel)
+                .await
+                .map_err(|fail| fail.error)
+        }
+        Err(fail) => Err(fail.error),
+    }
+}
+
+async fn run_once(
+    params: &RdParams,
+    security: SecurityMode,
+    ev: &Sender<RdEvent>,
+    cmds: &Receiver<RdCommand>,
+    cancel: &AtomicBool,
+) -> Result<(), AttemptFailed> {
     let _ = ev.send(RdEvent::State(RdState::Connecting));
-    let config = build_config(params)?;
-    let (out_tx, mut out_rx) = ironrdp::client::output_channel::output_channel(2);
-    let client = RdpClient::new(config, out_tx).with_desktop_updates();
-    let input_sender = client.input_sender();
+    let mut connected = false;
+    let result: Result<()> = async {
+        let config = build_config(params, security)?;
+        let (out_tx, mut out_rx) = ironrdp::client::output_channel::output_channel(2);
+        let mut client = RdpClient::new(config, out_tx).with_desktop_updates();
+        // 共享目录：挂一个本地目录当远端的盘符（RDPDR 通道）。
+        // 目录不存在时直接报错，别让用户连上以后在「我的电脑」里找不到盘。
+        if let Some(dir) = params
+            .share_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !std::path::Path::new(dir).is_dir() {
+                return Err(anyhow!("共享目录不存在或不是目录: {dir}"));
+            }
+            eprintln!(
+                "[RDP] 共享目录 {dir} → 远端「{} on {}」（RDPDR 驱动器重定向；要排查细节请设 NYATERM_RDPDR_TRACE=1）",
+                share_drive_name(dir),
+                client_name()
+            );
+            client = client.with_rdpdr_backend_factory(rdpdr_factory(dir)?);
+        }
+        let input_sender = client.input_sender();
 
-    let _ = ev.send(RdEvent::State(RdState::Authenticating));
+        let _ = ev.send(RdEvent::State(RdState::Authenticating));
 
-    // client.run() 不是 Send：按参考实现放到独立线程 + 独立单线程运行时
-    std::thread::Builder::new()
-        .name("rdp-client".into())
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("[RDP] runtime 创建失败: {e}");
-                    return;
-                }
-            };
-            rt.block_on(client.run());
-        })
-        .map_err(|e| anyhow!("启动 RDP 客户端线程失败: {e}"))?;
-
-    let mut fb: Option<Fb> = None;
-    let mut dirty: Dirty = None;
-    let mut last_frame = Instant::now() - FRAME_INTERVAL;
-    let mut db = Database::new();
-    let mut buttons: u8 = 0;
-    let mut last_pos = (0u16, 0u16);
-    let mut active = false;
-
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(());
+        // ---- 剪贴板：文本 + 文件 ----
+        // 文件传输两条路只能选一条，否则远端会同时看到「盘符」和「剪贴板文件」，
+        // 用户粘贴时容易撞上锁冲突：
+        // - 配了共享目录 → 文件走 RDPDR 盘符（大文件、目录树、断点续传都更稳）
+        // - 没配共享目录 → 文件走剪贴板（本机复制 → 远端粘贴，零配置）
+        // 文本始终走剪贴板。
+        let mut _clip_guard: Option<ClipboardBridgeGuard> = None;
+        if params.clipboard {
+            let file_over_clipboard = params
+                .share_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none();
+            let bridge = Arc::new(RdpClipboardBridge::new(ev.clone(), file_over_clipboard));
+            client = client.with_cliprdr_backend_factory(Box::new(
+                RdpClipboardBackendFactory::from_input_sender(bridge.clone(), input_sender.clone()),
+            ));
+            // 会话结束后自动停掉轮询线程
+            _clip_guard = Some(ClipboardBridgeGuard(bridge));
         }
 
-        // ---- 上行输入 ----
-        while let Ok(cmd) = cmds.try_recv() {
-            match cmd {
-                RdCommand::Close => return Ok(()),
-                RdCommand::Key(k) => {
-                    let ops = key_operations(&k);
-                    if !ops.is_empty() {
-                        flush_ops(&mut db, &input_sender, ops);
+        // client.run() 不是 Send：按参考实现放到独立线程 + 独立单线程运行时
+        std::thread::Builder::new()
+            .name("rdp-client".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("[RDP] runtime 创建失败: {e}");
+                        return;
                     }
-                }
-                RdCommand::Pointer { x, y, buttons: nb } => {
-                    let mut ops = vec![Operation::MouseMove(MousePosition { x, y })];
-                    if nb != buttons {
-                        for (bit, btn) in [
-                            (1u8, MouseButton::Left),
-                            (2u8, MouseButton::Middle),
-                            (4u8, MouseButton::Right),
-                        ] {
-                            let was = buttons & bit != 0;
-                            let now = nb & bit != 0;
-                            if was != now {
-                                ops.push(if now {
-                                    Operation::MouseButtonPressed(btn)
-                                } else {
-                                    Operation::MouseButtonReleased(btn)
-                                });
-                            }
+                };
+                rt.block_on(client.run());
+            })
+            .map_err(|e| anyhow!("启动 RDP 客户端线程失败: {e}"))?;
+
+        let mut fb: Option<Fb> = None;
+        let mut dirty: Dirty = None;
+        let mut last_frame = Instant::now() - FRAME_INTERVAL;
+        let mut db = Database::new();
+        let mut buttons: u8 = 0;
+        let mut last_pos = (0u16, 0u16);
+        let mut active = false;
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            // ---- 上行输入 ----
+            while let Ok(cmd) = cmds.try_recv() {
+                match cmd {
+                    RdCommand::Close => return Ok(()),
+                    RdCommand::Key(k) => {
+                        let ops = key_operations(&k);
+                        if !ops.is_empty() {
+                            flush_ops(&mut db, &input_sender, ops);
                         }
-                        buttons = nb;
                     }
-                    last_pos = (x, y);
-                    flush_ops(&mut db, &input_sender, ops);
-                }
-                RdCommand::Wheel { dy } => {
-                    if dy != 0 {
-                        let ops = vec![
-                            Operation::MouseMove(MousePosition {
-                                x: last_pos.0,
-                                y: last_pos.1,
-                            }),
-                            Operation::WheelRotations(WheelRotations {
-                                is_vertical: true,
-                                rotation_units: dy.saturating_mul(120),
-                            }),
-                        ];
+                    RdCommand::Pointer { x, y, buttons: nb } => {
+                        let mut ops = vec![Operation::MouseMove(MousePosition { x, y })];
+                        if nb != buttons {
+                            for (bit, btn) in [
+                                (1u8, MouseButton::Left),
+                                (2u8, MouseButton::Middle),
+                                (4u8, MouseButton::Right),
+                            ] {
+                                let was = buttons & bit != 0;
+                                let now = nb & bit != 0;
+                                if was != now {
+                                    ops.push(if now {
+                                        Operation::MouseButtonPressed(btn)
+                                    } else {
+                                        Operation::MouseButtonReleased(btn)
+                                    });
+                                }
+                            }
+                            buttons = nb;
+                        }
+                        last_pos = (x, y);
                         flush_ops(&mut db, &input_sender, ops);
                     }
+                    RdCommand::Wheel { dy } => {
+                        if dy != 0 {
+                            let ops = vec![
+                                Operation::MouseMove(MousePosition {
+                                    x: last_pos.0,
+                                    y: last_pos.1,
+                                }),
+                                Operation::WheelRotations(WheelRotations {
+                                    is_vertical: true,
+                                    rotation_units: dy.saturating_mul(120),
+                                }),
+                            ];
+                            flush_ops(&mut db, &input_sender, ops);
+                        }
+                    }
+                    // 剪贴板由 CLIPRDR 通道 + WinClipboard 后端自行双向同步
+                    //（本机剪贴板变化由后端线程直接监听，无需 UI 转发）。
+                    RdCommand::Clipboard(_) => {}
+                }
+            }
+
+            // ---- 下行帧 ----
+            match tokio::time::timeout(POLL_INTERVAL, out_rx.recv()).await {
+                Ok(Some(out)) => match out {
+                    RdpOutputEvent::DesktopUpdate(update) => {
+                        let (buffer, w, h, region) = update.into_parts();
+                        let (w, h) = (w.get() as u32, h.get() as u32);
+                        let created = fb.is_none();
+                        let f = fb.get_or_insert_with(|| Fb::new(w, h));
+                        if f.width != w || f.height != h {
+                            *f = Fb::new(w, h);
+                            let _ = ev.send(RdEvent::Resized {
+                                width: w,
+                                height: h,
+                            });
+                            dirty = None;
+                        } else if created {
+                            let _ = ev.send(RdEvent::Resized {
+                                width: w,
+                                height: h,
+                            });
+                        }
+                        let r = f.apply_region(&buffer, region);
+                        dirty = union(dirty, r);
+                        if !active {
+                            active = true;
+                            connected = true;
+                            let _ = ev.send(RdEvent::State(RdState::Active));
+                        }
+                    }
+                    RdpOutputEvent::Image {
+                        buffer,
+                        width,
+                        height,
+                    } => {
+                        let (w, h) = (width.get() as u32, height.get() as u32);
+                        let mut f = Fb::new(w, h);
+                        let region = InclusiveRectangle {
+                            left: 0,
+                            top: 0,
+                            right: w.saturating_sub(1) as u16,
+                            bottom: h.saturating_sub(1) as u16,
+                        };
+                        f.apply_region(&buffer, region);
+                        fb = Some(f);
+                        let _ = ev.send(RdEvent::Resized {
+                            width: w,
+                            height: h,
+                        });
+                        dirty = Some((0, 0, w, h));
+                        if !active {
+                            active = true;
+                            connected = true;
+                            let _ = ev.send(RdEvent::State(RdState::Active));
+                        }
+                    }
+                    RdpOutputEvent::Connected => {
+                        // 安全协商与通道激活都已完成：之后如果再失败，就不是
+                        // NLA 兼容问题，不能再回退成 TLS-only。
+                        connected = true;
+                        eprintln!("[RDP] 连接激活完成（安全层={security:?}）");
+                    }
+                    RdpOutputEvent::LoginComplete => {
+                        eprintln!("[RDP] 远端登录完成");
+                    }
+                    RdpOutputEvent::Terminated(reason) => {
+                        return Err(anyhow!("RDP 会话终止: {reason:?}"));
+                    }
+                    RdpOutputEvent::ConnectionFailure(err) => {
+                        // report() 会带上 source 链（CredSSP/TSRequest 的具体原因），
+                        // 否则只剩「连接失败」四个字，NLA 兼容问题很难定位。
+                        return Err(anyhow!("RDP 连接失败: {}", err.report()));
+                    }
+                    // ---- 远端光标 ----
+                    // 服务器下发光标形状与位置，客户端负责绘制。
+                    // 不处理的话画面里就没有远端光标，而本地系统光标还在 →
+                    // 用户看到「两个鼠标」或者「远端没有指针」。
+                    RdpOutputEvent::PointerBitmap(ptr) => {
+                        let _ = ev.send(RdEvent::Cursor {
+                            width: ptr.width,
+                            height: ptr.height,
+                            hotspot_x: ptr.hotspot_x,
+                            hotspot_y: ptr.hotspot_y,
+                            // ironrdp 的 bitmap_data 已是 RGBA8 预乘 alpha
+                            rgba: ptr.bitmap_data.clone(),
+                        });
+                    }
+                    RdpOutputEvent::PointerPosition { x, y } => {
+                        let _ = ev.send(RdEvent::CursorPos { x, y });
+                    }
+                    RdpOutputEvent::PointerHidden => {
+                        let _ = ev.send(RdEvent::CursorHidden);
+                    }
+                    RdpOutputEvent::PointerDefault => {
+                        // 恢复默认形状：宽度/高度为 0 表示「无自定义光标」，
+                        // 客户端据此隐藏远端光标绘制，退回本地系统光标。
+                        let _ = ev.send(RdEvent::CursorHidden);
+                    }
+                    _ => {}
+                },
+                Ok(None) => return Err(anyhow!("RDP 输出通道关闭")),
+                Err(_) => {}
+            }
+
+            // ---- 推送脏区 ----
+            if let (Some(rect), Some(f)) = (dirty, fb.as_ref()) {
+                if last_frame.elapsed() >= FRAME_INTERVAL {
+                    last_frame = Instant::now();
+                    dirty = None;
+                    let (x, y, w, h) = rect;
+                    let w = w.min(f.width.saturating_sub(x));
+                    let h = h.min(f.height.saturating_sub(y));
+                    if w > 0 && h > 0 {
+                        let rgba = f.sub_rgba(x, y, w, h);
+                        let _ = ev.send(RdEvent::Frame { x, y, w, h, rgba });
+                    }
                 }
             }
         }
+    }
+    .await;
+    result.map_err(|error| AttemptFailed { connected, error })
+}
 
-        // ---- 下行帧 ----
-        match tokio::time::timeout(POLL_INTERVAL, out_rx.recv()).await {
-            Ok(Some(out)) => match out {
-                RdpOutputEvent::DesktopUpdate(update) => {
-                    let (buffer, w, h, region) = update.into_parts();
-                    let (w, h) = (w.get() as u32, h.get() as u32);
-                    let created = fb.is_none();
-                    let f = fb.get_or_insert_with(|| Fb::new(w, h));
-                    if f.width != w || f.height != h {
-                        *f = Fb::new(w, h);
-                        let _ = ev.send(RdEvent::Resized { width: w, height: h });
-                        dirty = None;
-                    } else if created {
-                        let _ = ev.send(RdEvent::Resized { width: w, height: h });
-                    }
-                    let r = f.apply_region(&buffer, region);
-                    dirty = union(dirty, r);
-                    if !active {
-                        active = true;
-                        let _ = ev.send(RdEvent::State(RdState::Active));
-                    }
-                }
-                RdpOutputEvent::Image { buffer, width, height } => {
-                    let (w, h) = (width.get() as u32, height.get() as u32);
-                    let mut f = Fb::new(w, h);
-                    let region = InclusiveRectangle {
-                        left: 0,
-                        top: 0,
-                        right: w.saturating_sub(1) as u16,
-                        bottom: h.saturating_sub(1) as u16,
-                    };
-                    f.apply_region(&buffer, region);
-                    fb = Some(f);
-                    let _ = ev.send(RdEvent::Resized { width: w, height: h });
-                    dirty = Some((0, 0, w, h));
-                    if !active {
-                        active = true;
-                        let _ = ev.send(RdEvent::State(RdState::Active));
-                    }
-                }
-                RdpOutputEvent::Terminated(reason) => {
-                    return Err(anyhow!("RDP 会话终止: {reason:?}"));
-                }
-                RdpOutputEvent::ConnectionFailure(err) => {
-                    return Err(anyhow!("RDP 连接失败: {err:?}"));
-                }
-                // ---- 远端光标 ----
-                // 服务器下发光标形状与位置，客户端负责绘制。
-                // 不处理的话画面里就没有远端光标，而本地系统光标还在 →
-                // 用户看到「两个鼠标」或者「远端没有指针」。
-                RdpOutputEvent::PointerBitmap(ptr) => {
-                    let _ = ev.send(RdEvent::Cursor {
-                        width: ptr.width,
-                        height: ptr.height,
-                        hotspot_x: ptr.hotspot_x,
-                        hotspot_y: ptr.hotspot_y,
-                        // ironrdp 的 bitmap_data 已是 RGBA8 预乘 alpha
-                        rgba: ptr.bitmap_data.clone(),
-                    });
-                }
-                RdpOutputEvent::PointerPosition { x, y } => {
-                    let _ = ev.send(RdEvent::CursorPos { x, y });
-                }
-                RdpOutputEvent::PointerHidden => {
-                    let _ = ev.send(RdEvent::CursorHidden);
-                }
-                RdpOutputEvent::PointerDefault => {
-                    // 恢复默认形状：宽度/高度为 0 表示「无自定义光标」，
-                    // 客户端据此隐藏远端光标绘制，退回本地系统光标。
-                    let _ = ev.send(RdEvent::CursorHidden);
-                }
-                _ => {}
-            },
-            Ok(None) => return Err(anyhow!("RDP 输出通道关闭")),
-            Err(_) => {}
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        // ---- 推送脏区 ----
-        if let (Some(rect), Some(f)) = (dirty, fb.as_ref()) {
-            if last_frame.elapsed() >= FRAME_INTERVAL {
-                last_frame = Instant::now();
-                dirty = None;
-                let (x, y, w, h) = rect;
-                let w = w.min(f.width.saturating_sub(x));
-                let h = h.min(f.height.saturating_sub(y));
-                if w > 0 && h > 0 {
-                    let rgba = f.sub_rgba(x, y, w, h);
-                    let _ = ev.send(RdEvent::Frame { x, y, w, h, rgba });
-                }
-            }
-        }
+    /// 旧版 Server 2008 的典型报错要能触发自动回退；
+    /// 凭据错误和本地配置错误则不能白白多连一次。
+    #[test]
+    fn nla_failure_detection_matches_old_server_errors() {
+        assert!(looks_like_nla_failure(&anyhow::anyhow!(
+            "invalid sequence tag identifier"
+        )));
+        assert!(looks_like_nla_failure(&anyhow::anyhow!(
+            "RDP 连接失败: TLS alert received: alert 80"
+        )));
+        assert!(looks_like_nla_failure(&anyhow::anyhow!(
+            "CredSSP NTLM authentication failed"
+        )));
+        assert!(!looks_like_nla_failure(&anyhow::anyhow!(
+            "logon failure: unknown user name or bad password"
+        )));
+        assert!(!looks_like_nla_failure(&anyhow::anyhow!(
+            "共享目录不存在或不是目录: D:\\share"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rdpdr_factory_requires_an_absolute_local_path() {
+        assert!(rdpdr_factory(r"D:\share").is_ok());
+        assert!(rdpdr_factory(r"D:\").is_ok());
+        assert!(rdpdr_factory(r"D:share").is_err());
+        assert!(rdpdr_factory(r"\share").is_err());
+        assert!(rdpdr_factory(r"\\server\share").is_err());
+        assert!(rdpdr_factory("relative").is_err());
+    }
+
+    /// 远端显示的名字要能区分共享的是哪个目录；整卷共享用盘符（与 mstsc 一致）。
+    #[test]
+    fn share_drive_name_follows_the_shared_directory() {
+        assert_eq!(share_drive_name(r"D:\rustterm"), "rustterm");
+        assert_eq!(share_drive_name(r"D:\rustterm\sub"), "sub");
+        assert_eq!(share_drive_name(r"D:\我的 目录"), "我的 目录");
+        assert_eq!(share_drive_name(r"D:\"), "D");
+        assert_eq!(share_drive_name("D:/"), "D");
     }
 }

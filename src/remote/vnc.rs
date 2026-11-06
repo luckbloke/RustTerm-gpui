@@ -23,6 +23,9 @@ const FULL_REFRESH_INTERVAL: Duration = Duration::from_millis(2000);
 /// 与参考实现一致的画面尺寸上限
 const MAX_FRAMEBUFFER_WIDTH: u16 = 7680;
 const MAX_FRAMEBUFFER_HEIGHT: u16 = 4320;
+/// 下行事件的等待窗口：有事件立刻返回，没事件就挂起这么久再回到「定时刷新」。
+/// 这个 await 同时是循环里唯一的让出点（current_thread 运行时靠它调度
+/// vnc-rs 内部 spawn 的解码 / 收发任务）。
 const POLL_INTERVAL: Duration = Duration::from_millis(8);
 
 struct Framebuffer {
@@ -378,97 +381,23 @@ pub async fn run(
                             .await;
                     }
                 }
+                // 本机剪贴板 → 远端（ClientCutText）。RFB 的剪贴板只有 Latin-1，
+                // 超出范围的字符按协议惯例替换成 '?'。
+                RdCommand::Clipboard(text) => {
+                    let latin1: String = text
+                        .chars()
+                        .map(|c| if (c as u32) <= 0xFF { c } else { '?' })
+                        .collect();
+                    let _ = client.input(X11Event::CopyText(latin1)).await;
+                }
             }
-        }
-
-        // ---- 下行事件 ----
-        match tokio::time::timeout(POLL_INTERVAL, client.poll_event()).await {
-            Ok(Ok(Some(event))) => match event {
-                VncEvent::SetResolution(screen) => {
-                    let (w, h) = (screen.width as u32, screen.height as u32);
-                    // 尺寸没变就不要重建帧缓冲：服务器常常在每次更新里
-                    // 都带一个 DesktopSize 伪编码，重建会把已经解出来的
-                    // 像素全清掉，画面会先闪一帧黑屏再重画。
-                    let same = fb
-                        .as_ref()
-                        .map(|f| f.width == w && f.height == h)
-                        .unwrap_or(false);
-                    if !same {
-                        fb = Some(Framebuffer::new(w, h)?);
-                        dirty = Some((0, 0, w, h));
-                        need_full = true;
-                        active = false;
-                    }
-                    let _ = ev.send(RdEvent::Resized {
-                        width: w,
-                        height: h,
-                    });
-                }
-                VncEvent::SetPixelFormat(p) => pf = p,
-                VncEvent::RawImage(rect, data) => {
-                    if let Some(f) = fb.as_mut() {
-                        f.blit(rect, &data, &pf)?;
-                        dirty = union(
-                            dirty,
-                            (rect.x as u32, rect.y as u32, rect.width as u32, rect.height as u32),
-                        );
-                    }
-                }
-                VncEvent::Copy(dst, src) => {
-                    if let Some(f) = fb.as_mut() {
-                        f.copy_rect(dst, src);
-                        dirty = union(
-                            dirty,
-                            (dst.x as u32, dst.y as u32, dst.width as u32, dst.height as u32),
-                        );
-                    }
-                }
-                VncEvent::JpegImage(rect, data) => {
-                    if let Some(f) = fb.as_mut() {
-                        if let Ok(img) = image::load_from_memory(&data) {
-                            let rgba = img.to_rgba8();
-                            let (w, h) = (rgba.width(), rgba.height());
-                            f.blit_rgba(rect, rgba.as_raw(), w, h);
-                            dirty = union(dirty, (rect.x as u32, rect.y as u32, w, h));
-                        }
-                    }
-                }
-                VncEvent::Error(msg) => return Err(anyhow!("VNC 服务器错误: {msg}")),
-                // ---- 远端光标 ----
-                // CursorPseudo 伪编码：服务器下发光标形状（BGRA + alpha）。
-                // 客户端要自己绘制并隐藏本地光标，否则会出现「两个鼠标」。
-                VncEvent::SetCursor(rect, data) => {
-                    let w = rect.width as u16;
-                    let h = rect.height as u16;
-                    if w == 0 || h == 0 {
-                        continue;
-                    }
-                    let _ = ev.send(RdEvent::Cursor {
-                        width: w,
-                        height: h,
-                        // VNC 的光标伪编码不带热点信息，按协议热点取左上角 (0,0)
-                        hotspot_x: 0,
-                        hotspot_y: 0,
-                        // vnc-rs 的 cursor 解码器已经按协商的 PixelFormat
-                        // 把 alpha 写进了正确的字节位；PixelFormat::bgra() 下
-                        // 字节序是 B,G,R,A，需要转成 RGBA 交给上层。
-                        rgba: bgra_to_rgba(&data, w as usize, h as usize),
-                    });
-                }
-                _ => {}
-            },
-            Ok(Ok(None)) => {}
-            Ok(Err(e)) => {
-                let msg = match e {
-                    VncError::IoError(e) => format!("连接中断: {e}"),
-                    other => format!("{other}"),
-                };
-                return Err(anyhow!("{msg}"));
-            }
-            Err(_) => {} // 轮询超时：正常
         }
 
         // ---- 定时请求画面更新 ----
+        //
+        // 顺序：先做「定时」（请求 / 推帧），最后才等事件。等事件是最长 8ms
+        // 的阻塞点，放在循环尾部，处理完一个事件就能立刻回到顶部把脏区推出去，
+        // 不必先空等一轮。
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
             last_refresh = Instant::now();
             if fb.is_some() {
@@ -503,6 +432,117 @@ pub async fn run(
                     }
                 }
             }
+        }
+
+        // ---- 下行事件（放在循环尾部：这是唯一的挂起点）----
+        //
+        // 用 `recv_event`（真阻塞）而不是 `poll_event`（内部是 `try_recv`）：
+        // 后者永远立刻返回 Ready，这一行 `timeout` 一次都不会真正挂起，
+        // 循环退化成空转 —— 一个核 100% 被吃掉，而 current_thread 运行时上
+        // vnc-rs 内部 spawn 的解码 / 收发任务只能等到输入 channel 反压
+        // 才被调度一次。`recv_event` 有事件立刻返回、没事件挂起到超时，
+        // 空闲时 CPU 占用接近 0，事件延迟也从一个轮询周期降到 0。
+        let downlink = tokio::time::timeout(POLL_INTERVAL, client.recv_event()).await;
+        match downlink {
+            Ok(Ok(event)) => match event {
+                VncEvent::SetResolution(screen) => {
+                    let (w, h) = (screen.width as u32, screen.height as u32);
+                    // 尺寸没变就不要重建帧缓冲：服务器常常在每次更新里
+                    // 都带一个 DesktopSize 伪编码，重建会把已经解出来的
+                    // 像素全清掉，画面会先闪一帧黑屏再重画。
+                    let same = fb
+                        .as_ref()
+                        .map(|f| f.width == w && f.height == h)
+                        .unwrap_or(false);
+                    if !same {
+                        fb = Some(Framebuffer::new(w, h)?);
+                        // 新帧缓冲里全是 0，**不要**把它当脏区推上去：
+                        // 那样 UI 会先收到一整屏黑（RDP 首帧黑闪就是这么来的），
+                        // 服务器回第一帧慢的时候还会一直黑着。真正的脏区
+                        // 等 RawImage / Copy / Jpeg 事件标。
+                        dirty = None;
+                        need_full = true;
+                        active = false;
+                    }
+                    let _ = ev.send(RdEvent::Resized {
+                        width: w,
+                        height: h,
+                    });
+                }
+                VncEvent::SetPixelFormat(p) => pf = p,
+                VncEvent::RawImage(rect, data) => {
+                    #[cfg(feature = "devtools")]
+                    eprintln!(
+                        "[vncdbg] RawImage ({},{}) {}x{} data[0..8]={:?}",
+                        rect.x, rect.y, rect.width, rect.height, &data[..data.len().min(8)]
+                    );
+                    if let Some(f) = fb.as_mut() {
+                        f.blit(rect, &data, &pf)?;
+                        dirty = union(
+                            dirty,
+                            (rect.x as u32, rect.y as u32, rect.width as u32, rect.height as u32),
+                        );
+                    }
+                }
+                VncEvent::Copy(dst, src) => {
+                    if let Some(f) = fb.as_mut() {
+                        f.copy_rect(dst, src);
+                        dirty = union(
+                            dirty,
+                            (dst.x as u32, dst.y as u32, dst.width as u32, dst.height as u32),
+                        );
+                    }
+                }
+                VncEvent::JpegImage(rect, data) => {
+                    if let Some(f) = fb.as_mut() {
+                        if let Ok(img) = image::load_from_memory(&data) {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = (rgba.width(), rgba.height());
+                            f.blit_rgba(rect, rgba.as_raw(), w, h);
+                            dirty = union(dirty, (rect.x as u32, rect.y as u32, w, h));
+                        }
+                    }
+                }
+                VncEvent::Error(msg) => return Err(anyhow!("VNC 服务器错误: {msg}")),
+                // ---- 远端光标 ----
+                // CursorPseudo 伪编码：服务器下发光标形状（BGRA + alpha）。
+                // 客户端要自己绘制并隐藏本地光标，否则会出现「两个鼠标」。
+                VncEvent::SetCursor(rect, data) => {
+                    let w = rect.width as u16;
+                    let h = rect.height as u16;
+                    // 0×0 是「光标形状不变」，不需要转发（也不要打断本轮的刷新逻辑）
+                    if w != 0 && h != 0 {
+                        let _ = ev.send(RdEvent::Cursor {
+                            width: w,
+                            height: h,
+                            // VNC 的光标伪编码不带热点信息，按协议热点取左上角 (0,0)
+                            hotspot_x: 0,
+                            hotspot_y: 0,
+                            // vnc-rs 的 cursor 解码器已经按协商的 PixelFormat
+                            // 把 alpha 写进了正确的字节位；PixelFormat::bgra() 下
+                            // 字节序是 B,G,R,A，需要转成 RGBA 交给上层。
+                            rgba: bgra_to_rgba(&data, w as usize, h as usize),
+                        });
+                    }
+                }
+                // ---- 远端剪贴板 ----
+                // ServerCutText：服务器剪贴板变化时下发，交给 UI 写进本机剪贴板
+                //（参数 params.clipboard 在 UI 侧已经决定了要不要开同步，
+                // 这里照单转发即可）。
+                VncEvent::Text(text) => {
+                    let _ = ev.send(RdEvent::Clipboard(text));
+                }
+                _ => {}
+            },
+            Ok(Err(e)) => {
+                let msg = match e {
+                    VncError::IoError(e) => format!("连接中断: {e}"),
+                    other => format!("{other}"),
+                };
+                return Err(anyhow!("{msg}"));
+            }
+            // 超时：这段时间没有事件，属于正常情况（交给下一轮的定时刷新）
+            Err(_) => {}
         }
     }
 }

@@ -4,7 +4,7 @@
 //! - 渲染：整帧 BGRA 缓冲 + `RenderImage` 贴图（canvas 元素）
 //! - 输入：键盘（扫描码 + keysym，gpui 键名映射）、鼠标、滚轮转发到远端
 
-use crate::remote::{self, RdCommand, RdEvent, RdParams, RdProtocol, RdSession, RdState};
+use crate::remote::{self, RdCommand, RdEvent, RdParams, RdProtocol, RdSession, RdState, TransferUpdate};
 use crate::ui_icons::ic;
 use crate::widgets::password_field;
 
@@ -54,6 +54,25 @@ impl RdTabProtocol {
     pub fn all() -> [RdTabProtocol; 3] {
         [RdTabProtocol::Vnc, RdTabProtocol::Rdp, RdTabProtocol::Spice]
     }
+
+    /// 存盘用的稳定键名（`label()` 是给人看的，会随文案变，不能拿来做标识）。
+    pub fn key(self) -> &'static str {
+        match self {
+            RdTabProtocol::Vnc => "vnc",
+            RdTabProtocol::Rdp => "rdp",
+            RdTabProtocol::Spice => "spice",
+        }
+    }
+
+    /// 从存盘键名还原；老版本/未知值返回 `None`（快照里那一项直接跳过）。
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "vnc" => Some(RdTabProtocol::Vnc),
+            "rdp" => Some(RdTabProtocol::Rdp),
+            "spice" => Some(RdTabProtocol::Spice),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +85,21 @@ pub struct RdpConnectionProfile {
     pub password: String,
     pub domain: String,
     pub color_depth: u8,
+    /// 共享给远端的本机目录（仅 RDP；空 = 不共享）。
+    ///
+    /// RDP 通过 RDPDR 通道把它挂成远端「我的电脑」里的一个盘符，
+    /// 往远端拷贝文件就是普通的资源管理器拖拽。
+    pub share_dir: String,
+    /// 旧版服务器兼容模式（Windows Server 2008 / 2008 R2 等）。
+    ///
+    /// 勾选后连接时跳过 NLA（CredSSP），只用 TLS 安全层。
+    /// 即使不勾选，NLA 握手失败时后端也会自动回退一次。
+    pub legacy_compat: bool,
+    /// 该档案来自哪条保存的会话（`None` = 「新建远程桌面」这种临时连接）。
+    ///
+    /// 用来把标签页里改的共享目录写回 `sessions.json`：
+    /// 表单是本次运行的临时状态，会话才是跨重启的真相。
+    pub session_id: Option<String>,
 }
 
 impl Default for RdpConnectionProfile {
@@ -79,6 +113,9 @@ impl Default for RdpConnectionProfile {
             password: String::new(),
             domain: String::new(),
             color_depth: 32,
+            share_dir: String::new(),
+            legacy_compat: false,
+            session_id: None,
         }
     }
 }
@@ -153,6 +190,21 @@ fn view_rect_of(
     )
 }
 
+/// 字节数 → 人看得懂的大小。
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while v >= 1024.0 && unit + 1 < UNITS.len() {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
+}
+
 /// 连接表单输入实体。
 #[derive(Clone)]
 pub struct RdFormInputs {
@@ -163,6 +215,8 @@ pub struct RdFormInputs {
     pub domain: Entity<InputState>,
     pub width: Entity<InputState>,
     pub height: Entity<InputState>,
+    /// 共享目录（仅 RDP 显示）
+    pub share: Entity<InputState>,
 }
 
 pub struct RemoteDesktopTab {
@@ -171,6 +225,8 @@ pub struct RemoteDesktopTab {
     /// 最近一次失败原因（后端会先发 Error 再发 Disconnected，
     /// 后者不能把错误信息冲掉，否则用户只看到「连不上」没有原因）
     pub last_error: Option<String>,
+    /// 连接过程中的非致命提示（例如 NLA 失败后自动改用 TLS 兼容模式）。
+    pub notice: Option<String>,
     /// 帧缓冲（RGBA 主缓冲 + BGRA 纹理缓冲）——逻辑见 framebuf 模块
     pub fb: crate::framebuf::FrameBuffer,
     /// 当前可绘制的整帧图像（BGRA，GPUI 渲染器格式）
@@ -205,6 +261,29 @@ pub struct RemoteDesktopTab {
     cursor_pos: (u16, u16),
     /// 远端是否要求隐藏光标
     cursor_hidden: bool,
+    /// 最近一次同步到远端的本机剪贴板内容（去重：不变就不重发）。
+    last_local_clip: Option<String>,
+    /// 最近一次由远端写进本机剪贴板的内容（防止「写回 → 读到自己 → 再发回远端」的回环）。
+    last_clip_write: Option<String>,
+    /// 本机剪贴板轮询节流（VNC 没有剪贴板变化通知，只能定时查）
+    clip_check_t: std::time::Instant,
+    /// 认为远端当前所处的 CapsLock 状态。
+    ///
+    /// VNC / RDP 都没有 LED 状态回传，只能假定「连上时远端是关的」，
+    /// 之后每次按键前比对本地状态，不一致就补发一次 Caps_Lock。
+    remote_caps: bool,
+    /// 剪贴板文件传输的最近一条状态（进度 / 结果），显示在工具条右侧。
+    transfer: Option<TransferUi>,
+}
+
+/// 剪贴板传文件的状态条内容。
+struct TransferUi {
+    text: String,
+    /// 传输已结束（成功或失败）：过一会儿自动消失，别一直占着工具条
+    finished: bool,
+    /// 失败时用红色显示
+    failed: bool,
+    at: std::time::Instant,
 }
 
 /// 远端光标：位图 + 热点偏移。
@@ -228,6 +307,7 @@ impl RemoteDesktopTab {
             profile,
             state: RdState::Disconnected,
             last_error: None,
+            notice: None,
             fb: crate::framebuf::FrameBuffer::new(),
             image: None,
             fit: true,
@@ -246,6 +326,11 @@ impl RemoteDesktopTab {
             cursor: None,
             cursor_pos: (0, 0),
             cursor_hidden: false,
+            last_local_clip: None,
+            last_clip_write: None,
+            clip_check_t: std::time::Instant::now(),
+            remote_caps: false,
+            transfer: None,
         }
     }
 
@@ -298,8 +383,23 @@ impl RemoteDesktopTab {
             width: self.desired.0,
             height: self.desired.1,
             color_depth: self.profile.color_depth,
+            // 剪贴板通道在建连时协商：中途切换开关要重连才生效
+            clipboard: self.clipboard_sync,
+            share_dir: if self.profile.protocol == RdTabProtocol::Rdp {
+                let d = self.profile.share_dir.trim();
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_string())
+                }
+            } else {
+                None
+            },
+            legacy_compat: self.profile.legacy_compat,
         };
         self.state = RdState::Connecting;
+        self.notice = None;
+        self.last_error = None;
         self.session = Some(remote::spawn(params));
         self.prev_mods = (false, false, false);
         self.buttons = 0;
@@ -310,6 +410,11 @@ impl RemoteDesktopTab {
         self.cursor = None;
         self.cursor_pos = (0, 0);
         self.cursor_hidden = false;
+        // 剪贴板去重状态也随会话重置
+        self.last_local_clip = None;
+        self.last_clip_write = None;
+        // 新会话的远端 CapsLock 假定为关（没有 LED 回传，只能这样起步）
+        self.remote_caps = false;
     }
 
     pub fn disconnect(&mut self) {
@@ -317,6 +422,7 @@ impl RemoteDesktopTab {
             s.close();
         }
         self.last_error = None;
+        self.notice = None;
         self.state = RdState::Disconnected;
         self.image = None;
         self.fb.clear();
@@ -328,7 +434,10 @@ impl RemoteDesktopTab {
     }
 
     /// 消费后端事件并更新整帧缓冲。返回是否有新画面。
-    pub fn poll(&mut self) -> bool {
+    ///
+    /// 剪贴板事件在这里单独处理（写本机剪贴板需要 `cx`），
+    /// 其余都转给 [`Self::apply_event`]。
+    pub fn poll(&mut self, cx: &mut App) -> bool {
         let mut got_frame = false;
 
         let mut events: Vec<RdEvent> = Vec::new();
@@ -339,7 +448,41 @@ impl RemoteDesktopTab {
         }
 
         for ev in events {
-            got_frame |= self.apply_event(ev);
+            match ev {
+                RdEvent::Clipboard(text) => {
+                    // 远端 → 本机：写系统剪贴板。记住内容防止回环
+                    //（本机剪贴板轮询会读到这次写入，不能当成「用户复制了」再发回去）。
+                    if self.clipboard_sync && self.last_clip_write.as_deref() != Some(text.as_str())
+                    {
+                        crate::term::copy_to_clipboard(cx, text.clone());
+                        self.last_clip_write = Some(text);
+                        self.last_local_clip = None;
+                    }
+                }
+                other => {
+                    got_frame |= self.apply_event(other);
+                }
+            }
+        }
+
+        // ---- 本机 → 远端 ----
+        // RDP 的 CLIPRDR + WinClipboard 在后端自行双向同步（见 remote/rdp.rs）；
+        // VNC 没有变化通知，只能节流轮询本机剪贴板。
+        if self.clipboard_sync
+            && self.is_active()
+            && self.profile.protocol == RdTabProtocol::Vnc
+            && self.clip_check_t.elapsed().as_millis() >= 500
+        {
+            self.clip_check_t = std::time::Instant::now();
+            if let Some(text) = crate::term::read_clipboard(cx) {
+                if !text.is_empty()
+                    && self.last_clip_write.as_deref() != Some(text.as_str())
+                    && self.last_local_clip.as_deref() != Some(text.as_str())
+                {
+                    self.send(RdCommand::Clipboard(text.clone()));
+                    self.last_local_clip = Some(text);
+                }
+            }
         }
 
         // ---- 上传纹理：RGBA 主缓冲 → BGRA 副本 ----
@@ -379,6 +522,10 @@ impl RemoteDesktopTab {
                     self.session = None;
                 }
                 other => {
+                    // 连上以后不再显示「正在回退」之类的过程提示
+                    if other == RdState::Active {
+                        self.notice = None;
+                    }
                     self.state = other;
                 }
             },
@@ -426,6 +573,41 @@ impl RemoteDesktopTab {
                 self.last_error = Some(msg.clone());
                 self.state = RdState::Failed(msg);
             }
+            // 非致命提示：只更新连接中的状态行，不进入失败状态
+            RdEvent::Notice(msg) => {
+                self.notice = Some(msg);
+            }
+            // 剪贴板传文件：只更新工具条右侧那一行状态
+            RdEvent::Transfer(update) => {
+                let (text, finished, failed) = match update {
+                    TransferUpdate::Progress { sent, total } => {
+                        let text = if total == 0 {
+                            format!("剪贴板传文件 {}", human_size(sent))
+                        } else {
+                            format!(
+                                "剪贴板传文件 {:.0}%（{} / {}）",
+                                sent as f64 * 100.0 / total as f64,
+                                human_size(sent),
+                                human_size(total)
+                            )
+                        };
+                        (text, false, false)
+                    }
+                    TransferUpdate::Done(hint) => (hint, true, false),
+                    TransferUpdate::Failed(err) => {
+                        (format!("剪贴板传文件失败：{err}"), true, true)
+                    }
+                };
+                self.transfer = Some(TransferUi {
+                    text,
+                    finished,
+                    failed,
+                    at: std::time::Instant::now(),
+                });
+            }
+            // 剪贴板事件在 poll() 里已经消费（写系统剪贴板需要 cx），
+            // 走到这里说明是测试路径，直接忽略。
+            RdEvent::Clipboard(_) => {}
         }
         got_frame
     }
@@ -494,7 +676,40 @@ impl RemoteDesktopTab {
     // 输入转发（由 app 层事件监听器调用）
     // ------------------------------------------------------------------
 
+    /// 让远端 CapsLock 状态与本地一致。
+    ///
+    /// RFB / RDP 都没有「远端锁定键状态」的反馈通道，所以只能：
+    /// 连接时假定远端为关，之后每次按键前读一次本地状态，不一致就补发一次
+    /// Caps_Lock 按下 + 抬起。少了这一步，本地开灯后输入的字母在远端
+    /// 还是小写（反之亦然），是 VNC 客户端最常见的「大小写不听话」。
+    fn sync_caps_lock(&mut self) {
+        let local = crate::win32::caps_lock_on();
+        if local == self.remote_caps {
+            return;
+        }
+        self.remote_caps = local;
+        for down in [true, false] {
+            self.send(RdCommand::Key(remote::KeyInput {
+                // PC/AT set-1 的 CapsLock 扫描码；keysym 为 XK_Caps_Lock
+                scancode: 0x3a,
+                keysym: 0xffe5,
+                ch: None,
+                down,
+            }));
+        }
+    }
+
     fn send_key(&mut self, ks: &Keystroke, down: bool) {
+        // CapsLock 键本身不再透传：本地按下时系统已经切换了本地状态，
+        // 这里交给 sync_caps_lock 折算成「一次远端切换」，
+        // 否则本地按一次 + 同步补一次 = 远端连切两次（等于没切）。
+        if ks.key == "capslock" {
+            if down {
+                self.sync_caps_lock();
+            }
+            return;
+        }
+        self.sync_caps_lock();
         self.apply_mods((
             ks.modifiers.shift,
             ks.modifiers.control,
@@ -640,7 +855,16 @@ impl RemoteDesktopTab {
         window: &mut Window,
         cx: &mut Context<crate::app::RustTermApp>,
     ) -> AnyElement {
-        self.poll();
+        self.poll(cx);
+
+        // 传文件的结果提示留一会儿就撤，避免工具条一直挂着一行旧状态
+        if self
+            .transfer
+            .as_ref()
+            .is_some_and(|t| t.finished && t.at.elapsed().as_secs() >= 8)
+        {
+            self.transfer = None;
+        }
 
         if self.focus.is_none() {
             self.focus = Some(cx.focus_handle());
@@ -665,13 +889,13 @@ impl RemoteDesktopTab {
             }
             RdState::Connecting | RdState::Authenticating => {
                 let connecting = self.state == RdState::Connecting;
+                let mut status = if connecting { "正在连接…" } else { "正在认证…" }.to_string();
+                if let Some(note) = &self.notice {
+                    status.push(' ');
+                    status.push_str(note);
+                }
                 toolbar = toolbar
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(dim)
-                            .child(if connecting { "正在连接…" } else { "正在认证…" }),
-                    )
+                    .child(div().text_size(px(12.0)).text_color(dim).child(status))
                     .child(
                         Button::new("rd-cancel")
                             .label("取消")
@@ -717,7 +941,17 @@ impl RemoteDesktopTab {
                     .label("剪贴板")
                     .checked(self.clipboard_sync)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        // 会话中切换：通道是建连时协商的，提示重连生效
+                        let was_active =
+                            this.active_rd_ref().map(|t| t.is_active()).unwrap_or(false);
                         this.active_rd(|t| t.clipboard_sync = *checked);
+                        if was_active {
+                            this.set_toast(if *checked {
+                                "剪贴板同步将在下次连接时生效"
+                            } else {
+                                "已关闭剪贴板同步（重新连接后完全停止）"
+                            });
+                        }
                         cx.notify();
                     })),
             )
@@ -732,6 +966,18 @@ impl RemoteDesktopTab {
                         )),
                 )
             });
+
+        // 剪贴板传文件的状态：进度常驻，结果 8 秒后自动消失
+        if let Some(t) = &self.transfer {
+            toolbar = toolbar.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(if t.failed { theme.colors.danger } else { dim })
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(t.text.clone()),
+            );
+        }
 
         if let Some(err) = self.error().map(|e| e.to_string()) {
             toolbar = toolbar
@@ -957,6 +1203,7 @@ impl RemoteDesktopTab {
             let username = self.profile.username.clone();
             let password = self.profile.password.clone();
             let domain = self.profile.domain.clone();
+            let share = self.profile.share_dir.clone();
             let (dw, dh) = self.desired;
             // RDP 必须有用户名，占位符直接点明，避免等到握手超时才发现
             let user_ph = if self.profile.protocol == RdTabProtocol::Rdp {
@@ -985,6 +1232,11 @@ impl RemoteDesktopTab {
                 domain: mk(domain, "可空", false),
                 width: mk(dw.to_string(), "", false),
                 height: mk(dh.to_string(), "", false),
+                share: mk(
+                    share,
+                    r"D:\share 或 D:\share\子目录（可选，RDP 共享目录）",
+                    false,
+                ),
             });
         }
         let form = self.form.clone().unwrap();
@@ -1035,12 +1287,60 @@ impl RemoteDesktopTab {
         }
         content = content.child(proto_row).child(field("主机", &form.host)).child(field("端口", &form.port));
         if self.profile.protocol == RdTabProtocol::Rdp {
+            // 共享目录：RDP 独有的「传文件」手段 —— 把本机目录挂成远端盘符。
+            // VNC / SPICE 没有标准文件通道（RFB 只有剪贴板），所以只在 RDP 下显示。
+            let share_row = div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(64.0)).text_size(px(12.0)).child("共享目录"))
+                .child(Input::new(&form.share).flex_1().text_size(px(12.0)))
+                .child(
+                    Button::new("rd-share-pick")
+                        .label("浏览…")
+                        .compact()
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            crate::app::RustTermApp::pick_folder_async(
+                                cx,
+                                window,
+                                |this, window, cx, path| {
+                                    this.active_rd(|t| {
+                                        t.profile.share_dir = path.clone();
+                                        if let Some(f) = &t.form {
+                                            let input = f.share.clone();
+                                            input.update(cx, |s, cx| {
+                                                s.set_value(path.clone(), window, cx)
+                                            });
+                                        }
+                                    });
+                                    cx.notify();
+                                },
+                            );
+                        })),
+                );
             content = content
                 .child(field("用户", &form.username))
                 .child(pw_field("密码", &form.password))
-                .child(field("域", &form.domain));
+                .child(field("域", &form.domain))
+                .child(share_row)
+                .child(
+                    Checkbox::new("rd-legacy")
+                        .label("旧版服务器兼容（Server 2008：禁用 NLA，仅用 TLS）")
+                        .checked(self.profile.legacy_compat)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.active_rd(|t| t.profile.legacy_compat = *checked);
+                            // 勾选状态也属于会话设置：下次从侧栏连同一个会话要保留
+                            this.persist_rd_settings();
+                            cx.notify();
+                        })),
+                );
         } else {
-            content = content.child(pw_field("密码", &form.password));
+            content = content.child(pw_field("密码", &form.password)).child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(dim)
+                    .child("该协议没有文件传输通道：需要传文件请用右侧 SFTP 面板，或改用 RDP 共享目录"),
+            );
         }        content = content.child(
             div()
                 .h_flex()
@@ -1071,13 +1371,11 @@ impl RemoteDesktopTab {
                     .label("连接")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.active_rd(|t| {
-                            // 表单值回填
-                            if let Some(f) = &t.form {
-                                // 输入值在 app 层读取后回填（见 active_rd_connect）
-                                let _ = f;
-                            }
                             t.connect_from_form(cx);
                         });
+                        // 表单里可能刚改过共享目录/兼容开关：写回它来源的会话，
+                        // 否则下次从侧栏连同一个会话，盘符或兼容设置又没了。
+                        this.persist_rd_settings();
                     })),
             );
         }
@@ -1163,6 +1461,12 @@ impl RemoteDesktopTab {
             if let Ok(h) = get(&f.height).trim().parse::<u16>() {
                 self.desired.1 = h.clamp(480, 2160);
             }
+            // 共享目录只对 RDP 有意义（VNC/SPICE 没有文件通道）
+            self.profile.share_dir = if self.profile.protocol == RdTabProtocol::Rdp {
+                get(&f.share).trim().to_string()
+            } else {
+                String::new()
+            };
         }
         self.connect();
     }

@@ -8,6 +8,7 @@
 //! 不必整帧重传（各协议内部维护完整帧缓冲，脏区合并后节流推送）。
 
 pub mod rdp;
+pub mod rdp_clipboard;
 pub mod spice;
 pub mod vnc;
 
@@ -35,6 +36,30 @@ pub struct RdParams {
     pub height: u16,
     /// 16 / 24 / 32
     pub color_depth: u8,
+    /// 是否开启剪贴板同步。
+    ///
+    /// - RDP：协商 CLIPRDR 通道，文本双向同步；**没配共享目录时**文件也走剪贴板
+    ///   （配了共享目录则文件只走 RDPDR 盘符，剪贴板只传文本）；
+    /// - VNC：`VncEvent::Text` 上报远端剪贴板、`X11Event::CopyText` 下发本机剪贴板；
+    /// - SPICE：后端尚未实现剪贴板通道，此开关暂无效果。
+    ///
+    /// 通道是建连时协商的：会话中途切换开关只对**下次连接**生效。
+    pub clipboard: bool,
+    /// 共享给远端的本机目录（RDP 专用）。
+    ///
+    /// RDP 走 RDPDR 通道把本地目录挂成远端的一个盘符，用户可以像操作
+    /// 本地磁盘一样往远端拷文件；不需要在远端安装任何服务。
+    /// VNC 与 SPICE 没有标准的文件通道（RFB 只有剪贴板），这里为 `None`。
+    pub share_dir: Option<String>,
+    /// 旧版服务器兼容模式（Windows Server 2008 / 2008 R2 等）。
+    ///
+    /// 这些服务器的 CredSSP/NLA 实现与客户端 sspi 存在已知兼容问题：
+    /// 协商阶段会收到 TLS alert 80，或服务端无法解析 TSRequest
+    ///（`invalid sequence tag identifier`）。开启后直接跳过 NLA，
+    /// 只用 TLS 安全层；凭据改由 Client Info PDU 以自动登录方式发送。
+    ///
+    /// 不开启时也会在 NLA 握手失败后自动回退一次，只是不记住这次选择。
+    pub legacy_compat: bool,
 }
 
 impl Default for RdParams {
@@ -49,6 +74,9 @@ impl Default for RdParams {
             width: 1280,
             height: 800,
             color_depth: 32,
+            clipboard: true,
+            share_dir: None,
+            legacy_compat: false,
         }
     }
 }
@@ -59,6 +87,21 @@ pub enum RdState {
     Authenticating,
     Active,
     Disconnected,
+    Failed(String),
+}
+
+/// 剪贴板文件传输的进度（仅 RDP，走 CLIPRDR 的文件通道）。
+///
+/// mstsc 的「本机复制文件 → 远端粘贴」走的是延迟渲染：先是文件列表
+/// （`FileGroupDescriptorW`），再按 `FileContentsRequest` 一块块拉内容。
+/// 后端把进度折算成这个结构，UI 只负责显示。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferUpdate {
+    /// 正在传输：已传 / 总字节（`total == 0` 表示远端没告知大小）
+    Progress { sent: u64, total: u64 },
+    /// 传输完成，附带一句给用户看的提示
+    Done(String),
+    /// 传输失败 / 被远端取消
     Failed(String),
 }
 
@@ -94,6 +137,16 @@ pub enum RdEvent {
     CursorPos { x: u16, y: u16 },
     /// 远端要求隐藏光标（例如鼠标移出远端窗口、或进入全屏视频）。
     CursorHidden,
+    /// 远端剪贴板文本（VNC `ServerCutText`；RDP 走后端原生的系统剪贴板，
+    /// 不经过这条事件）。
+    Clipboard(String),
+    /// 非致命的连接提示（例如 NLA 握手失败后自动改用 TLS 兼容模式）。
+    ///
+    /// 与 [`RdEvent::Error`] 不同：收到它仍然继续连接，UI 只把它显示在
+    /// 连接中的状态行里，不进入失败状态。
+    Notice(String),
+    /// 剪贴板文件传输状态（仅 RDP）。
+    Transfer(TransferUpdate),
     Error(String),
 }
 
@@ -116,6 +169,8 @@ pub enum RdCommand {
     /// 绝对指针位置 + 按键位掩码（1=左 2=中 4=右）
     Pointer { x: u16, y: u16, buttons: u8 },
     Wheel { dy: i16 },
+    /// 本机剪贴板文本 → 远端（VNC `ClientCutText`；RDP 由后端原生通道自行处理）。
+    Clipboard(String),
     Close,
 }
 
@@ -153,7 +208,24 @@ impl Drop for RdSession {
 /// "Got empty identity"。原始报错对普通用户毫无意义，这里补一句怎么办。
 fn friendly_error(protocol: RdProtocol, msg: &str) -> String {
     let lower = msg.to_lowercase();
-    let hint = if lower.contains("authentication failed") || lower.contains("wrongpassword") {
+    let hint = if protocol == RdProtocol::Rdp
+        && (lower.contains("rdpdr") || lower.contains("drive redirection") || lower.contains("redirected"))
+    {
+        Some(
+            "RDP 驱动器重定向失败：请确认远端组策略没有禁用「驱动器重定向」\
+             （计算机配置 → 管理模板 → Windows 组件 → 远程桌面服务 → \
+             远程桌面会话主机 → 设备和资源重定向），并确认共享目录存在且当前用户可读",
+        )
+    } else if lower.contains("invalid sequence tag")
+        || lower.contains("tsrequest")
+        || lower.contains("tls alert")
+    {
+        // Windows Server 2008 / 2008 R2 的 CredSSP 与客户端 sspi 有已知兼容问题
+        Some(
+            "服务器可能是 Windows Server 2008 / 2008 R2：NLA 握手不兼容，\
+             请在连接表单勾选「旧版服务器兼容（禁用 NLA）」后重试",
+        )
+    } else if lower.contains("authentication failed") || lower.contains("wrongpassword") {
         match protocol {
             RdProtocol::Vnc => Some("VNC 密码错误或未填写：在远程桌面连接表单的「密码」栏填写（也可右键会话 → 编辑… 填好后重连）"),
             RdProtocol::Spice => Some("SPICE 密码错误或未填写：在远程桌面连接表单的「密码」栏填写（也可右键会话 → 编辑… 填好后重连）"),

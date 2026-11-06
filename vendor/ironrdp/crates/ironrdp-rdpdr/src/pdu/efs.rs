@@ -1193,10 +1193,10 @@ impl DeviceAnnounceHeader {
             device_type: DeviceType::Filesystem,
             device_id,
             // With DRIVE_CAPABILITY_VERSION_02, DeviceData contains the complete
-            // null-terminated Unicode name. The field remains mandatory even
+            // null-terminated name. The field remains mandatory even
             // though the server ignores it when DeviceDataLength is nonzero.
             preferred_dos_name: PreferredDosName::for_drive(&name),
-            device_data: utf16le_with_nul(&name),
+            device_data: drive_name_8bit_with_nul(&name),
         }
     }
 
@@ -1390,6 +1390,38 @@ fn utf16le_with_nul(s: &str) -> Vec<u8> {
         out.extend_from_slice(&unit.to_le_bytes());
     }
     out.extend_from_slice(&[0, 0] /* UTF-16 NUL terminator */);
+    out
+}
+
+/// Announces a filesystem device name as 8-bit characters, NUL-terminated.
+///
+/// NyaTerm (upstream IronRDP #2342): Windows reads the filesystem
+/// `DEVICE_ANNOUNCE` `DeviceData` as 8-bit characters even though
+/// MS-RDPEFS 2.2.3.1 defines a null-terminated Unicode string, so a UTF-16LE
+/// name ended after its first letter (`\\tsclient\t` for `trd rw`; Windows 11
+/// build 26300, Windows Server 2022 and 2025 all behave this way). FreeRDP and
+/// rdesktop announce 8-bit characters as well. Non-ASCII characters and the
+/// ones MS-RDPEFS 2.2.1.3 forbids in `PreferredDosName` (`<`, `>`, `"`, `/`,
+/// `\`, `|`, and a colon before the end) become `_`, as in FreeRDP; a trailing
+/// colon is kept (`C:` stays `\\tsclient\C`). A server that decodes the field
+/// as Unicode, as the specification says, would misread the name; xrdp names
+/// drives from `PreferredDosName`, which is unchanged.
+fn drive_name_8bit_with_nul(name: &str) -> Vec<u8> {
+    let characters = name.chars().collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(characters.len() + 1 /* NUL terminator */);
+    for (index, &character) in characters.iter().enumerate() {
+        let is_trailing_colon = character == ':' && index + 1 == characters.len();
+        let mapped = if is_trailing_colon
+            || character.is_ascii_alphanumeric()
+            || matches!(character, ' ' | '_' | '-' | '.')
+        {
+            character
+        } else {
+            '_'
+        };
+        out.push(u8::try_from(mapped).unwrap_or(b'_'));
+    }
+    out.push(0);
     out
 }
 

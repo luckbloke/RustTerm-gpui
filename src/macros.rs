@@ -467,8 +467,8 @@ impl MacroPanel {
                                     .tooltip("发送到终端")
                                     .compact()
                                     .disabled(!enabled)
-                                    .on_click(cx.listener(move |this, _, _, _| {
-                                        this.send_macro_to_active(idx);
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_macro_to_active(idx, cx);
                                     })),
                             )
                             .child(
@@ -1002,8 +1002,15 @@ impl MacroPanel {
     }
 }
 
-pub fn apply_keep_alive() {
-    // keep-alive 边缘处理：发送空包保持 SSH 连接
+/// 把配置里的 Keep-Alive 间隔推给所有**已经在跑**的会话。
+///
+/// 心跳本身由 `backends/ssh.rs` 的会话任务发（每秒醒一次，攒够间隔就发一个
+/// `keepalive@openssh.com`，`want_reply = true` 顺带探活）。这里只写全局量，
+/// 不改已建好的连接 —— 所以改配置不用重连，下一个心跳周期就按新值走。
+///
+/// `interval_secs == 0` 表示关闭心跳。
+pub fn apply_keep_alive(interval_secs: u64) {
+    crate::config::set_keep_alive_interval(interval_secs);
 }
 
 #[cfg(test)]

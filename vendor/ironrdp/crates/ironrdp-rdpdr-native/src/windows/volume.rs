@@ -41,6 +41,13 @@ pub(crate) fn query_information(
         ),
         _ => None,
     };
+    // NyaTerm diagnostic: see `windows::trace_enabled`.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] query-volume {information_class:?} file={} -> {status:?}",
+            req.device_io_request.file_id
+        ));
+    }
     debug!(
         ?information_class,
         ?status,

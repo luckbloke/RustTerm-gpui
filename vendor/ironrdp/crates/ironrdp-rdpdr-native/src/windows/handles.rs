@@ -49,13 +49,13 @@ pub(crate) const RENAME_DESTINATION_DIRECTORY_ACCESS: FILE_ACCESS_RIGHTS = FILE_
 const DIRECTORY_TRAVERSAL_ACCESS: FILE_ACCESS_RIGHTS =
     FILE_ACCESS_RIGHTS(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0);
 
-/// A validated native path for a logical-volume root.
+/// A validated native path for a redirected root directory.
 pub(crate) struct RootDirectory {
     nt_path: Vec<u16>,
 }
 
 impl RootDirectory {
-    /// Validates the native path of a logical-volume root.
+    /// Validates the native path of the redirected root directory.
     pub(crate) fn open(path: &Path) -> Result<Self, OpenDirectoryError> {
         Ok(Self {
             nt_path: volume_root_nt_path(path).ok_or(OpenDirectoryError::InvalidVolumeRoot)?,
@@ -1046,10 +1046,10 @@ pub(crate) const FILE_OPENED_INFORMATION: usize = 1;
 pub(crate) const FILE_CREATED_INFORMATION: usize = 2;
 pub(crate) const FILE_OVERWRITTEN_INFORMATION: usize = 3;
 
-/// Failure while opening a selected redirected-volume root.
+/// Failure while opening a selected redirected root directory.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum OpenDirectoryError {
-    /// The selection is not a logical Windows volume root (`C:\`).
+    /// The selection is not an absolute local directory path (`C:\`, `C:\dir`).
     InvalidVolumeRoot,
     /// The native open failed without disclosing the host path.
     NtStatus(NTSTATUS),
@@ -1058,7 +1058,7 @@ pub(crate) enum OpenDirectoryError {
 impl fmt::Display for OpenDirectoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidVolumeRoot => f.write_str("redirected drive must be a logical volume root"),
+            Self::InvalidVolumeRoot => f.write_str("redirected root must be an absolute local directory path"),
             Self::NtStatus(status) => write!(
                 f,
                 "opening redirected-drive root failed with NTSTATUS {:#010X}",
@@ -1070,19 +1070,55 @@ impl fmt::Display for OpenDirectoryError {
 
 impl core::error::Error for OpenDirectoryError {}
 
+/// Converts the selected local directory into the native path used as the
+/// redirected root.
+///
+/// Upstream only accepted a logical volume root (`D:\`), which forces users to
+/// expose an entire drive. We also accept an absolute directory beneath it
+/// (`D:\rustterm`), so a single folder can be redirected. Everything else is
+/// still refused: drive-relative (`D:rustterm`), root-relative (`\rustterm`),
+/// UNC and namespace (`\\?\`, `\\.\`) forms, embedded NULs, and `.`/`..`
+/// components, none of which can be pinned to the selected folder.
+///
+/// The result always ends with a backslash: a trailing separator is what makes
+/// `NtCreateFile` treat the target as a directory even when the server's
+/// open-root request omits `FILE_DIRECTORY_FILE`.
 fn volume_root_nt_path(path: &Path) -> Option<Vec<u16>> {
-    let path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let is_separator = |code_unit: u16| code_unit == u16::from(b'\\') || code_unit == u16::from(b'/');
 
-    let is_logical_volume_root = path.len() == 3
-        && matches!(path[0], 65..=90 | 97..=122)
-        && path[1] == u16::from(b':')
-        && path[2] == u16::from(b'\\');
-    if !is_logical_volume_root {
+    let is_absolute_drive_path = wide.len() >= 3
+        && matches!(wide[0], 65..=90 | 97..=122)
+        && wide[1] == u16::from(b':')
+        && is_separator(wide[2]);
+    if !is_absolute_drive_path || wide.contains(&0) {
         return None;
     }
 
+    let separator = u16::from(b'\\');
     let mut nt_path = r"\??\".encode_utf16().collect::<Vec<_>>();
-    nt_path.extend(path);
+    // Re-emit the `<letter>:\` prefix ourselves so a `/` separator in the
+    // user-supplied path cannot leak into the native path.
+    nt_path.push(wide[0]);
+    nt_path.push(wide[1]);
+    nt_path.push(separator);
+
+    for component in wide[3..].split(|code_unit| is_separator(*code_unit)) {
+        if component.is_empty() {
+            // `D:\`, `D:\a\`, and `D:\a\\b` all collapse to one separator.
+            continue;
+        }
+        let is_dot = component.len() == 1 && component[0] == u16::from(b'.');
+        let is_dot_dot = component.len() == 2
+            && component[0] == u16::from(b'.')
+            && component[1] == u16::from(b'.');
+        if is_dot || is_dot_dot {
+            return None;
+        }
+        nt_path.extend_from_slice(component);
+        nt_path.push(separator);
+    }
+
     Some(nt_path)
 }
 
@@ -1133,7 +1169,7 @@ fn open_directory_with_access_and_options(
         Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).expect("OBJECT_ATTRIBUTES size fits in u32"),
         RootDirectory: root_directory,
         ObjectName: core::ptr::addr_of_mut!(unicode_name),
-        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        Attributes: open_object_attributes(root_directory, create_options),
         SecurityDescriptor: core::ptr::null(),
         SecurityQualityOfService: core::ptr::null(),
     };
@@ -1143,7 +1179,8 @@ fn open_directory_with_access_and_options(
     // SAFETY:
     // - `name` and `unicode_name` stay alive for the entire call.
     // - `object_attributes`, `handle`, and `io_status` are valid writable pointers.
-    // - `OBJ_DONT_REPARSE` ensures object-manager resolution fails instead of traversing a reparse point.
+    // - With `OBJ_DONT_REPARSE` (relative opens only) object-manager resolution
+    //   fails instead of traversing a reparse point.
     let status = unsafe {
         NtCreateFile(
             core::ptr::addr_of_mut!(handle),
@@ -1187,7 +1224,7 @@ fn open_file(
         Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).expect("OBJECT_ATTRIBUTES size fits in u32"),
         RootDirectory: root_directory,
         ObjectName: core::ptr::addr_of_mut!(unicode_name),
-        Attributes: final_file_object_attributes(options.create_options),
+        Attributes: open_object_attributes(root_directory, options.create_options),
         SecurityDescriptor: core::ptr::null(),
         SecurityQualityOfService: core::ptr::null(),
     };
@@ -1197,8 +1234,9 @@ fn open_file(
     // SAFETY:
     // - `name` and `unicode_name` stay alive for the entire call.
     // - `object_attributes`, `handle`, and `io_status` are valid writable pointers.
-    // - `OBJ_DONT_REPARSE` prevents reparse-point traversal outside the volume
-    //   unless the caller explicitly opens the final reparse-point object.
+    // - `OBJ_DONT_REPARSE` (relative opens only) prevents reparse-point
+    //   traversal outside the redirected root unless the caller explicitly
+    //   opens the final reparse-point object.
     let status = unsafe {
         NtCreateFile(
             core::ptr::addr_of_mut!(handle),
@@ -1221,9 +1259,16 @@ fn open_file(
     Ok((FileHandle(handle), io_status.Information))
 }
 
-fn final_file_object_attributes(create_options: u32) -> OBJECT_ATTRIBUTE_FLAGS {
+fn open_object_attributes(root_directory: HANDLE, create_options: u32) -> OBJECT_ATTRIBUTE_FLAGS {
+    // NyaTerm: `OBJ_DONT_REPARSE` guards only the server-controlled component
+    // names resolved relative to the redirected root handle. The root itself is
+    // opened by its absolute NT path, and the leading `\??\<letter>:` component
+    // is a symbolic link by design — with OBJ_DONT_REPARSE set, every such open
+    // fails with STATUS_REPARSE_POINT_ENCOUNTERED (0xC000050B) before the
+    // configured root is reached, which the remote shell reports as an
+    // unopenable `\\tsclient\...` share.
     let mut attributes = OBJ_CASE_INSENSITIVE;
-    if create_options & FILE_OPEN_REPARSE_POINT == 0 {
+    if root_directory != HANDLE::default() && create_options & FILE_OPEN_REPARSE_POINT == 0 {
         attributes |= OBJ_DONT_REPARSE;
     }
     attributes
@@ -1242,12 +1287,28 @@ mod tests {
     use windows::Win32::System::IO::CancelSynchronousIo;
 
     #[test]
-    fn final_reparse_point_open_does_not_set_object_manager_reparse_blocking() {
-        assert_ne!((final_file_object_attributes(0) & OBJ_DONT_REPARSE).0, 0);
+    fn reparse_blocking_applies_only_to_opens_relative_to_the_redirected_root() {
+        // The absolute `\??\<letter>:` root path resolves a symbolic link by
+        // design and must not set OBJ_DONT_REPARSE.
         assert_eq!(
-            (final_file_object_attributes(FILE_OPEN_REPARSE_POINT) & OBJ_DONT_REPARSE).0,
+            (open_object_attributes(HANDLE::default(), 0) & OBJ_DONT_REPARSE).0,
             0
         );
+        assert_eq!(
+            (open_object_attributes(non_null_handle(), 0) & OBJ_DONT_REPARSE).0,
+            OBJ_DONT_REPARSE.0
+        );
+        // FILE_OPEN_REPARSE_POINT keeps the object-manager flag unset so the
+        // final reparse-point component can be opened explicitly.
+        assert_eq!(
+            (open_object_attributes(non_null_handle(), FILE_OPEN_REPARSE_POINT) & OBJ_DONT_REPARSE).0,
+            0
+        );
+    }
+
+    /// A non-null stand-in root handle; only nullness is inspected.
+    fn non_null_handle() -> HANDLE {
+        HANDLE(1usize as *mut core::ffi::c_void)
     }
 
     #[test]
@@ -1263,6 +1324,62 @@ mod tests {
                 .expect("open child directory")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn normalizes_absolute_roots_and_rejects_unpinned_paths() {
+        let nt_path = |path: &str| volume_root_nt_path(Path::new(path));
+
+        assert_eq!(
+            nt_path(r"D:\"),
+            Some(r"\??\D:\".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            nt_path(r"D:\rustterm"),
+            Some(r"\??\D:\rustterm\".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            nt_path(r"d:\rustterm\"),
+            Some(r"\??\d:\rustterm\".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            nt_path(r"D:\a\\b"),
+            Some(r"\??\D:\a\b\".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            nt_path(r"D:/rustterm"),
+            Some(r"\??\D:\rustterm\".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(nt_path(r"D:\a\..\b"), None);
+        assert_eq!(nt_path(r"D:\."), None);
+        assert_eq!(nt_path(r"D:rustterm"), None);
+        assert_eq!(nt_path(r"\rustterm"), None);
+        assert_eq!(nt_path(r"rustterm"), None);
+        assert_eq!(nt_path(r"\\server\share"), None);
+        assert_eq!(nt_path(r"\\?\D:\rustterm"), None);
+    }
+
+    #[test]
+    fn opens_a_selected_subdirectory_as_the_redirected_root() {
+        let directory = std::env::temp_dir().join(format!(
+            "ironrdp-rdpdr-scoped-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(directory.join("inner")).expect("create the selected test directory");
+
+        let root = RootDirectory::open(&directory).expect("open the selected subdirectory as root");
+        let child = root
+            .open_relative_directory(&RelativePath::parse(r"\inner").expect("valid relative path"))
+            .expect("open child directory relative to the selected root");
+        assert!(child.is_some());
+
+        drop(child);
+        drop(root);
+        std::fs::remove_dir_all(&directory).expect("remove the test directory");
     }
 
     #[test]

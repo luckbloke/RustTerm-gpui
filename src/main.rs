@@ -32,9 +32,9 @@ mod screenshot;
 mod sessions;
 mod sftp;
 mod sftp_client;
-mod split;
 mod tabs;
 mod term;
+mod terminal_view;
 mod tunnel;
 mod ui_icons;
 mod widgets;
@@ -129,6 +129,20 @@ fn install_crash_log() {
     }));
 }
 
+/// RDPDR 诊断日志：GUI（windows 子系统）启动看不到 stderr，把 RDP 共享目录
+/// 的每条失败 IRP 落到 `%APPDATA%/rustterm-gpui/rdpdr.log`，复现一次就能定位。
+///
+/// vendored IronRDP 里通过 `NYATERM_RDPDR_LOG` 读取该路径；每次启动清空旧日志。
+/// `NYATERM_RDPDR_TRACE=1` 追加每条 IRP 的全量跟踪（排查拷贝失败期间开启，
+/// 问题修复后应移除）。
+fn install_rdpdr_log() {
+    let Some(dir) = dirs::config_dir() else { return };
+    let path = dir.join("rustterm-gpui").join("rdpdr.log");
+    let _ = std::fs::remove_file(&path);
+    std::env::set_var("NYATERM_RDPDR_LOG", &path);
+    std::env::set_var("NYATERM_RDPDR_TRACE", "1");
+}
+
 /// 主逻辑跑在**大栈线程**上。
 ///
 /// GPUI 的元素树是递归布局/递归绘制的，本项目的元素树嵌套很深
@@ -143,6 +157,7 @@ fn main() {
     // 栈溢出检测本身也需要一点栈空间，先把 panic / 日志装好再进新线程。
     env_logger::init();
     install_crash_log();
+    install_rdpdr_log();
     enable_child_window_embedding();
 
     let handle = std::thread::Builder::new()

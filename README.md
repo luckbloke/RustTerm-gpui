@@ -31,9 +31,12 @@
 - **ProxyJump 跳板机**：真实 `direct-tcpip` 通道（不是本地端口转发），跳板机 Handle 一并保活；`user@host:port` 解析，凭据沿用目标机认证方式
 - **SSH 主机密钥**：accept-new（TOFU）写入 `~/.ssh/known_hosts`，密钥变更一律拒绝；取不到主目录时退化为全放行（与 P0 行为一致）
 - **认证**：password 失败自动 fallback 到 keyboard-interactive（PAM 场景）；算法协商在默认安全算法之后追加 SHA-1 / CBC / des 兜底，兼容 Jumpserver 与老设备
-- **会话管理**：`sessions.json` 持久化 SSH / VNC / RDP / SPICE 四类会话（主机、端口、用户、密码、私钥路径、域），侧栏列表支持单击选中、**双击连接**、行内连接 / 编辑 / 删除、搜索过滤、最近会话（8 条）、首次运行写入示例会话
+- **Keep-Alive**：配置面板里的间隔（秒，0 = 关闭）真实生效 —— 会话任务每秒读一次全局间隔，只在**确实空闲**够久时发 `keepalive@openssh.com`（want_reply 顺带探活）；改间隔不用重连
+- **会话管理**：`sessions.json` 持久化 SSH / VNC / RDP / SPICE 四类会话（主机、端口、用户、密码、私钥路径、域、**RDP 共享目录**），侧栏列表支持单击选中、**双击连接**、行内连接 / 编辑 / 删除、搜索过滤、最近会话（8 条）、首次运行写入示例会话
 - **快速连接栏**：地址 | 跳板机 | 密码 / 密钥 | 凭据 | 连接
-- **统一标签栏**：终端 / 浏览器 / 远程桌面 / 本地文件 / 键宏 / 端口扫描平级共存，点击切换 + 活动高亮 + 关闭按钮（**暂无拖拽排序与双击重命名**）
+- **统一标签栏**：终端 / 浏览器 / 远程桌面 / 本地文件 / 键宏 / 端口扫描平级共存，点击切换 + 活动高亮 + 关闭按钮；**拖拽标签可重排**（拖动中源标签半透明，松开落在哪一格就插到哪一格），**双击标签就地重命名**（回车或失焦提交，清空则恢复默认标题）
+- **分屏（dock）**：`TermPane` 提升为 dock 面板实体（`impl Panel`），由 `gpui-base` 的 `DockArea` + `gpui-component` 的 `DockSkin` 承载 —— 任意嵌套分屏、拖到边缘分裂、标签组合并/拆分、单格缩放、整树 dump/load（重启还原布局）都交给 dock。`Ctrl+Shift+D` 向右、`Ctrl+Shift+U` 向下仍可用，新窗格**复制当前会话的启动配置**（SSH 会另起一条连接，不共享通道）；每格各自测量尺寸、各自一个 pty、各自一份选区与查找状态
+- **恢复上次会话**：空标签页的欢迎页上有按钮，按 `last_tabs.json` 重开上次退出时的标签（本地 / 命令 / Telnet / SSH / 浏览器 / 远程桌面 / 本地文件）；**快照不含密码**，SSH 与远程桌面按会话表取凭据，取不到就跳过并提示
 - **批量执行**（同一条命令发到所有终端）、**同步输入**（活动终端按键镜像到其它终端）、**查找**（Ctrl+F 高亮 + 上/下跳转）、**键宏**（手动 / 快捷键 / 连接时 / 断开时四种触发）
 - **终端绘制**：每帧生成 `TermSnapshot`（可见行文本 + 颜色 run + 选区 / 查找 / 光标覆盖层），由 canvas 绘制；10k 行 scrollback、选区复制（Ctrl+C 智能复制）、bracketed paste、鼠标上报（click / drag / motion）、OSC 52 写系统剪贴板（读请求回空串，避免远端程序挂起）
 - 终端设备查询（DA / 颜色请求等）由 `PtyProxy` 应答回写，不外泄到日志
@@ -49,9 +52,12 @@
 
 - 三协议真实实现，统一接口：下行 `RdCommand`（键盘 / 指针 / 滚轮 / 关闭），上行 `RdEvent`（状态 / 分辨率 / RGBA8 脏矩形帧 / 错误）
 - 帧缓冲独立成模块（`framebuf.rs`，不依赖 gpui、可离线回归）：脏矩形合并 → RGBA 主缓冲 → BGRA → `RenderImage` 纹理上传（canvas 绘制）
-- RDP 走 CredSSP / NLA（用户名必填，缺了会很难懂地超时）、VNC 走 Auto 安全策略（覆盖带凭据 / 无凭据）、SPICE 只合成主 surface
+- RDP 走 CredSSP / NLA（用户名必填，缺了会很难懂地超时）、VNC 走 Auto 安全策略（覆盖带凭据 / 无凭据）、SPICE 把主 surface 作为桌面输出、子 surface 单独维护缓冲（合成要等 capsaicin 解析 draw 通道）
 - 错误经 `friendly_error()` 翻译成可操作提示（缺密码 / 缺用户名 / 分辨率异常等）
-- `fit` / `zoom` 缩放、键盘捕获开关、远端光标贴图（带缓存）、剪贴板同步开关（UI 已就位，后端未接）
+- `fit` / `zoom` 缩放、键盘捕获开关、远端光标贴图（带缓存）
+- **剪贴板双向同步**：RDP 走自定义 CLIPRDR 后端（文本 + 文件，见下）、VNC 走 `ServerCutText` / `ClientCutText`（Latin-1）、SPICE 暂无剪贴板通道
+- **CapsLock 状态同步**：RFB / RDP 都没有远端 LED 回传，客户端只在本地锁定状态变化时补发一次 `Caps_Lock`，让远端跟上（否则会出现「本地大写、远端小写」）
+- **传文件**：RDP 有两条通道，按有没有配共享目录二选一 —— 配了共享目录就走 **RDPDR 驱动器重定向**：连接表单（或会话对话框）里指定一个本机目录（整盘 `D:\` 或某个文件夹 `D:\rustterm` 都行，**只暴露这个目录**），**随会话存进 `sessions.json`**，连上后远端「我的电脑」里多一个 `RustTerm` 盘符，直接拖拽即可（大文件、目录、批量都走这条通道）；**没配共享目录就走剪贴板**：本机复制文件 → 远端粘贴，远端复制 → 本机缓存目录并写回剪贴板（`src/remote/rdp_clipboard.rs`，进度显示在标签页工具条右侧）。VNC / SPICE 协议本身没有文件通道（RFB 只有剪贴板），需要时用右侧 SFTP 面板
 - 键映射：PC/AT set-1 扫描码 + X11 keysym，Shift 下的可打印字符单独换算，无映射键走 Unicode 通道
 - 从已保存的远程桌面会话打开即自动连接
 
@@ -102,6 +108,10 @@
 | `Ctrl+Shift+B` | 内置浏览器 |
 | `Ctrl+Shift+A` | AI 助手 |
 | `Ctrl+W` | 关闭当前标签 |
+| `Ctrl+Shift+D` | 当前窗格向右分屏 |
+| `Ctrl+Shift+U` | 当前窗格向下分屏 |
+| `Ctrl+Shift+P` | 切换到下一个窗格 |
+| `Ctrl+Shift+W` | 关闭当前窗格（只剩一格时不动作） |
 | `Ctrl+F` | 终端查找（仅终端标签可用） |
 | `Ctrl+L` | 聚焦浏览器地址栏 |
 | `F11` | 全屏 |
@@ -118,7 +128,7 @@ cargo build --release        # 产出可执行文件
 cargo test                   # 纯逻辑单测
 ```
 
-`cargo test` 覆盖的是不依赖窗口的部分：i18n 词条与语言回退、键宏快捷键归一化与触发类型往返、Telnet IAC 协商、端口扫描解析、SFTP 路径工具（共 17 个用例，用的是标准 `#[test]`）。
+`cargo test` 覆盖的是不依赖窗口的部分：i18n 词条与语言回退、键宏快捷键归一化与触发类型往返、Telnet IAC 协商与 NAWS 应答、端口扫描解析、SFTP 路径工具与大小格式化（共 22 个用例，用的是标准 `#[test]`；含会话存盘的向后兼容：老 `sessions.json` 缺 `share_dir` 仍能解析）。
 
 - 默认启用 `browser`（wry / WebView2）。不需要内置浏览器时：`cargo build --release --no-default-features`
 - 开发工具二进制不在默认构建里，需要显式开 `devtools` feature：
@@ -150,7 +160,8 @@ src/
   main.rs         入口：32MB 栈线程 + 崩溃日志 + 关闭 DComp + 窗口几何 + 图标资源注册
   app.rs          外壳：菜单 / 工具栏 / 快速连接 / 侧栏 / 标签栏 / 中央区 / 状态栏 / 覆盖层对话框
   term.rs         终端核心：Term 状态机、TermSnapshot 生成与绘制、键鼠 → VT 编码、选区 / 粘贴 / 查找
-  tabs.rs         标签模型与类别（Terminal / Browser / RemoteDesktop / LocalFiles / Macro / PortScan）
+  split.rs        分屏布局树：叶子 / 分割节点 + 稳定节点 id（比例靠它挂在 ResizableState 上）
+  tabs.rs         标签模型 + 终端标签页（多个窗格 + 分屏树 + 活动窗格 id）
   config.rs       AppConfig + AiSettings（serde 默认值迁移 + 回退落盘）
   sessions.rs     会话模型 + sessions.json（最近会话、首次运行示例）
   backends/
@@ -162,7 +173,7 @@ src/
     mod.rs        VNC / RDP / SPICE 统一 RdCommand / RdEvent + friendly_error + 键映射
     vnc.rs        VNC（vendor vnc-rs，强制 BGRA 像素格式）
     rdp.rs        RDP（vendor IronRDP，CredSSP + TLS + 接受任意证书）
-    spice.rs      SPICE（vendor capsaicin，仅主 surface）
+    spice.rs      SPICE（vendor capsaicin，主 surface + 光标通道 + 子 surface 缓冲）
   framebuf.rs     远程桌面帧缓冲：脏矩形 → RGBA 主缓冲 → BGRA（纯逻辑，可离线回归）
   rdp.rs          远程桌面标签页：等比缩放绘制、键盘捕获、远端光标、控制项
   sftp.rs         右侧 SFTP 停靠面板（拖拽上传、进度、行内操作）
@@ -187,6 +198,8 @@ src/
 
 - 终端：`pty/ssh → mpsc → vte Processor.advance(Term) → renderable_content() → TermSnapshot → canvas`
 - 终端输入：`GPUI 事件 → VT 序列 → mpsc → pty/ssh`（终端查询响应经 `PtyProxy` 回写）
+- 分屏尺寸：`canvas prepaint 记录本格 bounds → pane_areas → 下一帧 fit_to(该格)`，
+  每格独立算列数/行数；鼠标先按 `pane_areas` 命中判定，再换算列/行
 - 远程桌面：`后端线程 → RdEvent{Frame 脏矩形} → FrameBuffer → BGRA → RenderImage → canvas`
 - 浏览器：`gpui 主线程 ⇄ channel ⇄ WebView 专属线程（自带消息泵）⇄ WebView2`
 
@@ -201,7 +214,7 @@ src/
 | P1 | 产品骨架：统一标签页 / SFTP 双栏 / 状态栏 / 配置面板 / i18n | 已落地 |
 | P2 | 远程桌面：VNC / RDP / SPICE 帧渲染，后端零改动 | 已落地 |
 | P3 | 兼容层：wry 浏览器标签 + AI 助手多提供方 + AI 截屏分析 | 已落地 |
-| P4 | 打磨：键宏 / keep-alive / 装配打包 / 性能与内存调优 | 进行中（键宏已完成，keep-alive 与打包未做） |
+| P4 | 打磨：键宏 / keep-alive / 装配打包 / 性能与内存调优 | 进行中（键宏、keep-alive、行级 shaping 缓存已完成；打包未做） |
 
 ## 工程要点（GPUI / wry 踩坑）
 
@@ -213,17 +226,21 @@ src/
 6. **终端原点只算一次**：canvas 的 prepaint 把「文本网格」原点写进全局 `TermArea`，绘制与鼠标列 / 行换算共用同一原点，避免两处各算一套导致选中错位。
 7. **原生子窗口恒在 gpui 之上**：任何浮层（对话框 / 菜单 / 右键菜单）打开时都要隐藏或钳制 WebView 区域，否则会被盖住。
 8. **对话框 = 同帧覆盖层**：egui 的独立视口窗口在 GPUI 里改为绝对定位覆盖层，不参与主布局；`overlay_open()` 统一判定「当前是否有浮层」，供 WebView 隐藏与快捷键屏蔽使用。
+9. **dock 面板的两处约束**：
+   - **尺寸只能取自己上一帧的 bounds**：分屏后每格大小不同，用窗口视口去估算列数/行数会让第二格按整屏算。每格在 canvas prepaint 里把自己的 bounds 存下来，下一帧据此 `fit_to`；鼠标列/行换算也用同一份 bounds；
+   - **面板实体创建需要 `&mut Window`**：而「新建终端」常从菜单 / 快捷键发起（那时没有 window），所以新面板先以 `PendingPane`（意图）排进工作区，首帧渲染时再变成 `TerminalView` 实体装进 dock。
+
+10. **`div()` 默认是 block，不是 flex**（`Style::default().display = Display::Block`）：只有 `.flex()` / `.h_flex()` / `.v_flex()` 才是 flex 容器。中间层漏了这一步，子元素的 `flex_1` 直接不生效，而 `height:100%` 又解析到 auto 高度上 —— 高度塌成 0，**终端 canvas 一片空白的真实原因**。分屏尤其容易踩：每多包一层容器就要确认它是 flex；叶子里的 canvas 用 `flex_1` 拿高度，不要依赖百分比。
 
 ## 已知缺口
 
-- **Keep-Alive 未实现**：`config.keep_alive_interval` 与配置面板项已就位，但 `macros::apply_keep_alive()` 是空实现，SSH 侧也没有心跳任务
+- **Keep-Alive 只覆盖 SSH**：`config.keep_alive_interval`（0 = 关闭）已经是真实现 —— SSH 会话任务每秒醒一次读全局间隔，攒够且这段时间确实没数据才发一个 `keepalive@openssh.com`（want_reply，顺带探活），改配置不用重连。Telnet / 远程桌面没有心跳：Telnet 的 `IAC NOP` 只在少数老设备上有意义，RFB 本身没有 idle 超时概念
 - **X11 转发未实现**：`menu.x11` / `item.x11_forward` 词条在表里，菜单与后端都没接
-- **「恢复上次会话」未接线**：`welcome.restore` 词条存在，欢迎页还没渲染这个按钮
-- **标签页无拖拽排序 / 双击重命名**：目前只有点击切换与关闭按钮（egui 版有这两项）
-- **远程桌面剪贴板同步**：只有 `clipboard_sync` 开关，未接后端
-- **SPICE** 只合成主 surface，多 surface 与光标叠层未处理；**VNC** 未同步 CapsLock 状态；**Telnet** 忽略 NAWS 窗口协商
-- **终端性能**：每帧逐行 `shape_line`，未做行级 shaping 缓存；整屏快照每帧重建，可考虑行级缓存或 GPU 顶点缓存
-- **分屏未实现**：gpui-kit 自带 `resizable`（`h_resizable` / `v_resizable`）与完整 `dock`（递归 PaneTree 分屏 + 拖拽 + 布局 dump/load），但本工程的终端尺寸、焦点、输入目前都是单例假设（`fit_to` 用视口估算、单个 `term_focus` / `term_snap`、全局 `TermArea`），接入前要先拆这一层
+- **RDP 剪贴板传文件**：走 CLIPRDR 的 `FileGroupDescriptorW` + `FileContentsRequest`（延迟拉取），实现在 `src/remote/rdp_clipboard.rs`（参考 rustterm-tauri 的同名实现）。**只在本会话没配共享目录时启用**，配了共享目录则文件统一走 RDPDR 盘符，避免远端同时看到盘符和剪贴板文件、粘贴时撞锁。远端→本机的文件落在 `%LOCALAPPDATA%\rustterm-gpui\cache\rdp-clipboard\<uuid>`，全部下完才写回剪贴板（写太早资源管理器会拿到半个文件），旧缓存 24 小时后自动清理
+- **VNC / SPICE 没有文件通道**：RFB 标准协议没有文件传输（只有剪贴板），SPICE 的文件通道（`port`/`usbredir`）capsaicin 也未暴露。需要时用右侧 SFTP
+- **SPICE 子 surface 不合成**：子 surface 的像素已落到独立缓冲，但「贴到主面哪个位置」在 draw 通道的 `DRAW_COPY_BITS` 里，capsaicin 目前归到 `UnhandledDraw`
+- **终端性能**：已做行级 shaping 缓存（key = 文本 + 样式 + 字号 + 字体族，命中直接复用 `ShapedLine`）；整屏快照仍每帧重建（`renderable_content` 遍历全可见区），后续可考虑按行版本号增量生成
+- **恢复上次会话的边界**：`last_tabs.json` 只记「哪些标签开着」，分屏内部结构与标签自定义名不恢复（那是 dock 自己的 dump/load 该管的）；快照**不含密码**，SSH 恢复时按 `host/port/user` 回 `sessions.json` 取凭据，取不到（临时连的、没存密码的）就跳过并在提示里报个数，不会拿空密码去撞
 - **打包**：没有安装包或分发脚本
 - **残留物**：`src/status.rs` 已废弃（状态栏并入 `app.rs`）；`check-msvc.bat` / `run-msvc.bat` 仍指向旧的 egui 目录
 

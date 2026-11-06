@@ -1,6 +1,11 @@
 //! RDP 在线探针：直连服务器打印每一个输出事件，定位「连不上 / 连上没有画面」的真实原因。
 //!
-//! 用法：`cargo run --features devtools --bin rdpprobe -- <host> <port> [user] [password] [domain]`
+//! 用法：
+//! `cargo run --features devtools --bin rdpprobe -- <host> <port> [user] [password] [domain]`
+//!
+//! 可选参数：
+//! - `--tls-only`：跳过 NLA/CredSSP，只用 TLS（Windows Server 2008 兼容路径）
+//! - `--share <目录>`：启用 RDPDR 驱动器重定向，验证共享目录是否被服务器接受
 //!
 //! 与 `src/remote/rdp.rs` 使用同一套 ConfigBuilder（CredSSP + TLS + 接受任意证书），
 //! 区别只在于：把所有 RdpOutputEvent 原样打印出来，失败时把完整错误打出来。
@@ -49,7 +54,22 @@ fn client_name() -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // 先摘掉开关，剩下的仍是位置参数，保持旧用法可用
+    let tls_only = args.iter().any(|a| a == "--tls-only");
+    args.retain(|a| a != "--tls-only");
+    let share = args
+        .iter()
+        .position(|a| a == "--share")
+        .and_then(|i| {
+            if i + 1 < args.len() {
+                let path = args[i + 1].clone();
+                args.drain(i..=i + 1);
+                Some(path)
+            } else {
+                None
+            }
+        });
     let host = args.get(1).cloned().unwrap_or_else(|| "192.168.1.16".into());
     let port: u16 = args
         .get(2)
@@ -60,7 +80,14 @@ async fn main() -> anyhow::Result<()> {
     let domain = args.get(5).cloned().unwrap_or_default();
 
     println!("== RDP 连接 {host}:{port} ==");
-    println!("   用户名={username:?} 域={domain:?} 密码长度={}", password.len());
+    println!(
+        "   用户名={username:?} 域={domain:?} 密码长度={} 安全层={}",
+        password.len(),
+        if tls_only { "TLS-only" } else { "NLA" }
+    );
+    if let Some(dir) = &share {
+        println!("   共享目录={dir:?}（RDPDR）");
+    }
 
     let connector_host = host.clone();
     let connector_port = port;
@@ -75,12 +102,15 @@ async fn main() -> anyhow::Result<()> {
         .with_desktop_height(768)
         .with_desktop_scale_factor(100)
         .with_color_depth(32)
-        .with_credssp(true)
+        .with_credssp(!tls_only)
         .with_tls(true)
+        .with_autologon(tls_only)
         .with_platform(MajorPlatformType::WINDOWS)
         .with_client_build(client_build())
         .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
         .with_client_name(client_name())
+        // RDPDR 通道由配置里的开关决定：只给工厂但不开通道，盘符不会广播。
+        .with_rdpdr(share.is_some())
         .with_server_certificate_verifier(Arc::new(TrustAnyCert))
         .with_direct_transport_connector(Arc::new(move |_destination| {
             let host = connector_host.clone();
@@ -105,7 +135,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("RDP 配置失败: {e:?}"))?;
 
     let (out_tx, mut out_rx) = ironrdp::client::output_channel::output_channel(2);
-    let client = RdpClient::new(config, out_tx).with_desktop_updates();
+    let mut client = RdpClient::new(config, out_tx).with_desktop_updates();
+    if let Some(dir) = &share {
+        #[cfg(windows)]
+        {
+            use ironrdp_rdpdr_native::{RedirectedDrive, WindowsRdpdrBackendFactory};
+            let drive = RedirectedDrive::new(1, "RTShare", dir, false)
+                .map_err(|e| anyhow::anyhow!("共享目录配置失败（{dir}）: {e}"))?;
+            client = client.with_rdpdr_backend_factory(Box::new(WindowsRdpdrBackendFactory::new(drive)));
+            println!("[probe] 已启用驱动器重定向：{dir} → \\\\tsclient\\RTShare");
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("共享目录探针目前只在 Windows 上可用");
+        }
+    }
 
     // client.run() 不是 Send：放到独立线程 + 独立单线程运行时（与应用一致）
     std::thread::Builder::new()
@@ -130,6 +174,12 @@ async fn main() -> anyhow::Result<()> {
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await {
             Ok(Some(out)) => match out {
+                RdpOutputEvent::Connected => {
+                    println!("[probe] *** 连接激活完成（安全协商通过） ***");
+                }
+                RdpOutputEvent::LoginComplete => {
+                    println!("[probe] *** 远端登录完成 ***");
+                }
                 RdpOutputEvent::DesktopUpdate(update) => {
                     frames += 1;
                     let (_buffer, w, h, _region) = update.into_parts();

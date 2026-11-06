@@ -1,27 +1,33 @@
 //! 统一标签页模型。
 //!
-//! 主界面的标签栏同时承载多种会话与工具面板，与本地 / SSH 终端平级：
-//! - `Terminal`：终端（**可以是分屏**，见 [`TerminalTab`]）
+//! 主界面的标签栏同时承载多种会话与工具面板，与终端工作区平级：
+//! - `Terminal`：**终端工作区**（内部是一个 dock 区域，可任意嵌套分屏 / 标签组）
 //! - `Browser`：内置浏览器（独立 WebView2 子窗口）
 //! - `RemoteDesktop`：VNC / RDP / SPICE 远程桌面
 //! - `LocalFiles`：本地文件浏览器（宽栏）
 //! - `Macro`：键宏管理器
 //! - `PortScan`：端口扫描器
 //!
-//! 键宏与端口扫描原先是「模态对话框」，只能盖在终端上、关掉就没了；
-//! 现在两者都提升为**标签页**，可以和其它会话并排存在、随时切回。
-//!
 //! SFTP 不在标签页里：它是右侧停靠面板（见 `sftp.rs`）。
 //!
-//! 连接中的 SSH 标签用 `Connecting` 表示（结果经独立线程送回），
-//! 失败用 `Failed` 保留标签供查看错误；**分屏**新增的 SSH 窗格走
-//! [`PaneState::Connecting`] / [`PaneState::Failed`]，语义一致但不占整张标签。
+//! ## 终端工作区与 dock
+//!
+//! 终端不再由本工程自己写分屏树：每个工作区持有一个 `gpui-base` 的
+//! [`DockArea`]（外观由 `gpui-component` 的 [`DockSkin`] 提供），于是分屏、
+//! 标签组、拖到边缘分裂、单格缩放、整树 dump/load 都由 dock 负责。
+//!
+//! 面板是 [`TerminalView`]（见 `terminal_view.rs`）。dock 需要 `&mut Window`
+//! 才能创建，而「新建终端」常从菜单/快捷键发起（那时没有 window），因此新面板
+//! 先排进 `pending`，在首帧渲染时统一装进 dock。
 
 use crate::browser::BrowserTab;
 use crate::filebrowser::FileBrowser;
 use crate::rdp::RemoteDesktopTab;
-use crate::split::{next_pane_id, PaneId, SplitTree};
-use crate::term::TermPane;
+use crate::terminal_view::TerminalView;
+use gpui_kit::base::dock::{DockArea, DockPlacement};
+use gpui_kit::component::dock::DockSkin;
+use gpui_kit::{App, Entity};
+use std::rc::Rc;
 
 /// 标签页类别。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,191 +66,125 @@ impl TabType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 终端标签页：多窗格 + 分屏布局
-// ---------------------------------------------------------------------------
+/// 取出一个 dock 区域里的所有终端面板（按布局顺序）。
+///
+/// dock 是「有哪些面板」的唯一真相：面板实体以 `Arc<dyn PanelView>` 形式存在
+/// dock 里，这里通过 `PanelView::view() -> AnyView` 反查回具体类型。
+pub fn dock_panels(dock: &Entity<DockArea>, cx: &App) -> Vec<Entity<TerminalView>> {
+    let area = dock.read(cx);
+    let Some(tree) = area.layout(DockPlacement::Center) else {
+        return Vec::new();
+    };
+    tree.panels()
+        .filter_map(|id| area.panel(id))
+        .filter_map(|handle| handle.view().downcast::<TerminalView>().ok())
+        .collect()
+}
 
-/// 一个分屏窗格的状态。
-pub enum PaneState {
-    /// 已连上（本地 / SSH / Telnet / 命令）
-    Live(TermPane),
-    /// SSH 分屏连接中：结果由后台线程经通道送回，每帧 [`TerminalTab::poll`]
+/// 待装入 dock 的面板。
+///
+/// 「新建终端」常常从菜单/快捷键发起，那时既没有 `&mut Window`（dock 创建需要），
+/// 也不方便要一个 `&mut App`（面板实体创建需要）。所以先把**意图**排进工作区，
+/// 首帧渲染时统一变成 [`TerminalView`] 实体再装进 dock。
+pub enum PendingPane {
+    /// 已经拿到终端状态机（本地 / Telnet / 命令 / 已连上的 SSH）
+    Ready(crate::term::TermPane),
+    /// SSH 后台连接中（结果经通道送回）
     Connecting {
         title: String,
-        rx: std::sync::mpsc::Receiver<anyhow::Result<TermPane>>,
+        rx: std::sync::mpsc::Receiver<anyhow::Result<crate::term::TermPane>>,
     },
-    /// 分屏连接失败（保留占位与错误信息，可关闭）
-    Failed { title: String, msg: String },
 }
 
-/// 窗格槽位：稳定 id + 状态。
-pub struct PaneSlot {
-    pub id: PaneId,
-    pub state: PaneState,
+/// 一个终端工作区。
+pub struct TerminalWorkspace {
+    /// dock 区域；由首帧渲染惰性创建（创建需要 `&mut Window`）
+    pub dock: Option<Entity<DockArea>>,
+    /// 外观句柄（改面板样式用，例如把标签栏改成常显）
+    pub skin: Option<Rc<DockSkin>>,
+    /// 待装入 dock 的终端（首帧消费掉）
+    pub pending: Vec<PendingPane>,
 }
 
-/// 一个终端标签页：若干窗格 + 一棵分屏树。
-///
-/// 窗格顺序（`panes`）只是创建顺序；屏幕上的位置一律以 `layout` 为准。
-/// `active` 是**窗格 id**，不是下标 —— 关掉中间一个窗格不会让活动窗格串位。
-pub struct TerminalTab {
-    pub panes: Vec<PaneSlot>,
-    pub active: PaneId,
-    pub layout: SplitTree,
-}
-
-impl TerminalTab {
-    /// 用第一个窗格开一个不分屏的终端标签。
-    pub fn new(pane: TermPane) -> Self {
-        Self::with_slot(PaneState::Live(pane))
-    }
-
-    /// 用任意初始状态开标签（SSH 分屏失败后重建、或直接以「连接中」开标签）。
-    pub fn with_slot(state: PaneState) -> Self {
-        let id = next_pane_id();
+impl TerminalWorkspace {
+    /// 空工作区（还没有终端）。
+    pub fn new() -> Self {
         Self {
-            panes: vec![PaneSlot { id, state }],
-            active: id,
-            layout: SplitTree::new(id),
+            dock: None,
+            skin: None,
+            pending: Vec::new(),
         }
     }
 
-    pub fn active_id(&self) -> PaneId {
-        self.active
-    }
-
-    /// 活动窗格（连接中/失败时返回 None）。
-    pub fn active_pane(&self) -> Option<&TermPane> {
-        self.pane(self.active)
-    }
-
-    pub fn active_pane_mut(&mut self) -> Option<&mut TermPane> {
-        self.pane_mut(self.active)
-    }
-
-    pub fn pane(&self, id: PaneId) -> Option<&TermPane> {
-        match self.slot(id)?.state {
-            PaneState::Live(p) => Some(p),
-            _ => None,
+    /// 带一个终端的工作区。
+    pub fn with_pane(pane: crate::term::TermPane) -> Self {
+        Self {
+            dock: None,
+            skin: None,
+            pending: vec![PendingPane::Ready(pane)],
         }
     }
 
-    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut TermPane> {
-        match &mut self.slot_mut(id)?.state {
-            PaneState::Live(p) => Some(p),
-            _ => None,
+    /// 带一个「连接中」终端的工作区（SSH）。
+    pub fn with_connecting(
+        title: String,
+        rx: std::sync::mpsc::Receiver<anyhow::Result<crate::term::TermPane>>,
+    ) -> Self {
+        Self {
+            dock: None,
+            skin: None,
+            pending: vec![PendingPane::Connecting { title, rx }],
         }
     }
 
-    pub fn slot(&self, id: PaneId) -> Option<&PaneSlot> {
-        self.panes.iter().find(|s| s.id == id)
+    pub fn push_pane(&mut self, pane: crate::term::TermPane) {
+        self.pending.push(PendingPane::Ready(pane));
     }
 
-    pub fn slot_mut(&mut self, id: PaneId) -> Option<&mut PaneSlot> {
-        self.panes.iter_mut().find(|s| s.id == id)
+    /// 把「要开一个终端」记在工作区上（还没装进 dock）。
+    pub fn queue(&mut self, pending: PendingPane) {
+        self.pending.push(pending);
     }
 
-    /// 布局顺序的窗格 id。
-    pub fn leaf_ids(&self) -> Vec<PaneId> {
-        self.layout.leaves()
-    }
-
-    /// 是否分屏（多于一个窗格）。
-    pub fn is_split(&self) -> bool {
-        self.layout.len() > 1
-    }
-
-    pub fn set_active(&mut self, id: PaneId) {
-        if self.layout.contains(id) {
-            self.active = id;
+    /// 该工作区是否还没有任何终端（dock 建好后用它决定关标签）。
+    pub fn is_empty(&self, cx: &App) -> bool {
+        match &self.dock {
+            Some(dock) => dock_panels(dock, cx).is_empty(),
+            None => self.pending.is_empty(),
         }
     }
 
-    /// 追加一个窗格并挂到 `target` 旁边，返回新窗格 id。
-    ///
-    /// `axis` 横向 = 左右并排（`before` = 放左边），纵向 = 上下叠放（`before` = 放上边）。
-    pub fn split_with(
-        &mut self,
-        target: PaneId,
-        axis: gpui_kit::Axis,
-        state: PaneState,
-        before: bool,
-    ) -> Option<PaneId> {
-        let id = next_pane_id();
-        self.panes.push(PaneSlot { id, state });
-        if self.layout.split(target, axis, id, before) {
-            self.active = id;
-            Some(id)
-        } else {
-            self.panes.retain(|s| s.id != id);
-            None
-        }
-    }
-
-    /// 关掉一个窗格。返回 false 表示这是最后一个窗格（调用方应关掉整张标签）。
-    pub fn remove(&mut self, id: PaneId) -> bool {
-        if self.layout.len() <= 1 {
-            return false;
-        }
-        if !self.layout.remove(id) {
-            return false;
-        }
-        self.panes.retain(|s| s.id != id);
-        if self.active == id {
-            // 优先接管「布局里的下一个」，没有就退回第一个
-            self.active = self.leaf_ids().first().copied().unwrap_or(self.active);
-        }
-        true
-    }
-
-    /// 轮询连接中的窗格，返回是否有变化。
-    pub fn poll(&mut self) -> bool {
-        let mut changed = false;
-        for slot in self.panes.iter_mut() {
-            let done = match &slot.state {
-                PaneState::Connecting { rx, .. } => Some(match rx.try_recv() {
-                    Ok(Ok(pane)) => Ok(pane),
-                    Ok(Err(e)) => Err(format!("{e:#}")),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Err("连接线程异常退出".to_string())
-                    }
-                }),
-                _ => None,
-            };
-            if let Some(result) = done {
-                let title = match &slot.state {
-                    PaneState::Connecting { title, .. } => title.clone(),
-                    _ => "终端".to_string(),
-                };
-                slot.state = match result {
-                    Ok(pane) => PaneState::Live(pane),
-                    Err(msg) => PaneState::Failed { title, msg },
-                };
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    /// 标签栏显示的名字：活动窗格优先，分屏时补一个格数提示。
-    pub fn title(&self) -> String {
-        let base = match self.slot(self.active).map(|s| &s.state) {
-            Some(PaneState::Live(p)) => p.title.clone(),
-            Some(PaneState::Connecting { title, .. }) => format!("{title}（连接中）"),
-            Some(PaneState::Failed { title, .. }) => format!("{title}（连接失败）"),
-            None => "终端".to_string(),
+    /// 标签栏显示的标题：取第一个终端面板的标题（分屏时补一个格数）。
+    pub fn title(&self, cx: &App) -> String {
+        let Some(dock) = &self.dock else {
+            return "终端".to_string();
         };
-        if self.is_split() {
-            format!("{base} ⟨{} 格⟩", self.layout.len())
+        let panels = dock_panels(dock, cx);
+        let base = panels
+            .first()
+            .map(|v| v.read(cx).title())
+            .unwrap_or_else(|| "终端".to_string());
+        if panels.len() > 1 {
+            format!("{base} ⟨{} 格⟩", panels.len())
         } else {
             base
         }
     }
 
-    /// 活动窗格是否已断开（标签栏图标用）。
-    pub fn active_dead(&self) -> bool {
-        self.active_pane().map(|p| p.dead).unwrap_or(false)
+    /// 该工作区里是否已经有「死了」的终端（标签栏图标用）。
+    pub fn any_dead(&self, cx: &App) -> Option<bool> {
+        let dock = self.dock.as_ref()?;
+        let panels = dock_panels(dock, cx);
+        if panels.is_empty() {
+            return None;
+        }
+        Some(panels.iter().any(|v| v.read(cx).is_dead()))
+    }
+}
+
+impl Default for TerminalWorkspace {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -253,10 +193,10 @@ pub enum TabContent {
     /// SSH 连接中（结果经线程送回）
     Connecting {
         title: String,
-        rx: std::sync::mpsc::Receiver<anyhow::Result<TermPane>>,
+        rx: std::sync::mpsc::Receiver<anyhow::Result<crate::term::TermPane>>,
     },
-    /// 终端（本地 / SSH / Telnet，可含多个分屏窗格）
-    Terminal(TerminalTab),
+    /// 终端工作区（内部是 dock：分屏 / 标签组 / 缩放 / 持久化）
+    Terminal(TerminalWorkspace),
     /// 连接 / 认证失败（保留 tab 供查看错误）
     Failed(String),
     /// 内置浏览器
@@ -286,10 +226,10 @@ impl TabContent {
     }
 
     /// 标签栏显示的标题。
-    pub fn title(&self) -> String {
+    pub fn title(&self, cx: &App) -> String {
         match self {
             TabContent::Connecting { title, .. } => title.clone(),
-            TabContent::Terminal(tab) => tab.title(),
+            TabContent::Terminal(ws) => ws.title(cx),
             TabContent::Failed(_) => "连接失败".to_string(),
             TabContent::Browser(tab) => tab.display_title(),
             TabContent::RemoteDesktop(tab) => tab.title(),
@@ -299,31 +239,19 @@ impl TabContent {
         }
     }
 
-    /// 终端标签页本体（仅 Terminal 返回）。
-    pub fn terminal_tab(&self) -> Option<&TerminalTab> {
+    /// 终端工作区（仅 Terminal 返回）。
+    pub fn workspace(&self) -> Option<&TerminalWorkspace> {
         match self {
-            TabContent::Terminal(tab) => Some(tab),
+            TabContent::Terminal(ws) => Some(ws),
             _ => None,
         }
     }
 
-    pub fn terminal_tab_mut(&mut self) -> Option<&mut TerminalTab> {
+    pub fn workspace_mut(&mut self) -> Option<&mut TerminalWorkspace> {
         match self {
-            TabContent::Terminal(tab) => Some(tab),
+            TabContent::Terminal(ws) => Some(ws),
             _ => None,
         }
-    }
-
-    /// **活动**窗格（仅 Terminal 且活动窗格已连上时返回）。
-    ///
-    /// 保持这个名字是为了让既有调用点（键盘/复制/粘贴/查找/AI 上下文……）
-    /// 不用改动：它们本来就只关心「当前聚焦的那一格」。
-    pub fn terminal(&self) -> Option<&TermPane> {
-        self.terminal_tab()?.active_pane()
-    }
-
-    pub fn terminal_mut(&mut self) -> Option<&mut TermPane> {
-        self.terminal_tab_mut()?.active_pane_mut()
     }
 
     /// 释放底层资源（关闭标签时调用，确保 WebView 子窗口被销毁）。
