@@ -1,4 +1,4 @@
-#[cfg(test)]
+﻿#[cfg(test)]
 mod test;
 
 use std::io::Write as _;
@@ -86,7 +86,7 @@ impl ClientPlatformChallengeResponse {
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::PlatformChallengeResponse,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(
                 PREAMBLE_SIZE

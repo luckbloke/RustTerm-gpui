@@ -57,7 +57,7 @@
 - `fit` / `zoom` 缩放、键盘捕获开关、远端光标贴图（带缓存）
 - **剪贴板双向同步**：RDP 走自定义 CLIPRDR 后端（文本 + 文件，见下）、VNC 走 `ServerCutText` / `ClientCutText`（Latin-1）、SPICE 暂无剪贴板通道
 - **CapsLock 状态同步**：RFB / RDP 都没有远端 LED 回传，客户端只在本地锁定状态变化时补发一次 `Caps_Lock`，让远端跟上（否则会出现「本地大写、远端小写」）
-- **传文件**：RDP 有两条通道，按有没有配共享目录二选一 —— 配了共享目录就走 **RDPDR 驱动器重定向**：连接表单（或会话对话框）里指定一个本机目录（整盘 `D:\` 或某个文件夹 `D:\rustterm` 都行，**只暴露这个目录**），**随会话存进 `sessions.json`**，连上后远端「我的电脑」里多一个 `RustTerm` 盘符，直接拖拽即可（大文件、目录、批量都走这条通道）；**没配共享目录就走剪贴板**：本机复制文件 → 远端粘贴，远端复制 → 本机缓存目录并写回剪贴板（`src/remote/rdp_clipboard.rs`，进度显示在标签页工具条右侧）。VNC / SPICE 协议本身没有文件通道（RFB 只有剪贴板），需要时用右侧 SFTP 面板
+- **传文件**：RDP 有两条通道，按有没有配共享目录二选一 —— 配了共享目录就走 **RDPDR 驱动器重定向**：连接表单（或会话对话框）里指定一个本机目录（整盘 `D:\` 或某个文件夹 `D:\rustterm` 都行，**只暴露这个目录**），**随会话存进 `sessions.json`**，连上后远端「我的电脑」里多一个以共享目录命名的盘符（目录名即远端显示名，整盘共享取盘符，与 mstsc 一致；Windows 只按 8-bit 解析这个名字，非 ASCII 字符会变成 `_`），直接拖拽即可（大文件、目录、批量都走这条通道）；**没配共享目录就走剪贴板**：本机复制文件 → 远端粘贴，远端复制 → 本机缓存目录并写回剪贴板（`src/remote/rdp_clipboard.rs`，进度显示在标签页工具条右侧）。VNC / SPICE 协议本身没有文件通道（RFB 只有剪贴板），需要时用右侧 SFTP 面板
 - 键映射：PC/AT set-1 扫描码 + X11 keysym，Shift 下的可打印字符单独换算，无映射键走 Unicode 通道
 - 从已保存的远程桌面会话打开即自动连接
 
@@ -231,6 +231,13 @@ src/
    - **面板实体创建需要 `&mut Window`**：而「新建终端」常从菜单 / 快捷键发起（那时没有 window），所以新面板先以 `PendingPane`（意图）排进工作区，首帧渲染时再变成 `TerminalView` 实体装进 dock。
 
 10. **`div()` 默认是 block，不是 flex**（`Style::default().display = Display::Block`）：只有 `.flex()` / `.h_flex()` / `.v_flex()` 才是 flex 容器。中间层漏了这一步，子元素的 `flex_1` 直接不生效，而 `height:100%` 又解析到 auto 高度上 —— 高度塌成 0，**终端 canvas 一片空白的真实原因**。分屏尤其容易踩：每多包一层容器就要确认它是 flex；叶子里的 canvas 用 `flex_1` 拿高度，不要依赖百分比。
+
+11. **RDP 共享目录（RDPDR 驱动器重定向）四个坑** —— 远端报「无法访问 `\\tsclient\…`」「0x8007048F 设备没有连接」基本都是这几条；修复都在 `vendor/ironrdp`，逐条记录见 `vendor/ironrdp/NYATERM.md`：
+    - **分片消息不能自动置位 `CHANNEL_FLAG_SHOW_PROTOCOL`**（最隐蔽的一条）：MS-RDPBCGR 2.2.6.1.1 规定该标志表示「Channel PDU Header 必须对上层应用端点可见」。上游只在**消息需要分片时**才自动置位，Windows 于是把 8 字节通道头当成 RDPDR 数据流交给 `rdpdr.sys`，报文错位后设备被直接判死 —— 症状极具误导性：**≤1600 字节的单块消息全部正常，第一条更大的消息之后所有打开/复制都报「设备没有连接」**（远端 `dir`/复制统统失效，已打开的浏览句柄却还能用）。CLIPRDR / RAIL 这类确实需要该标志的通道仍由它们显式请求。
+    - **用绝对路径打开重定向根目录时不能带 `OBJ_DONT_REPARSE`**：盘符路径的 `\??\D:` 本身就是符号链接，带上该标志必然以 `STATUS_REPARSE_POINT_ENCOUNTERED (0xC000050B)` 失败，服务器会无限重试 create IRP。该标志只该用于「相对根句柄打开的服务器可控路径」，用来挡符号链接逃逸。
+    - **设备名要按 8-bit 字符广播**：Windows 按 8-bit 解析 `DeviceData`（遇 NUL 即截断），UTF-16 名字在远端只显示首字母（`congcong` → `\\tsclient\c`），所以改成 NUL 结尾的 8-bit 名字（对齐上游 #2342，FreeRDP / rdesktop 也是这么发的）。
+    - **服务器可能先发 IRP、再发确认回执**：已广播但还没收到确认的设备的 IRP 必须照常处理（对齐上游 #2191）。静默丢弃会让服务器等约 30 秒再重试，严重时直接把设备标成断开。
+    - 排查手段：失败 IRP 会自动写进 `%APPDATA%\rustterm-gpui\rdpdr.log`；启动前 `set NYATERM_RDPDR_TRACE=1` 可拿到每条 IRP 与出站字节的完整跟踪（GUI 启动看不到 stderr，所以走文件）。
 
 ## 已知缺口
 

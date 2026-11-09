@@ -3,7 +3,7 @@ winresource = "0.1"
 
 [package]
 name = "rustterm-gpui"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）"
 
@@ -56,6 +56,24 @@ ironrdp = { path = "vendor/ironrdp/crates/ironrdp", default-features = false, fe
 # 有了它，「把文件拖进远端桌面」等同于把本机某个目录挂成远端的一个盘符，
 # 不用在远端额外跑任何服务。
 ironrdp-rdpdr-native = { path = "vendor/ironrdp/crates/ironrdp-rdpdr-native" }
+
+# 内置 X11 服务（src/xsrv/，设计参考主工程 docs/x11-server.md）：只复用
+# x11rb-protocol 的线格式编解码与资源 ID 分配，服务端语义自己实现。
+# 纯 Rust，无 C 依赖。
+x11rb-protocol = { version = "0.13", default-features = false, features = [
+    "std",
+    "request-parsing",
+    "composite",
+    "damage",
+    "randr",
+    "render",
+    "shape",
+    "shm",
+    "xfixes",
+    "xinput",
+    "xkb",
+    "xtest",
+] }
 
 # 浏览器内核（wry） - 可选
 wry = { version = "0.47", optional = true }
@@ -118,6 +136,11 @@ required-features = ["devtools"]
 [[bin]]
 name = "ptytest"
 path = "devtools/ptytest.rs"
+required-features = ["devtools"]
+
+[[bin]]
+name = "x11test"
+path = "devtools/x11test.rs"
 required-features = ["devtools"]
 
 [profile.dev]

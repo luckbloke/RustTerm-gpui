@@ -31,6 +31,13 @@ where
             builder.danger_accept_invalid_hostnames(true);
             builder.use_sni(false);
         }
+        // NyaTerm: RDP endpoints are often ancient -- a captured Windows
+        // Server 2008 R2 offers only TLS 1.0 with AES128/SHA1. Modern Windows
+        // disables TLS 1.0/1.1 for clients by default, so the system-default
+        // connector fails the upgrade with SEC_E_ALGORITHM_MISMATCH. Lower the
+        // floor to TLS 1.0 (certificate trust is the validation policy's job,
+        // not the protocol version's).
+        builder.min_protocol_version(Some(tokio_native_tls::native_tls::Protocol::Tlsv10));
         let connector = builder
             .build()
             .map(tokio_native_tls::TlsConnector::from)

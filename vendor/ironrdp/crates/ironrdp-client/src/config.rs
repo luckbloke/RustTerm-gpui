@@ -1,4 +1,4 @@
-use core::fmt;
+﻿use core::fmt;
 use core::pin::Pin;
 use core::str::FromStr;
 use core::time::Duration;
@@ -18,7 +18,7 @@ use url::Url;
 #[cfg(feature = "vmconnect")]
 pub use ironrdp_vmconnect::Mode as VmConnectMode;
 
-// ── Extension registry ────────────────────────────────────────────────────────
+// 鈹€鈹€ Extension registry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 type StaticChannelFn = Arc<dyn Fn(&mut ironrdp_connector::ClientConnector, &PropertySet) + Send + Sync>;
 type DvcChannelFn = Arc<dyn Fn(&mut ironrdp_dvc::DrdynvcClient, &PropertySet) + Send + Sync>;
@@ -76,7 +76,7 @@ impl fmt::Debug for ExtensionRegistry {
     }
 }
 
-// ── Public configuration types ────────────────────────────────────────────────
+// 鈹€鈹€ Public configuration types 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// RDPSND quality policy sent to servers that support audio protocol version 6 or newer.
 #[cfg(any(feature = "sound", feature = "rdpdr"))]
@@ -148,7 +148,7 @@ pub struct Config {
     /// Initial RemoteApp launch queued after the RAIL handshake.
     pub(crate) rail_initial_execute: Option<ExecutePdu>,
 
-    /// DVC channel ↔ named-pipe proxy configuration.
+    /// DVC channel 鈫?named-pipe proxy configuration.
     ///
     /// Each entry causes IronRDP to forward that DVC channel's traffic to/from the
     /// named pipe, allowing out-of-process DVC logic.
@@ -471,11 +471,11 @@ impl Default for RdpdrConfig {
 ///
 /// This is the form stored in [`Config`] and consumed by the connection code: every variant
 /// carries all the data the transport needs, including any credentials. To *configure* a transport
-/// on a [`ConfigBuilder`], use the granular [`TransportKind`] instead — it carries only the
+/// on a [`ConfigBuilder`], use the granular [`TransportKind`] instead 鈥?it carries only the
 /// addressing, leaving secrets to be supplied (or prompted for) separately.
 #[derive(Clone, Debug, Default)]
 pub enum Transport {
-    /// Plain TCP → TLS direct connection to the RDP server.
+    /// Plain TCP 鈫?TLS direct connection to the RDP server.
     #[default]
     Direct,
 
@@ -495,7 +495,7 @@ pub enum Transport {
     /// Typically used with standard RDP security (`enable_tls`/`enable_credssp` both false).
     #[cfg(windows)]
     NamedPipe {
-        /// Full pipe path (`\\.\pipe\…`) or bare pipe name.
+        /// Full pipe path (`\\.\pipe\鈥) or bare pipe name.
         path: String,
     },
 }
@@ -503,8 +503,8 @@ pub enum Transport {
 /// Transport selection used to configure a [`ConfigBuilder`].
 ///
 /// Only the *addressing* of the transport is provided here (the gateway endpoint, the RDCleanPath
-/// URL). The associated secrets — gateway username/password and the RDCleanPath authentication
-/// token — are supplied through their own dedicated `with_*` methods
+/// URL). The associated secrets 鈥?gateway username/password and the RDCleanPath authentication
+/// token 鈥?are supplied through their own dedicated `with_*` methods
 /// ([`with_gateway_username`](ConfigBuilder::with_gateway_username),
 /// [`with_gateway_password`](ConfigBuilder::with_gateway_password),
 /// [`with_rdcleanpath_token`](ConfigBuilder::with_rdcleanpath_token)).
@@ -515,7 +515,7 @@ pub enum Transport {
 /// and the collected credentials in [`build`](ConfigBuilder::build).
 #[derive(Clone, Debug, Default)]
 pub enum TransportKind {
-    /// Plain TCP → TLS direct connection to the RDP server.
+    /// Plain TCP 鈫?TLS direct connection to the RDP server.
     #[default]
     Direct,
 
@@ -545,7 +545,7 @@ pub enum TransportKind {
     /// Windows named-pipe RDP stream (e.g. Windows Sandbox).
     #[cfg(windows)]
     NamedPipe {
-        /// Full pipe path (`\\.\pipe\…`) or bare pipe name.
+        /// Full pipe path (`\\.\pipe\鈥) or bare pipe name.
         path: String,
     },
 }
@@ -565,7 +565,7 @@ pub struct GatewayConfig {
     pub prefer_direct: bool,
 }
 
-// ── Destination ───────────────────────────────────────────────────────────────
+// 鈹€鈹€ Destination 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[derive(Debug, Clone)]
 pub struct Destination {
@@ -655,7 +655,7 @@ impl From<&Destination> for ironrdp_connector::ServerName {
     }
 }
 
-// ── RDCleanPath & DVC proxy ───────────────────────────────────────────────────
+// 鈹€鈹€ RDCleanPath & DVC proxy 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// URL and authentication token for a fully-resolved RDCleanPath connection.
 #[derive(Clone, Debug)]
@@ -687,7 +687,7 @@ impl FromStr for DvcProxyInfo {
     }
 }
 
-// ── ConfigBuilder ─────────────────────────────────────────────────────────────
+// 鈹€鈹€ ConfigBuilder 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 const RDP_DEFAULT_PORT: u16 = 3389;
 const DEFAULT_WIDTH: u16 = 1280;
@@ -762,7 +762,7 @@ impl fmt::Display for MissingField {
 /// IronRDP's own extension keys use an `ironrdp_` prefix to avoid colliding with standard Microsoft
 /// keys, and custom channels are encouraged (but not required) to namespace their keys similarly
 /// (e.g. `mycorp_mychannel_enabled`). A channel may equally reuse a standard MS key when that fits,
-/// or adopt a completely different pattern if warranted — these are only conventions.
+/// or adopt a completely different pattern if warranted 鈥?these are only conventions.
 #[derive(Default)]
 pub struct ConfigBuilder {
     // Required (no default).
@@ -780,6 +780,7 @@ pub struct ConfigBuilder {
     domain: Option<String>,
     enable_tls: Option<bool>,
     enable_credssp: Option<bool>,
+    enable_standard_rdp_security: Option<bool>,
     certificate_validation: Option<ironrdp_tls::CertificateValidation>,
     certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
     server_certificate_verifier: Option<Arc<dyn ServerCertificateVerifier>>,
@@ -1015,7 +1016,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the desktop scale factor (percentage, typically 100–500) to request. Upserts the
+    /// Set the desktop scale factor (percentage, typically 100鈥?00) to request. Upserts the
     /// `desktopscalefactor` property.
     ///
     /// This becomes the `desktop_scale_factor` in the `TS_UD_CS_CORE` GCC structure.
@@ -1057,7 +1058,7 @@ impl ConfigBuilder {
 
     /// Set or clear the opaque load-balance routing token carried by the X.224 Connection Request PDU.
     ///
-    /// A nonempty token must contain 1–238 printable ASCII bytes, excluding an optional trailing CRLF.
+    /// A nonempty token must contain 1鈥?38 printable ASCII bytes, excluding an optional trailing CRLF.
     /// An empty value clears the token, and [`Self::build`] rejects other values.
     #[must_use]
     pub fn with_load_balance_info(mut self, value: impl Into<String>) -> Self {
@@ -1160,6 +1161,24 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable Standard RDP Security (the legacy RC4 security layer,
+    /// `PROTOCOL_RDP` with an empty X.224 protocol flag set).
+    ///
+    /// Local addition (see `NYATERM.md`): with the vendored connector's RC4
+    /// implementation, this now supports real Windows servers configured with
+    /// the "RDP" security-layer policy. When enabled, TLS and CredSSP are
+    /// turned off and the full RC4 handshake (Security Exchange PDU, encrypted
+    /// Client Info, licensing and session traffic) is performed.
+    ///
+    /// The default remains the transport-derived value (Windows named pipes
+    /// opt in; everything else stays on enhanced security).
+    #[doc(alias("with_rdp_security_layer"))]
+    #[must_use]
+    pub fn with_standard_rdp_security(mut self, enabled: bool) -> Self {
+        self.enable_standard_rdp_security = Some(enabled);
+        self
+    }
+
     /// Set the TLS peer-certificate validation policy.
     ///
     /// The default preserves historic behavior by accepting invalid certificates. Use
@@ -1241,11 +1260,11 @@ impl ConfigBuilder {
     /// compression type is advertised. The server may then send compressed PDUs using any
     /// compression algorithm up to and including this level:
     ///
-    /// - `None` — no compression (default)
-    /// - `Some(K8)` — MPPC with 8 KB history (RDP 4.0)
-    /// - `Some(K64)` — MPPC with 64 KB history (RDP 5.0)
-    /// - `Some(Rdp6)` — NCRUSH (RDP 6.0)
-    /// - `Some(Rdp61)` — XCRUSH (RDP 6.1)
+    /// - `None` 鈥?no compression (default)
+    /// - `Some(K8)` 鈥?MPPC with 8 KB history (RDP 4.0)
+    /// - `Some(K64)` 鈥?MPPC with 64 KB history (RDP 5.0)
+    /// - `Some(Rdp6)` 鈥?NCRUSH (RDP 6.0)
+    /// - `Some(Rdp61)` 鈥?XCRUSH (RDP 6.1)
     #[must_use]
     pub fn with_compression_type(mut self, ty: Option<ironrdp_pdu::rdp::client_info::CompressionType>) -> Self {
         self.compression_type = ty;
@@ -1257,10 +1276,10 @@ impl ConfigBuilder {
         self
     }
 
-    /// Set the bulk compression type from a level (0–3). Out-of-range levels are ignored.
+    /// Set the bulk compression type from a level (0鈥?). Out-of-range levels are ignored.
     ///
     /// The level maps to a [`CompressionType`](ironrdp_pdu::rdp::client_info::CompressionType):
-    /// `0` → `K8`, `1` → `K64`, `2` → `Rdp6`, `3` → `Rdp61`. See
+    /// `0` 鈫?`K8`, `1` 鈫?`K64`, `2` 鈫?`Rdp6`, `3` 鈫?`Rdp61`. See
     /// [`with_compression_type`](Self::with_compression_type) for the semantics of each level.
     #[must_use]
     pub fn with_compression_level(self, level: u32) -> Self {
@@ -1444,7 +1463,7 @@ impl ConfigBuilder {
     ///
     /// `PlayOnServer` and `Disabled` currently share the same client-info outcome:
     /// both clear local RDPSND playback and set `INFO_NOAUDIOPLAYBACK`. Distinct
-    /// `INFO_REMOTECONSOLEAUDIO` (true “play on server console”) is not wired yet.
+    /// `INFO_REMOTECONSOLEAUDIO` (true 鈥減lay on server console鈥? is not wired yet.
     #[cfg(feature = "sound")]
     #[must_use]
     pub fn with_audio_mode(mut self, mode: ironrdp_cfg::AudioMode) -> Self {
@@ -1853,13 +1872,18 @@ impl ConfigBuilder {
             codecs,
         };
 
-        // Named-pipe RDP (Windows Sandbox) is the only built-in path that opts into PROTOCOL_RDP
-        // with ENCRYPTION_LEVEL_NONE. Keep TCP/gateway paths on enhanced security by default.
+        // Named-pipe RDP (Windows Sandbox) is the built-in path that opts into PROTOCOL_RDP
+        // by default; an explicit `with_standard_rdp_security` overrides it. Keep TCP/gateway
+        // paths on enhanced security otherwise.
         // Check before consuming `self.transport` below.
-        #[cfg(windows)]
-        let enable_standard_rdp_security = matches!(&self.transport, TransportKind::NamedPipe { .. });
-        #[cfg(not(windows))]
-        let enable_standard_rdp_security = false;
+        let enable_standard_rdp_security = self
+            .enable_standard_rdp_security
+            .unwrap_or(
+                #[cfg(windows)]
+                matches!(&self.transport, TransportKind::NamedPipe { .. }),
+                #[cfg(not(windows))]
+                false,
+            );
 
         // Resolve the granular transport selection into the bundled form, folding in the separately
         // tracked secrets (gateway credentials, RDCleanPath token).
@@ -2075,7 +2099,7 @@ impl ConfigBuilder {
     /// Overlay a `.rdp` [`PropertySet`] on top of the current builder.
     ///
     /// Only properties present in `ps` set values, so this can be layered:
-    /// `explicit setters → PropertySet → more setters`, last writer wins. Resolution rules:
+    /// `explicit setters 鈫?PropertySet 鈫?more setters`, last writer wins. Resolution rules:
     /// `full address` beats `alternate full address`, an embedded port beats `server port`, and
     /// transport precedence is RDCleanPath > Gateway > Direct.
     pub fn with_property_set(mut self, ps: &PropertySet) -> anyhow::Result<Self> {
@@ -2378,7 +2402,7 @@ impl ConfigBuilder {
     }
 }
 
-/// Map a bulk-compression level (0–3) to the corresponding [`CompressionType`].
+/// Map a bulk-compression level (0鈥?) to the corresponding [`CompressionType`].
 ///
 /// 0 = MPPC 8K (RDP4), 1 = MPPC 64K (RDP5), 2 = NCRUSH (RDP6), 3 = XCRUSH (RDP6.1).
 ///

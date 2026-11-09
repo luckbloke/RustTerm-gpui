@@ -89,6 +89,20 @@ pub(crate) fn caps_lock_on() -> bool {
     unsafe { GetKeyState(VK_CAPITAL as i32) & 1 != 0 }
 }
 
+/// 本机 NumLock 是否开启（RDP Sync 事件要对齐全部锁定键）。
+#[cfg(windows)]
+pub(crate) fn num_lock_on() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_NUMLOCK};
+    unsafe { GetKeyState(VK_NUMLOCK as i32) & 1 != 0 }
+}
+
+/// 本机 ScrollLock 是否开启。
+#[cfg(windows)]
+pub(crate) fn scroll_lock_on() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SCROLL};
+    unsafe { GetKeyState(VK_SCROLL as i32) & 1 != 0 }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn caps_lock_on() -> bool {
     false

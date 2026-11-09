@@ -190,8 +190,11 @@ impl Encode for RsaPublicKey {
     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
         ensure_size!(in: dst, size: self.size());
 
-        let keylen = cast_length!("modulusLen", self.modulus.len(), in: dst)?;
-        let bitlen = (keylen - RSA_KEY_PADDING_LENGTH) * 8;
+        // `modulus` excludes the 8 trailing zero bytes of the wire blob: the
+        // keylen field counts the modulus plus that padding.
+        let keylen = cast_length!("modulusLen", self.modulus.len() + RSA_KEY_PADDING_LENGTH as usize, in: dst)?;
+        let bitlen = u32::try_from(self.modulus.len() * 8)
+            .map_err(|_| invalid_field_err!("modulusLen", "RSA modulus is too large", in: dst))?;
         let datalen = bitlen / 8 - 1;
 
         dst.write_u32(RSA_SENTINEL); // magic
@@ -200,6 +203,7 @@ impl Encode for RsaPublicKey {
         dst.write_u32(datalen);
         dst.write_u32(self.public_exponent);
         dst.write_slice(&self.modulus);
+        write_padding(dst, RSA_KEY_PADDING_LENGTH as usize);
 
         Ok(())
     }
@@ -209,7 +213,7 @@ impl Encode for RsaPublicKey {
     }
 
     fn size(&self) -> usize {
-        Self::FIXED_PART_SIZE + self.modulus.len()
+        Self::FIXED_PART_SIZE + self.modulus.len() + RSA_KEY_PADDING_LENGTH as usize
     }
 }
 
@@ -240,8 +244,16 @@ impl<'de> Decode<'de> for RsaPublicKey {
 
         let public_exponent = src.read_u32();
 
+        // The key blob is `bitlen/8 + 8` bytes: the modulus is followed by 8
+        // zero bytes of padding (FreeRDP `certificate_read_server_public_key`:
+        // ModulusLength = keylen - 8, then a 8-byte seek). The padding is not
+        // part of the RSA modulus -- feeding it to the big-endian conversion
+        // makes the modulus 2^64 times too large and every licensing RSA
+        // operation produces ciphertext the server cannot decrypt.
+        let modulus_len = keylen - RSA_KEY_PADDING_LENGTH as usize;
         ensure_size!(in: src, size: keylen);
-        let modulus = src.read_slice(keylen).into();
+        let modulus = src.read_slice(modulus_len).into();
+        read_padding!(src, RSA_KEY_PADDING_LENGTH as usize);
 
         Ok(Self {
             public_exponent,

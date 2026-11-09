@@ -105,11 +105,12 @@ impl<'de> Decode<'de> for LicenseHeader {
 
         let security_header = BasicSecurityHeader::decode(src)?;
 
-        if !security_header.flags.contains(BasicSecurityHeaderFlags::LICENSE_PKT) {
-            return Err(invalid_field_err!( "securityHeaderFlags",
-                "invalid security header flags", in: src));
-        }
-
+        // NyaTerm: do not require `SEC_LICENSE_PKT` here. FreeRDP's
+        // `license_read_preamble` never inspects the security-header flags, and
+        // a captured Windows Server 2008 R2 sends its licensing PDUs with the
+        // `SEC_ENCRYPT` flag only; the flags also get rewritten when this
+        // header is re-assembled from the wire (see the connector's license
+        // exchange). Which message this is, is told by the preamble type.
         let preamble_message_type = PreambleType::from_u8(src.read_u8())
             .ok_or_else(|| invalid_field_err!("preambleType", "invalid license type", in: src))?;
 

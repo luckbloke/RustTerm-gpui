@@ -84,6 +84,10 @@ pub fn tr(lang: Lang, key: &str) -> String {
         (En, "menu.help") => "Help",
         (Zh, "menu.x11") => "X 服务",
         (En, "menu.x11") => "X Service",
+        (Zh, "x11.screen_name") => "X 屏幕",
+        (En, "x11.screen_name") => "X screen",
+        (Zh, "x11.screen_hint") => "X server 已随应用运行。SSH 会话启用 X11 转发后，远端 X 程序会显示在这里。",
+        (En, "x11.screen_hint") => "The built-in X server is running. X11 programs from SSH sessions (with forwarding enabled) appear here.",
 
         // ---- 终端菜单 ----
         (Zh, "item.local_connect") => "本地连接",

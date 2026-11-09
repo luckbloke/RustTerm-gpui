@@ -212,6 +212,8 @@ pub enum SpawnCfg {
         auth: backends::ssh::SshAuth,
         /// 跳板机（ProxyJump），None = 直连
         jump: Option<backends::ssh::JumpHost>,
+        /// SSH X11 转发（内置 X server）
+        x11: bool,
     },
     /// 在 PTY 里运行任意命令（Ping / traceroute 等）
     Command {
@@ -266,6 +268,7 @@ impl TermPane {
         jump: Option<backends::ssh::JumpHost>,
         cols: u16,
         rows: u16,
+        x11: bool,
     ) -> Result<Self> {
         let io = backends::ssh::spawn(
             host.clone(),
@@ -275,10 +278,11 @@ impl TermPane {
             jump.clone(),
             cols,
             rows,
+            x11,
         )
         .await?;
         let mut pane = Self::new(title, io, cols, rows);
-        pane.spawn = SpawnCfg::Ssh { host, port, user, auth, jump };
+        pane.spawn = SpawnCfg::Ssh { host, port, user, auth, jump, x11 };
         Ok(pane)
     }
 

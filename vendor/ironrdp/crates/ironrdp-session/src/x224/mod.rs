@@ -1,8 +1,8 @@
 use ironrdp_bulk::BulkCompressor;
-use ironrdp_core::{Decode as _, ReadCursor, WriteBuf, decode};
+use ironrdp_core::{Decode as _, ReadCursor, WriteBuf, decode, encode_vec};
 use ironrdp_dvc::{DrdynvcClient, DvcClientProcessor, DynamicChannelMut, DynamicChannelRef};
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
-use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage, SendDataIndicationCtx};
+use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage, SendDataIndicationCtx, SendDataRequest};
 use ironrdp_pdu::rdp::autodetect::{AutoDetectReqPdu, AutoDetectRequest, AutoDetectResponse, AutoDetectRspPdu};
 use ironrdp_pdu::rdp::client_info::CompressionType;
 use ironrdp_pdu::rdp::headers::{
@@ -87,6 +87,14 @@ pub enum ProcessorOutput {
     /// The server may send this after activation when the client advertises
     /// `RNS_UD_CS_SUPPORT_MONITOR_LAYOUT_PDU`.
     MonitorLayout(Vec<Monitor>),
+    /// Server `TS_SET_KEYBOARD_INDICATORS_PDU` ([MS-RDPBCGR] 2.2.8.1.3.1): the
+    /// lock-key state of the *remote* session (`CKF_SCROLLLOCK`/`CKF_NUMLOCK`/
+    /// `CKF_CAPSLOCK`/`CKF_KANA`; `KBD_SYNC_*` in FreeRDP).
+    ///
+    /// Clients need this to keep their local lock keys aligned with the remote:
+    /// a CapsLock toggle flips *both* sides, so a client that only guesses the
+    /// initial state stays inverted forever.
+    KeyboardIndicators(u16),
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +115,10 @@ pub struct Processor {
     io_channel_id: u16,
     message_channel_id: Option<u16>,
     share_id: u32,
+    /// Standard RDP Security state (legacy RC4 layer); `None` for enhanced
+    /// security connections. Shared with the Fast-Path processor so both
+    /// advance the same keystreams (local addition; see `NYATERM.md`).
+    security: crate::security::SharedSecurity,
 }
 
 impl Processor {
@@ -123,7 +135,18 @@ impl Processor {
             io_channel_id,
             message_channel_id,
             share_id,
+            security: None,
         }
+    }
+
+    /// Installs the Standard RDP Security state negotiated by the connector.
+    pub fn set_security(&mut self, security: crate::security::SharedSecurity) {
+        self.security = security;
+    }
+
+    /// The negotiated Standard RDP Security state, if any.
+    pub fn security(&self) -> &crate::security::SharedSecurity {
+        &self.security
     }
 
     pub fn set_share_id(&mut self, share_id: u32) {
@@ -163,7 +186,7 @@ impl Processor {
             .get_channel_id_by_type::<C>()
             .ok_or_else(|| reason_err!("SVC", "channel not found"))?;
 
-        process_svc_messages(
+        process_svc_messages(&self.security, 
             messages.into(),
             channel_id,
             self.user_channel_id,
@@ -182,7 +205,7 @@ impl Processor {
             .get_channel_id_by_channel_name(channel_name)
             .ok_or_else(|| reason_err!("SVC", "channel not found"))?;
 
-        process_svc_messages(
+        process_svc_messages(&self.security, 
             messages,
             channel_id,
             self.user_channel_id,
@@ -213,7 +236,7 @@ impl Processor {
         frame: &[u8],
         bulk_decompressor: &mut Option<BulkCompressor>,
     ) -> SessionResult<Vec<ProcessorOutput>> {
-        let data_ctx: SendDataIndicationCtx<'_> = match ironrdp_pdu::mcs::decode_send_data_indication(frame) {
+        let raw_ctx: SendDataIndicationCtx<'_> = match ironrdp_pdu::mcs::decode_send_data_indication(frame) {
             Ok(data_ctx) => data_ctx,
             Err(error) => {
                 // Some servers (xrdp) end the session with a plain MCS Disconnect Provider Ultimatum.
@@ -230,6 +253,34 @@ impl Processor {
                 return Err(SessionError::decode(error));
             }
         };
+
+        // Under Standard RDP Security every inbound PDU carries a
+        // BasicSecurityHeader; strip (and decrypt) it before routing.
+        // Message-channel PDUs embed the header in their wire structure, so
+        // they keep it and only get their payload decrypted.
+        let user_data: std::borrow::Cow<'_, [u8]> = if self.message_channel_id == Some(raw_ctx.channel_id) {
+            match self.security.as_ref() {
+                Some(security) => {
+                    let mut security = security.lock().expect("standard security mutex");
+                    crate::security::unseal_message_pdu(&mut security, raw_ctx.user_data)?
+                }
+                None => std::borrow::Cow::Borrowed(raw_ctx.user_data),
+            }
+        } else {
+            match self.security.as_ref() {
+                Some(security) => {
+                    let mut security = security.lock().expect("standard security mutex");
+                    crate::security::unseal_io_pdu(&mut security, raw_ctx.user_data)?
+                }
+                None => std::borrow::Cow::Borrowed(raw_ctx.user_data),
+            }
+        };
+
+        let data_ctx = SendDataIndicationCtx {
+            initiator_id: raw_ctx.initiator_id,
+            channel_id: raw_ctx.channel_id,
+            user_data: user_data.as_ref(),
+        };
         let channel_id = data_ctx.channel_id;
 
         if channel_id == self.io_channel_id {
@@ -240,7 +291,7 @@ impl Processor {
             let maximum_chunk_size = self.static_channels.maximum_chunk_size();
             if let Some(svc) = self.static_channels.get_by_channel_id_mut(channel_id) {
                 let response_pdus = svc.process(data_ctx.user_data).map_err(SessionError::pdu)?;
-                process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id, maximum_chunk_size)
+                process_svc_messages(&self.security, response_pdus, channel_id, data_ctx.initiator_id, maximum_chunk_size)
                     .map(|data| vec![ProcessorOutput::ResponseFrame(data)])
             } else {
                 Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
@@ -365,8 +416,13 @@ impl Processor {
             }
             // FIXME: workaround fix to not terminate the session on "unhandled PDU: Set Keyboard Indicators PDU"
             ShareDataPdu::SetKeyboardIndicators(data) => {
-                debug!("Got Keyboard Indicators PDU: {data:?}");
-                Ok(Vec::new())
+                // keyboardIndicatorFlags (2 bytes) + pad2Octets (2 bytes)
+                let flags = data
+                    .get(..2)
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                    .unwrap_or_default();
+                debug!("Got Keyboard Indicators PDU: {flags:#06x}");
+                Ok(vec![ProcessorOutput::KeyboardIndicators(flags)])
             }
             ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(ErrorInfo::ProtocolIndependentCode(
                 ProtocolIndependentCode::None,
@@ -498,16 +554,23 @@ impl Processor {
         match req.request {
             AutoDetectRequest::RttRequest { sequence_number, .. } => {
                 let response = AutoDetectRspPdu::new(AutoDetectResponse::RttResponse { sequence_number });
-                let mut frame = WriteBuf::new();
-                ironrdp_pdu::mcs::encode_send_data_request(
-                    self.user_channel_id,
-                    message_channel_id,
-                    &response,
-                    &mut frame,
-                )
-                .map_err(SessionError::encode)?;
+                // Sealed when Standard RDP Security is active ([MS-RDPBCGR] 5.3).
+                let user_data = match self.security.as_ref() {
+                    Some(security) => {
+                        let mut security = security.lock().expect("standard security mutex");
+                        let body = encode_vec(&response).map_err(SessionError::encode)?;
+                        crate::security::seal_pdu(&mut security, BasicSecurityHeaderFlags::AUTODETECT_RSP, &body)?
+                    }
+                    None => encode_vec(&response).map_err(SessionError::encode)?,
+                };
+                let request = SendDataRequest {
+                    initiator_id: self.user_channel_id,
+                    channel_id: message_channel_id,
+                    user_data: std::borrow::Cow::Owned(user_data),
+                };
+                let frame = encode_vec(&X224(McsMessage::SendDataRequest(request))).map_err(SessionError::encode)?;
                 debug!(sequence_number, "Responded to auto-detect RTT request");
-                Ok(vec![ProcessorOutput::ResponseFrame(frame.into_inner())])
+                Ok(vec![ProcessorOutput::ResponseFrame(frame)])
             }
             req @ AutoDetectRequest::NetworkCharacteristicsResult { .. } => {
                 debug!(?req, "Received network characteristics from server");
@@ -537,15 +600,14 @@ impl Processor {
 
     /// Send a pdu on the static global channel. Typically used to send input events
     pub fn encode_static(&self, output: &mut WriteBuf, pdu: ShareDataPdu) -> SessionResult<usize> {
-        let written = ironrdp_pdu::rdp::headers::encode_share_data(
+        crate::security::encode_share_data(
+            &self.security,
             self.user_channel_id,
             self.io_channel_id,
             self.share_id,
             pdu,
             output,
         )
-        .map_err(SessionError::encode)?;
-        Ok(written)
     }
 }
 
@@ -563,13 +625,60 @@ fn is_logon_complete(session_info: &SaveSessionInfoPdu) -> bool {
 ///
 /// The caller is responsible for ensuring that the `channel_id` corresponds to the correct channel.
 fn process_svc_messages(
+    security: &crate::security::SharedSecurity,
     messages: Vec<SvcMessage>,
     channel_id: u16,
     initiator_id: u16,
     maximum_chunk_size: usize,
 ) -> SessionResult<Vec<u8>> {
-    client_encode_svc_messages_with_max_chunk_len(messages, channel_id, initiator_id, maximum_chunk_size)
-        .map_err(SessionError::encode)
+    let encoded = client_encode_svc_messages_with_max_chunk_len(messages, channel_id, initiator_id, maximum_chunk_size)
+        .map_err(SessionError::encode)?;
+
+    let Some(security) = security else {
+        return Ok(encoded);
+    };
+
+    // Under Standard RDP Security every MCS Send Data Request chunk is sealed
+    // individually ([MS-RDPBCGR] 5.3). Walk the concatenated TPKT frames and
+    // seal each chunk payload.
+    let mut sealed_frames = Vec::with_capacity(encoded.len() + 16 * 8);
+    let mut offset = 0usize;
+    while offset < encoded.len() {
+        if offset + 4 > encoded.len() {
+            return Err(reason_err!("standard security", "truncated TPKT header in SVC output"));
+        }
+        let frame_len = usize::from(u16::from_be_bytes([encoded[offset + 2], encoded[offset + 3]]));
+        if frame_len < 4 || offset + frame_len > encoded.len() {
+            return Err(reason_err!(
+                "standard security",
+                "invalid TPKT frame length {frame_len} in SVC output"
+            ));
+        }
+
+        let frame = &encoded[offset..offset + frame_len];
+        let X224(McsMessage::SendDataRequest(request)) = decode::<X224<McsMessage<'_>>>(frame)
+            .map_err(SessionError::decode)?
+        else {
+            return Err(reason_err!("standard security", "unexpected MCS message in SVC output"));
+        };
+
+        let mut security = security.lock().expect("standard security mutex");
+        let sealed_user_data = crate::security::seal_pdu(&mut security, BasicSecurityHeaderFlags::empty(), &request.user_data)?;
+        drop(security);
+
+        let sealed = SendDataRequest {
+            initiator_id: request.initiator_id,
+            channel_id: request.channel_id,
+            user_data: std::borrow::Cow::Owned(sealed_user_data),
+        };
+        let encoded_frame = encode_vec(&X224(McsMessage::SendDataRequest(sealed))).map_err(SessionError::encode)?;
+
+        sealed_frames.extend_from_slice(&encoded_frame);
+
+        offset += frame_len;
+    }
+
+    Ok(sealed_frames)
 }
 
 #[cfg(test)]

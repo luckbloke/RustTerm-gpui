@@ -140,6 +140,9 @@ pub struct Processor {
     /// repeatedly triggering redraw traffic.
     bitmap_recovery_requested: bool,
     bitmap_recovery_pending: bool,
+    /// Standard RDP Security state shared with the X.224 processor (local
+    /// addition; see `NYATERM.md`).
+    security: crate::security::SharedSecurity,
     #[cfg(feature = "qoiz")]
     zdctx: zstd_safe::DCtx<'static>,
 }
@@ -181,6 +184,33 @@ impl Processor {
 
         let header = decode_cursor::<FastPathHeader>(&mut input).map_err(SessionError::decode)?;
         trace!(fast_path_header = ?header, "Received Fast-Path packet");
+
+        // Under Standard RDP Security an encrypted fast-path output frame
+        // carries an 8-byte MAC followed by the RC4-encrypted updates
+        // ([MS-RDPBCGR] 5.3.6; local addition, see `NYATERM.md`).
+        let owned_plaintext;
+        let input: &[u8] = if header.flags.contains(ironrdp_pdu::fast_path::EncryptionFlags::ENCRYPTED) {
+            let payload = input.remaining();
+            let Some(security) = self.security.as_ref() else {
+                return Err(reason_err!(
+                    "FastPath",
+                    "received an encrypted fast-path frame without Standard RDP Security state"
+                ));
+            };
+            let mut security = security.lock().expect("standard security mutex");
+            owned_plaintext = crate::security::unseal_fastpath(
+                &mut security,
+                payload,
+                header
+                    .flags
+                    .contains(ironrdp_pdu::fast_path::EncryptionFlags::SECURE_CHECKSUM),
+            )?;
+            &owned_plaintext
+        } else {
+            input.remaining()
+        };
+
+        let mut input = ReadCursor::new(input);
 
         // A single FastPath output PDU can contain multiple updates.
         // Loop over all updates within the PDU payload.
@@ -826,7 +856,7 @@ impl Processor {
                         marker.frame_action,
                         marker.frame_id.unwrap_or(0)
                     );
-                    self.marker_processor.process(&marker, output)?;
+                    self.marker_processor.process(&marker, &self.security, output)?;
                 }
             }
         }
@@ -889,6 +919,9 @@ pub struct ProcessorBuilder {
     /// `UpdateKind::PointerBitmap` will not be generated. Remote pointer will be drawn
     /// via software rendering on top of the output image.
     pub pointer_software_rendering: bool,
+    /// Standard RDP Security state shared with the X.224 processor; `None`
+    /// for enhanced security connections (local addition; see `NYATERM.md`).
+    pub security: crate::security::SharedSecurity,
 }
 
 impl ProcessorBuilder {
@@ -903,6 +936,7 @@ impl ProcessorBuilder {
             mouse_pos_update: None,
             enable_server_pointer: self.enable_server_pointer,
             pointer_software_rendering: self.pointer_software_rendering,
+            security: self.security,
             palette: Palette::system_default(),
             bitmap_recovery_requested: false,
             bitmap_recovery_pending: false,
@@ -1049,11 +1083,17 @@ impl FrameMarkerProcessor {
         }
     }
 
-    fn process(&mut self, marker: &FrameMarkerPdu, output: &mut WriteBuf) -> SessionResult<()> {
+    fn process(
+        &mut self,
+        marker: &FrameMarkerPdu,
+        security: &crate::security::SharedSecurity,
+        output: &mut WriteBuf,
+    ) -> SessionResult<()> {
         match marker.frame_action {
             FrameAction::Begin => Ok(()),
             FrameAction::End => {
-                ironrdp_pdu::rdp::headers::encode_share_data(
+                crate::security::encode_share_data(
+                    security,
                     self.user_channel_id,
                     self.io_channel_id,
                     self.share_id,
@@ -1061,8 +1101,7 @@ impl FrameMarkerProcessor {
                         frame_id: marker.frame_id.unwrap_or(0),
                     }),
                     output,
-                )
-                .map_err(SessionError::encode)?;
+                )?;
 
                 Ok(())
             }
@@ -1089,6 +1128,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 4, 3);
@@ -1140,6 +1180,7 @@ mod tests {
                 share_id: 0,
                 enable_server_pointer: false,
                 pointer_software_rendering: false,
+            security: None,
             }
             .build();
             let mut image = DecodedImage::new(PixelFormat::RgbA32, 2, 2);
@@ -1194,6 +1235,7 @@ mod tests {
             share_id: 1,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1232,6 +1274,7 @@ mod tests {
             share_id: 1,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1264,6 +1307,7 @@ mod tests {
             share_id: 1,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1305,6 +1349,7 @@ mod tests {
             share_id: 1,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1358,6 +1403,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         processor
@@ -1391,6 +1437,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         processor

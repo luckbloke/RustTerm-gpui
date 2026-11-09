@@ -1,4 +1,4 @@
-use core::cell::RefCell;
+﻿use core::cell::RefCell;
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::num::NonZeroU32;
 use core::time::Duration;
@@ -552,7 +552,7 @@ pub(crate) type FastPathInputEvents = smallvec::SmallVec<[FastPathInputEvent; 2]
 pub(crate) enum RdpInputEvent {
     Cliprdr(ClipboardMessage),
     ClipboardBackend(WasmClipboardBackendMessage),
-    /// Printer backend → event loop: a print job finished and its bytes are
+    /// Printer backend 鈫?event loop: a print job finished and its bytes are
     /// ready for delivery to JS. See [`crate::printer::PrinterBackendMessage`].
     Printer(crate::printer::PrinterBackendMessage),
     FastPath(FastPathInputEvents),
@@ -700,6 +700,7 @@ impl iron_remote_desktop::Session for Session {
             compression_type: connection_result.compression_type,
             enable_server_pointer: connection_result.enable_server_pointer,
             pointer_software_rendering: connection_result.pointer_software_rendering,
+        security: connection_result.rdp_security,
         }
         .build();
 

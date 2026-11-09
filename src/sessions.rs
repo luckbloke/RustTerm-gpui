@@ -66,6 +66,11 @@ pub struct SessionEntry {
     /// `default` 同样是为了兼容没有该字段的旧 `sessions.json`。
     #[serde(default)]
     pub legacy_compat: bool,
+    /// SSH X11 转发：连接时发 `x11-req`，远端 X 程序显示在内置 X server。
+    ///
+    /// 只有 SSH 会话使用；`default` 兼容没有该字段的旧 `sessions.json`。
+    #[serde(default)]
+    pub x11: bool,
     #[serde(default = "default_group")]
     pub group: String,
 }
@@ -220,6 +225,7 @@ impl SessionStore {
                 domain: String::new(),
                 share_dir: String::new(),
                 legacy_compat: false,
+                x11: false,
                 group: default_group(),
             }
         };
@@ -397,6 +403,7 @@ mod tests {
             domain: String::new(),
             share_dir: r"D:\share".to_string(),
             legacy_compat: false,
+            x11: false,
             group: default_group(),
         };
         let json = serde_json::to_string(&entry).unwrap();

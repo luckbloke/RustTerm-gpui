@@ -60,20 +60,34 @@ fn client_name() -> String {
 
 /// 连接时采用的安全层。
 ///
-/// IronRDP 不支持 Standard RDP Security（没有 RC4 安全交换），所以这里只有两种：
 /// - `Nla`：CredSSP/NLA + TLS，现代服务器首选；
 /// - `TlsOnly`：只用 TLS，凭据在 Client Info 里自动登录 —— 旧版
-///   Windows Server 2008 / 2008 R2 的兼容路径。
+///   Windows Server 2008 / 2008 R2 的兼容路径；
+/// - `RdpStandard`：Standard RDP Security（传统 RC4 加密层）。服务器把
+///   「RDP 安全层」策略设为「RDP」时只接受这一种（报
+///   SSL_NOT_ALLOWED_BY_SERVER），vendored IronRDP 已实现完整 RC4 路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SecurityMode {
     Nla,
     TlsOnly,
+    RdpStandard,
 }
 
 impl SecurityMode {
     fn uses_credssp(self) -> bool {
         matches!(self, SecurityMode::Nla)
     }
+}
+
+/// 判断错误是否为「服务器只支持 Standard RDP Security」。
+///
+/// 对应 X.224 协商失败码 SSL_NOT_ALLOWED_BY_SERVER，连接器报
+/// "server only supports Standard RDP Security"。
+fn looks_like_standard_rdp_only_failure(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    text.contains("standard rdp security")
+        || text.contains("ssl_not_allowed_by_server")
+        || text.contains("ssl not allowed by server")
 }
 
 fn build_config(
@@ -106,9 +120,11 @@ fn build_config(
         // NLA（CredSSP）与 TLS 是两条独立的安全层：旧版服务器只走 TLS。
         // TLS-only 时服务器会显示登录界面，自动登录标志让它在 Client Info
         // 里直接用表单里的用户名/密码登录，体验与 mstsc 一致。
+        // RdpStandard：整个连接跑在传统 RC4 加密层上，同样用自动登录。
         .with_credssp(security.uses_credssp())
-        .with_tls(true)
-        .with_autologon(matches!(security, SecurityMode::TlsOnly))
+        .with_tls(!matches!(security, SecurityMode::RdpStandard))
+        .with_standard_rdp_security(matches!(security, SecurityMode::RdpStandard))
+        .with_autologon(matches!(security, SecurityMode::TlsOnly | SecurityMode::RdpStandard))
         // 剪贴板同步：Enable 时由 ironrdp-client 在 Windows 上自建 WinClipboard
         // 后端 —— 远端→本机直接写系统剪贴板，本机→远端由它监听系统剪贴板变化，
         // UI 层不经手数据。Disable 则完全不协商 CLIPRDR 通道。
@@ -362,6 +378,15 @@ fn looks_like_nla_failure(error: &anyhow::Error) -> bool {
     NLA.iter().any(|needle| text.contains(needle))
 }
 
+/// 服务器在协商响应里明确选择了 CredSSP（PROTOCOL_HYBRID）——这种情况下
+/// TLS-only 与 Standard RDP 都会被拒，必须走 NLA。用户勾选的「兼容模式」
+/// 只是偏好，服务器的明示要求优先：据此触发一次 NLA 重试。
+fn looks_like_credssp_required(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    text.contains("credssp")
+        && (text.contains("requires") || text.contains("enhanced rdp security") || text.contains("hybrid"))
+}
+
 pub async fn run(
     params: &RdParams,
     ev: &Sender<RdEvent>,
@@ -377,6 +402,20 @@ pub async fn run(
     };
     match run_once(params, first, ev, cmds, cancel).await {
         Ok(()) => Ok(()),
+        // 兼容模式下服务器明确要求 CredSSP：忽略勾选项，改用 NLA 重试一次。
+        Err(fail)
+            if !fail.connected
+                && first == SecurityMode::TlsOnly
+                && looks_like_credssp_required(&fail.error) =>
+        {
+            eprintln!("[RDP] 服务器要求 CredSSP (NLA)，改用 NLA 重试：{}", fail.error);
+            let _ = ev.send(RdEvent::Notice(
+                "服务器要求 NLA 认证，正在用 CredSSP 重试…".to_string(),
+            ));
+            run_once(params, SecurityMode::Nla, ev, cmds, cancel)
+                .await
+                .map_err(|fail| fail.error)
+        }
         Err(fail)
             if !fail.connected
                 && first == SecurityMode::Nla
@@ -386,7 +425,30 @@ pub async fn run(
             let _ = ev.send(RdEvent::Notice(
                 "NLA 握手失败，正在用 TLS 兼容模式重试…".to_string(),
             ));
-            run_once(params, SecurityMode::TlsOnly, ev, cmds, cancel)
+            match run_once(params, SecurityMode::TlsOnly, ev, cmds, cancel).await {
+                Ok(()) => Ok(()),
+                Err(fail)
+                    if !fail.connected && looks_like_standard_rdp_only_failure(&fail.error) =>
+                {
+                    eprintln!("[RDP] 服务器只支持 Standard RDP Security，改用 RC4 安全层重试：{}", fail.error);
+                    let _ = ev.send(RdEvent::Notice(
+                        "服务器只支持 RDP 安全层，正在用 Standard RDP Security 重试…".to_string(),
+                    ));
+                    run_once(params, SecurityMode::RdpStandard, ev, cmds, cancel)
+                        .await
+                        .map_err(|fail| fail.error)
+                }
+                Err(fail) => Err(fail.error),
+            }
+        }
+        Err(fail)
+            if !fail.connected && looks_like_standard_rdp_only_failure(&fail.error) =>
+        {
+            eprintln!("[RDP] 服务器只支持 Standard RDP Security，改用 RC4 安全层重试：{}", fail.error);
+            let _ = ev.send(RdEvent::Notice(
+                "服务器只支持 RDP 安全层，正在用 Standard RDP Security 重试…".to_string(),
+            ));
+            run_once(params, SecurityMode::RdpStandard, ev, cmds, cancel)
                 .await
                 .map_err(|fail| fail.error)
         }
@@ -491,6 +553,26 @@ async fn run_once(
                         if !ops.is_empty() {
                             flush_ops(&mut db, &input_sender, ops);
                         }
+                    }
+                    RdCommand::SyncLockKeys { scroll, num, caps } => {
+                        // Input Event Sync：绝对设置远端锁定键（不受修饰键影响，
+                        // 是扫描码 CapsLock 做不到的——Windows 忽略 Shift 按住时
+                        // 的 CapsLock 切换）。绕过 Database：锁定键不属于
+                        // Database 跟踪的按下/抬起状态。
+                        use ironrdp::pdu::input::fast_path::SynchronizeFlags;
+                        let mut flags = SynchronizeFlags::empty();
+                        if scroll {
+                            flags |= SynchronizeFlags::SCROLL_LOCK;
+                        }
+                        if num {
+                            flags |= SynchronizeFlags::NUM_LOCK;
+                        }
+                        if caps {
+                            flags |= SynchronizeFlags::CAPS_LOCK;
+                        }
+                        let _ = input_sender.try_send(RdpInputEvent::FastPath(
+                            smallvec::smallvec![ironrdp::pdu::input::fast_path::FastPathInputEvent::SyncEvent(flags)],
+                        ));
                     }
                     RdCommand::Pointer { x, y, buttons: nb } => {
                         let mut ops = vec![Operation::MouseMove(MousePosition { x, y })];
@@ -632,6 +714,9 @@ async fn run_once(
                         // 恢复默认形状：宽度/高度为 0 表示「无自定义光标」，
                         // 客户端据此隐藏远端光标绘制，退回本地系统光标。
                         let _ = ev.send(RdEvent::CursorHidden);
+                    }
+                    RdpOutputEvent::KeyboardIndicators(flags) => {
+                        let _ = ev.send(RdEvent::KeyboardIndicators(flags));
                     }
                     _ => {}
                 },

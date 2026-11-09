@@ -5,7 +5,15 @@
 
 #[cfg(windows)]
 fn main() {
-    println!("cargo:rerun-if-changed=icons/icon.ico");
+    // 构建时间戳：嵌入二进制供运行期日志做构建指纹（排障时确认版本）。
+    // 注意：不声明 rerun-if-changed（默认=包内任一文件变化都重跑本脚本），
+    // 保证时间戳与二进制同步刷新。
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=NYATERM_BUILD_UNIX_TS={ts}");
+
     winresource::WindowsResource::new()
         .set_icon("icons/icon.ico")
         .compile()

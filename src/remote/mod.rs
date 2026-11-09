@@ -11,6 +11,7 @@ pub mod rdp;
 pub mod rdp_clipboard;
 pub mod spice;
 pub mod vnc;
+pub mod x11;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -21,6 +22,8 @@ pub enum RdProtocol {
     Vnc,
     Rdp,
     Spice,
+    /// 内置 X11 服务（进程内 X server；`host` 等字段不使用）
+    X11,
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +143,12 @@ pub enum RdEvent {
     /// 远端剪贴板文本（VNC `ServerCutText`；RDP 走后端原生的系统剪贴板，
     /// 不经过这条事件）。
     Clipboard(String),
+    /// 远端会话的锁定键状态（`TS_SET_KEYBOARD_INDICATORS_PDU` 的 `CKF_*` 位）。
+    ///
+    /// CapsLock 位是 `0x0004`（FreeRDP `KBD_SYNC_CAPS_LOCK`）。客户端据此把
+    /// 本机锁定键对齐到远端——只靠"猜初值"会让大小写永远相反：一次 CapsLock
+    /// 切换会同时翻转两边，错位关系被原样保留，怎么按都修不回来。
+    KeyboardIndicators(u16),
     /// 非致命的连接提示（例如 NLA 握手失败后自动改用 TLS 兼容模式）。
     ///
     /// 与 [`RdEvent::Error`] 不同：收到它仍然继续连接，UI 只把它显示在
@@ -169,6 +178,12 @@ pub enum RdCommand {
     /// 绝对指针位置 + 按键位掩码（1=左 2=中 4=右）
     Pointer { x: u16, y: u16, buttons: u8 },
     Wheel { dy: i16 },
+    /// 把远端锁定键**绝对设置**为本地状态（RDP Input Event Sync）。
+    ///
+    /// 用 Sync 事件而不是注入 CapsLock 扫描码：Windows 会忽略按住 Shift 时的
+    /// CapsLock 切换——在折算大写字母时那正是常见情形，扫描码方案会让大写
+    /// 永远传不过去。Sync 事件不受修饰键影响。
+    SyncLockKeys { scroll: bool, num: bool, caps: bool },
     /// 本机剪贴板文本 → 远端（VNC `ClientCutText`；RDP 由后端原生通道自行处理）。
     Clipboard(String),
     Close,
@@ -230,6 +245,7 @@ fn friendly_error(protocol: RdProtocol, msg: &str) -> String {
             RdProtocol::Vnc => Some("VNC 密码错误或未填写：在远程桌面连接表单的「密码」栏填写（也可右键会话 → 编辑… 填好后重连）"),
             RdProtocol::Spice => Some("SPICE 密码错误或未填写：在远程桌面连接表单的「密码」栏填写（也可右键会话 → 编辑… 填好后重连）"),
             RdProtocol::Rdp => Some("RDP 认证失败：请确认用户名与密码都正确（也可右键会话 → 编辑… 填好后重连）"),
+            RdProtocol::X11 => None,
         }
     } else if lower.contains("empty identity") || lower.contains("credssp") {
         Some("RDP 必须填写用户名：在远程桌面连接表单的「用户」栏填用户名、「密码」栏填密码（也可右键会话 → 编辑… 填好后重连）")
@@ -289,6 +305,9 @@ pub fn spawn(params: RdParams) -> RdSession {
                         }
                         RdProtocol::Spice => {
                             spice::run(&params, &ev_tx, &cmd_rx, &cancel_thread).await
+                        }
+                        RdProtocol::X11 => {
+                            x11::run(&params, &ev_tx, &cmd_rx, &cancel_thread).await
                         }
                     }
                 })

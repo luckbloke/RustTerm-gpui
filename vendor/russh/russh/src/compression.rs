@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+﻿use std::convert::TryFrom;
 
 use delegate::delegate;
 use ssh_encoding::Encode;

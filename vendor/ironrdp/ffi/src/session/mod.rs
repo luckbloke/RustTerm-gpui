@@ -1,4 +1,4 @@
-pub mod image;
+﻿pub mod image;
 
 #[diplomat::bridge]
 pub mod ffi {
@@ -103,6 +103,7 @@ pub mod ffi {
                 compression_type: connection_result.compression_type,
                 enable_server_pointer: connection_result.enable_server_pointer,
                 pointer_software_rendering: connection_result.pointer_software_rendering,
+            security: connection_result.rdp_security,
             }
             .build();
             stage.set_window_support_level(window_support_level);
@@ -414,7 +415,7 @@ pub mod ffi {
 
         /// Returns the multitransport request ID and requested protocol.
         ///
-        /// The security cookie is intentionally not exposed — it is sensitive
+        /// The security cookie is intentionally not exposed 鈥?it is sensitive
         /// and only needed internally for transport binding.
         #[expect(
             clippy::as_conversions,

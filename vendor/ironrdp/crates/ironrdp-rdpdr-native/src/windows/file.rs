@@ -138,12 +138,14 @@ pub(crate) fn close(backend: &mut WindowsRdpdrBackend, req: DeviceCloseRequest) 
     } else {
         NtStatus::INVALID_HANDLE
     };
-    // NyaTerm diagnostic: logged unconditionally so the exact end-of-copy
-    // sequence is visible in the trace file.
-    super::log_diagnostic(format_args!(
-        "[RDPDR] close device={} file={} -> {status:?}",
-        req.device_io_request.device_id, req.device_io_request.file_id
-    ));
+    // NyaTerm diagnostic: failures always reach the log file, the successful
+    // tail of a copy only under `NYATERM_RDPDR_TRACE`.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] close device={} file={} -> {status:?}",
+            req.device_io_request.device_id, req.device_io_request.file_id
+        ));
+    }
 
     messages.push(SvcMessage::from(RdpdrPdu::DeviceCloseResponse(DeviceCloseResponse {
         device_io_response: DeviceIoResponse::new(req.device_io_request, status),
@@ -246,13 +248,15 @@ pub(crate) fn set_information(
     req: ServerDriveSetInformationRequest,
 ) -> PduResult<Vec<SvcMessage>> {
     let status = set_information_inner(backend, &req).map_or_else(|status| status, |_| NtStatus::SUCCESS);
-    // NyaTerm diagnostic: logged unconditionally so the exact end-of-copy
-    // sequence (timestamps, close) is visible in the trace file.
-    super::log_diagnostic(format_args!(
-        "[RDPDR] set-info class={:?} file={} -> {status:?}",
-        req.set_buffer,
-        req.device_io_request.file_id,
-    ));
+    // NyaTerm diagnostic: failures always reach the log file, the successful
+    // tail of a copy only under `NYATERM_RDPDR_TRACE`.
+    if status != NtStatus::SUCCESS || super::trace_enabled() {
+        super::log_diagnostic(format_args!(
+            "[RDPDR] set-info class={:?} file={} -> {status:?}",
+            req.set_buffer,
+            req.device_io_request.file_id,
+        ));
+    }
     let response = ClientDriveSetInformationResponse::new(&req, status).map_err(|error| encode_err!(error))?;
 
     Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(

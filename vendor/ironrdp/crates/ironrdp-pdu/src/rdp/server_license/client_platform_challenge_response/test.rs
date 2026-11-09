@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+﻿use std::sync::LazyLock;
 
 use ironrdp_core::{decode, encode_vec};
 
@@ -24,7 +24,7 @@ const CLIENT_HARDWARE_IDENTIFICATION_BUFFER: [u8; 20] = [
 const CLIENT_PLATFORM_CHALLENGE_RESPONSE_BUFFER: [u8; 70] = [
     0x80, 0x00, // flags
     0x00, 0x00, // flagsHi
-    0x15, 0x03, 0x42, 0x00, // preamble
+    0x15, 0x83, 0x42, 0x00, // preamble
     0x09, 0x00, // blob type, ignored
     0x12, 0x00, // blob len
     0xfa, 0xb4, 0xe8, 0x24, 0xcf, 0x56, 0xb2, 0x4e, 0x80, 0x02, 0xbd, 0xb6, 0x61, 0xfc, 0xdf, 0xe9, 0x6c,
@@ -62,7 +62,7 @@ pub(crate) static CLIENT_PLATFORM_CHALLENGE_RESPONSE: LazyLock<LicensePdu> = Laz
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::PlatformChallengeResponse,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(
                 CLIENT_PLATFORM_CHALLENGE_RESPONSE_BUFFER.len() - BASIC_SECURITY_HEADER_SIZE,
@@ -213,7 +213,7 @@ fn challenge_response_creates_from_server_challenge_and_encryption_data_correctl
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::PlatformChallengeResponse,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(
                 PREAMBLE_SIZE

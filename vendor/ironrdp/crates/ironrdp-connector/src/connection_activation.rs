@@ -1,11 +1,16 @@
+use std::borrow::Cow;
 use core::mem;
 
+use ironrdp_core::encode_vec;
 use ironrdp_pdu::rdp;
 use ironrdp_pdu::rdp::capability_sets::{
     CapabilitySet, InputFlags, Rail, RailSupportLevel, WindowList, WindowSupportLevel,
 };
+use ironrdp_pdu::rdp::headers::{BasicSecurityHeaderFlags, ShareControlHeader};
+use ironrdp_pdu::rdp::standard_security::RdpSecurity;
 use tracing::{debug, warn};
 
+use crate::standard_security::{encode_send_data_request_raw, seal_pdu, unseal_pdu};
 use crate::{
     Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
     MonotonicInstant, Sequence, State, Written, general_err, reason_err,
@@ -33,6 +38,10 @@ pub struct ConnectionActivationSequence {
     // here (rather than duplicated into every state variant).
     io_channel_id: u16,
     user_channel_id: u16,
+    /// Standard RDP Security state, when the connection was established with
+    /// the legacy RC4 layer. Every I/O-channel PDU of this phase is sealed /
+    /// unsealed with it (local addition; see `NYATERM.md`).
+    pub security: crate::standard_security::SharedSecurity,
 }
 
 impl ConnectionActivationSequence {
@@ -46,6 +55,7 @@ impl ConnectionActivationSequence {
             config,
             io_channel_id,
             user_channel_id,
+            security: None,
         }
     }
 
@@ -83,6 +93,8 @@ pub struct ConnectionActivationFactory {
     io_channel_id: u16,
     user_channel_id: u16,
     multitransport_soft_sync: bool,
+    /// Standard RDP Security state carried into reactivations.
+    security: crate::standard_security::SharedSecurity,
 }
 
 impl ConnectionActivationFactory {
@@ -92,7 +104,15 @@ impl ConnectionActivationFactory {
             io_channel_id,
             user_channel_id,
             multitransport_soft_sync: false,
+            security: None,
         }
+    }
+
+    /// Carries the negotiated Standard RDP Security state into every
+    /// activation sequence produced by this factory.
+    pub(crate) fn with_rdp_security(mut self, security: crate::standard_security::SharedSecurity) -> Self {
+        self.security = security;
+        self
     }
 
     pub(crate) fn with_multitransport_soft_sync(mut self, multitransport_soft_sync: bool) -> Self {
@@ -115,7 +135,15 @@ impl ConnectionActivationFactory {
     /// Produces a fresh [`ConnectionActivationSequence`] in the initial `CapabilitiesExchange` state.
     #[must_use]
     pub fn create(&self) -> ConnectionActivationSequence {
-        ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id)
+        // NyaTerm: carry the negotiated Standard RDP Security state into every
+        // activation sequence this factory produces -- a reactivation sequence
+        // without it would read encrypted PDUs as plaintext (captured: the
+        // Demand Active arrived with an `SEC_ENCRYPT` header and failed its
+        // Share Control decode).
+        let mut sequence =
+            ConnectionActivationSequence::new(self.config.clone(), self.io_channel_id, self.user_channel_id);
+        sequence.security = self.security.clone();
+        sequence
     }
 }
 
@@ -151,10 +179,32 @@ impl Sequence for ConnectionActivationSequence {
             ConnectionActivationState::CapabilitiesExchange => {
                 debug!("Capabilities Exchange");
 
-                let send_data_indication_ctx =
-                    ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+                let raw_ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+
+                // Under Standard RDP Security every inbound I/O-channel PDU carries a
+                // BasicSecurityHeader; strip (and decrypt) it when present.
+                let user_data: Cow<'_, [u8]> = match self.security.as_ref().map(|s| s.lock().expect("standard security mutex")) {
+                    Some(mut security) => unseal_pdu(&mut security, raw_ctx.user_data)?,
+                    None => Cow::Borrowed(raw_ctx.user_data),
+                };
+                let send_data_indication_ctx = ironrdp_pdu::mcs::SendDataIndicationCtx {
+                    initiator_id: raw_ctx.initiator_id,
+                    channel_id: raw_ctx.channel_id,
+                    user_data: user_data.as_ref(),
+                };
                 let share_control_ctx =
-                    rdp::headers::decode_share_control(send_data_indication_ctx).map_err(ConnectorError::decode)?;
+                    rdp::headers::decode_share_control(send_data_indication_ctx).map_err(|error| {
+                        // NyaTerm diagnostic: embed the decrypted plaintext head
+                        // into the error (a windowed GUI launch has no stderr).
+                        let mut head = String::new();
+                        for byte in user_data.iter().take(user_data.len().min(32)) {
+                            head.push_str(&format!("{byte:02X} "));
+                        }
+                        reason_err!(
+                            "capabilities exchange",
+                            "share control decode failed ({error}); plaintext head: {head}"
+                        )
+                    })?;
 
                 debug!(message = ?share_control_ctx.pdu, "Received");
 
@@ -167,7 +217,7 @@ impl Sequence for ConnectionActivationSequence {
 
                 // Some servers (e.g. GNOME Remote Desktop) send a ServerDeactivateAll PDU
                 // before ServerDemandActive as part of a Deactivation-Reactivation Sequence
-                // (MS-RDPBCGR §1.3.1.3). Skip it and stay in the same state to wait for
+                // (MS-RDPBCGR 搂1.3.1.3). Skip it and stay in the same state to wait for
                 // the actual DemandActive PDU.
                 //
                 // The decoded PDU is intentionally discarded: the DeactivateAll body carries
@@ -189,7 +239,7 @@ impl Sequence for ConnectionActivationSequence {
                     server_demand_active.pdu.capability_sets
                 } else {
                     // Instead of reactivating after a Deactivate-All, a server may end the
-                    // session (MS-RDPBCGR §1.3.1.3) by sending a Set Error Info PDU carrying the
+                    // session (MS-RDPBCGR 搂1.3.1.3) by sending a Set Error Info PDU carrying the
                     // disconnect reason. FreeRDP-based servers such as GNOME Remote Desktop do
                     // this, for example when the backend screencast session cannot be created.
                     // Surface that reason so the disconnect is explained rather than reported as
@@ -300,14 +350,28 @@ impl Sequence for ConnectionActivationSequence {
 
                 debug!(message = ?client_confirm_active, "Send");
 
-                let written = rdp::headers::encode_share_control(
-                    self.user_channel_id,
-                    self.io_channel_id,
-                    share_id,
-                    client_confirm_active,
-                    output,
-                )
-                .map_err(ConnectorError::encode)?;
+                let written = match self.security.as_ref().map(|s| s.lock().expect("standard security mutex")) {
+                    Some(mut security) => {
+                        // Under Standard RDP Security the Share Control PDU body is
+                        // sealed: BasicSecurityHeader(SEC_ENCRYPT) + MAC + RC4 body.
+                        let body = encode_vec(&ShareControlHeader {
+                            share_control_pdu: client_confirm_active,
+                            pdu_source: self.user_channel_id,
+                            share_id,
+                        })
+                        .map_err(ConnectorError::encode)?;
+                        let user_data = seal_pdu(&mut security, BasicSecurityHeaderFlags::empty(), &body)?;
+                        encode_send_data_request_raw(self.user_channel_id, self.io_channel_id, user_data, output)?
+                    }
+                    None => rdp::headers::encode_share_control(
+                        self.user_channel_id,
+                        self.io_channel_id,
+                        share_id,
+                        client_confirm_active,
+                        output,
+                    )
+                    .map_err(ConnectorError::encode)?,
+                };
 
                 (
                     Written::from_size(written)?,
@@ -323,7 +387,14 @@ impl Sequence for ConnectionActivationSequence {
                             self.io_channel_id,
                             self.user_channel_id,
                             share_id,
-                        ),
+                        )
+                        // NyaTerm: MOVE the security state in, not clone it. The
+                        // finalization sequence unseals every inbound finalization
+                        // PDU with it, so its copy must be the one carried forward;
+                        // a clone would be advanced and then dropped, leaving the
+                        // session with a stale RC4 position (captured: the first
+                        // session PDU failed its MAC and decrypted to garbage).
+                        .with_security(self.security.clone()),
                     },
                 )
             }
@@ -354,6 +425,10 @@ impl Sequence for ConnectionActivationSequence {
                     }
                 } else {
                     self.monitor_layout = connection_finalization.monitor_layout;
+                    // NyaTerm: take the advanced RC4 state back from the
+                    // finalization sequence (see the hand-over note above); the
+                    // session starts decrypting exactly where finalization left off.
+                    // (security is shared with the finalization sequence via Arc)
                     ConnectionActivationState::Finalized {
                         desktop_size,
                         share_id,

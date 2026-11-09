@@ -214,7 +214,9 @@ const SCOPE_BUFFER: [u8; 18] = [
 static PROPRIETARY_CERTIFICATE: LazyLock<ProprietaryCertificate> = LazyLock::new(|| ProprietaryCertificate {
     public_key: RsaPublicKey {
         public_exponent: 0x0001_0001,
-        modulus: Vec::from(MODULUS.as_ref()),
+        // The wire blob's last 8 bytes are zero padding, not modulus (see
+        // `RsaPublicKey::decode`).
+        modulus: Vec::from(&MODULUS[..MODULUS.len() - super::cert::RSA_KEY_PADDING_LENGTH as usize]),
     },
     signature: Vec::from(SIGNATURE.as_ref()),
 });
@@ -225,7 +227,7 @@ static PRODUCT_INFO: LazyLock<ProductInfo> = LazyLock::new(|| ProductInfo {
 });
 static PUBLIC_KEY: LazyLock<RsaPublicKey> = LazyLock::new(|| RsaPublicKey {
     public_exponent: 0x0001_0001,
-    modulus: Vec::from(MODULUS.as_ref()),
+    modulus: Vec::from(&MODULUS[..MODULUS.len() - super::cert::RSA_KEY_PADDING_LENGTH as usize]),
 });
 static SERVER_LICENSE_REQUEST: LazyLock<LicensePdu> = LazyLock::new(|| {
     let mut req = ServerLicenseRequest {

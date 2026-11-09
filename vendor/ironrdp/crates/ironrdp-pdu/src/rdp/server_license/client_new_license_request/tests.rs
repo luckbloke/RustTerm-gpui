@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+﻿use std::sync::LazyLock;
 
 use byteorder::{LittleEndian, WriteBytesExt as _};
 use ironrdp_core::{decode, encode_vec};
@@ -11,7 +11,7 @@ use crate::rdp::server_license::server_license_request::{ProductInfo, Scope, Ser
 const LICENSE_HEADER_BUFFER_NO_SIZE: [u8; 6] = [
     0x80, 0x00, // flags
     0x00, 0x00, // flagsHi
-    0x13, 0x03,
+    0x13, 0x83,
 ];
 
 const CLIENT_RANDOM_BUFFER: [u8; 32] = [
@@ -67,7 +67,7 @@ static CLIENT_NEW_LICENSE_REQUEST: LazyLock<LicensePdu> = LazyLock::new(|| {
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::NewLicenseRequest,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(
                 PREAMBLE_SIZE

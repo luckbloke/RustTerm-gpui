@@ -1,4 +1,4 @@
-//! SPICE 客户端 —— 基于 vendor 的 capsaicin。
+﻿//! SPICE 客户端 —— 基于 vendor 的 capsaicin。
 //!
 //! 画面：主 surface（id 0）作为桌面输出；子 surface 单独维护一份缓冲，
 //! **不合成**到主画面 —— SPICE 把子 surface 贴到主面用的是 draw 通道的
@@ -253,6 +253,7 @@ pub async fn run(
         // ---- 上行输入 ----
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
+                RdCommand::SyncLockKeys { .. } => {}
                 RdCommand::Close => {
                     client.close().await;
                     return Ok(());

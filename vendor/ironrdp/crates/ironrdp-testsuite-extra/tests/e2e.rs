@@ -1,4 +1,4 @@
-// FIXME: tests in this module can probably be rewritten to be much shorter using the ironrdp-client crate.
+﻿// FIXME: tests in this module can probably be rewritten to be much shorter using the ironrdp-client crate.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
@@ -171,6 +171,7 @@ fn test_reactivation_preserves_bulk_decompression_history() {
         compression_type: Some(PduCompressionType::K64),
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        security: None,
     }
     .build();
 
@@ -909,7 +910,7 @@ async fn client_server_with_connector<F, Fut, C>(
     Fut: Future<Output = (ActiveStage, Framed<TokioStream<TlsStream<TcpStream>>>)>,
     C: FnOnce(connector::ClientConnector) -> connector::ClientConnector + 'static,
 {
-    // FIXME(@CBenoit): If this is really necessary, we may consider a non-global way of registering the subscriber; otherwise it’s unnecessary to register that.
+    // FIXME(@CBenoit): If this is really necessary, we may consider a non-global way of registering the subscriber; otherwise it鈥檚 unnecessary to register that.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();

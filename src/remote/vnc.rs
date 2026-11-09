@@ -1,4 +1,4 @@
-//! VNC (RFB 3.x) 客户端 —— 基于 vendor 的 vnc-rs。
+﻿//! VNC (RFB 3.x) 客户端 —— 基于 vendor 的 vnc-rs。
 //!
 //! 帧格式固定为 **RGBA8**：连接时强制 `PixelFormat::bgra()`，因此 32bpp
 //! 原始数据只需把首尾字节对调即可；Tight 编码的 JPEG 分块单独解码后贴回
@@ -346,6 +346,7 @@ pub async fn run(
         // ---- 上行输入 ----
         while let Ok(cmd) = cmds.try_recv() {
             match cmd {
+                RdCommand::SyncLockKeys { .. } => {}
                 RdCommand::Close => {
                     let _ = client.close().await;
                     return Ok(());

@@ -462,7 +462,6 @@ impl ChunkProcessor {
         let mut chunks = Vec::new();
 
         let total_len = encoded_pdu.filled_len();
-        let is_chunked = total_len > max_chunk_len;
         let mut chunk_start_index: usize = 0;
         let mut chunk_end_index = core::cmp::min(total_len, max_chunk_len);
         loop {
@@ -485,10 +484,18 @@ impl ChunkProcessor {
                 if last {
                     flags |= ChannelFlags::LAST;
                 }
-                if is_chunked {
-                    flags |= ChannelFlags::SHOW_PROTOCOL;
-                }
-
+                // NyaTerm: `SHOW_PROTOCOL` is NOT set for chunked messages.
+                //
+                // Upstream set it whenever a message needed more than one chunk.
+                // A receiver that honours the flag treats the first four bytes of
+                // the reconstructed sequence as a channel protocol header, so
+                // Windows dropped our `RDPDR_HEADER` (Component/PacketId) and
+                // parsed the DeviceId as the packet id. rdpdr.sys then kills the
+                // redirected device: a 2000-byte read response was enough to make
+                // `\\tsclient\...` report "设备没有连接" (0x8007048F) for every
+                // later open and copy, while messages that fit in a single chunk
+                // (no flag) kept working. MSTSC does not set the flag on RDPDR
+                // data either.
                 flags |= message.flags;
 
                 ChannelPduHeader {

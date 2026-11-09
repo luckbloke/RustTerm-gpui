@@ -1,4 +1,4 @@
-//! Example of utilizing IronRDP in a blocking, synchronous fashion.
+﻿//! Example of utilizing IronRDP in a blocking, synchronous fashion.
 //!
 //! This example showcases the use of IronRDP in a blocking manner. It
 //! demonstrates how to create a basic RDP client with just a few hundred lines
@@ -360,6 +360,7 @@ fn active_stage(
         compression_type: connection_result.compression_type,
         enable_server_pointer: connection_result.enable_server_pointer,
         pointer_software_rendering: connection_result.pointer_software_rendering,
+    security: connection_result.rdp_security,
     }
     .build();
 
@@ -407,7 +408,7 @@ fn tls_upgrade(
     // This adds support for the SSLKEYLOGFILE env variable (https://wiki.wireshark.org/TLS#using-the-pre-master-secret)
     config.key_log = std::sync::Arc::new(rustls::KeyLogFile::new());
 
-    // Disable TLS resumption because it’s not supported by some services such as CredSSP.
+    // Disable TLS resumption because it鈥檚 not supported by some services such as CredSSP.
     //
     // > The CredSSP Protocol does not extend the TLS wire protocol. TLS session resumption is not supported.
     //
@@ -423,7 +424,7 @@ fn tls_upgrade(
     let mut tls_stream = rustls::StreamOwned::new(client, stream);
 
     // We need to flush in order to ensure the TLS handshake is moving forward. Without flushing,
-    // it’s likely the peer certificate is not yet received a this point.
+    // it鈥檚 likely the peer certificate is not yet received a this point.
     tls_stream.flush()?;
 
     let cert = tls_stream

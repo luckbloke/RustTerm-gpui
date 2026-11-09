@@ -1,3 +1,5 @@
+﻿use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
@@ -41,6 +43,9 @@ fn to_bulk_compression_type(compression_type: CompressionType) -> BulkCompressio
 }
 
 pub struct ActiveStage {
+    /// NyaTerm: the shared Standard RDP Security handle (the same Arc the
+    /// processors use) so the client can sync it with reactivation sequences.
+    pub security: crate::security::SharedSecurity,
     x224_processor: x224::Processor,
     fast_path_processor: fast_path::Processor,
     /// Shared server-to-client compression history across all output transports.
@@ -53,7 +58,7 @@ pub struct ActiveStage {
 
 /// Builder for [`ActiveStage`].
 ///
-/// All fields are required; they are typically taken straight from `ironrdp-connector`’s
+/// All fields are required; they are typically taken straight from `ironrdp-connector`閳ユ獨
 /// `ConnectionResult` once the connection sequence is finalized.
 pub struct ActiveStageBuilder {
     pub static_channels: StaticChannelSet,
@@ -67,6 +72,10 @@ pub struct ActiveStageBuilder {
     pub enable_server_pointer: bool,
     /// Use software rendering mode for pointer bitmap generation.
     pub pointer_software_rendering: bool,
+    /// Standard RDP Security state negotiated by the connector
+    /// (`ConnectionResult::rdp_security`); `None` for enhanced security
+    /// connections (local addition; see `NYATERM.md`).
+    pub security: crate::security::SharedSecurity,
 }
 
 impl ActiveStageBuilder {
@@ -80,15 +89,19 @@ impl ActiveStageBuilder {
             compression_type,
             enable_server_pointer,
             pointer_software_rendering,
+            security,
         } = self;
 
-        let x224_processor = x224::Processor::new(
+
+
+        let mut x224_processor = x224::Processor::new(
             static_channels,
             user_channel_id,
             io_channel_id,
             message_channel_id,
             share_id,
         );
+        x224_processor.set_security(security.clone()); // same Arc for both processors
 
         let fast_path_processor = fast_path::ProcessorBuilder {
             io_channel_id,
@@ -96,10 +109,12 @@ impl ActiveStageBuilder {
             share_id,
             enable_server_pointer,
             pointer_software_rendering,
+            security: security.clone(),
         }
         .build();
 
         ActiveStage {
+            security, // the same Arc the processors use
             x224_processor,
             fast_path_processor,
             bulk_decompressor: new_bulk_decompressor(compression_type),
@@ -152,6 +167,13 @@ impl ActiveStage {
             // PERF: unnecessary copy
             let fastpath_input = FastPathInput::new(event_chunk.to_vec()).map_err(SessionError::decode)?;
             let frame = ironrdp_core::encode_vec(&fastpath_input).map_err(SessionError::encode)?;
+
+            // Under Standard RDP Security only the *event data* of an outbound
+            // fast-path input PDU is sealed; the fast-path header stays in the
+            // clear ([MS-RDPBCGR] 2.2.8.1.2 and 5.3.6, see
+            // `security::seal_fastpath_input`).
+            let frame = crate::security::seal_fastpath_input(self.x224_processor.security(), &frame)?;
+
             output.push(ActiveStageOutput::ResponseFrame(frame));
         }
 
@@ -373,6 +395,7 @@ impl ActiveStage {
             share_id,
             enable_server_pointer,
             pointer_software_rendering,
+            security: self.x224_processor.security().clone(),
         }
         .build();
         // The x224 processor encodes ShareDataPdu with the server's (possibly new) share_id.
@@ -638,7 +661,7 @@ impl ActiveStage {
     ///
     /// `None` means no RDPEI client is configured. `Some(false)` means it is registered but not
     /// yet ready (or currently suspended for touch/pen send purposes when checking readiness for
-    /// injection — use [`Self::rdpei_can_send_touch`] for the send gate).
+    /// injection 閳?use [`Self::rdpei_can_send_touch`] for the send gate).
     pub fn rdpei_ready(&mut self) -> Option<bool> {
         let Some(dvc) = self.get_dvc::<RdpeiClient>() else {
             return self
@@ -812,6 +835,9 @@ pub enum ActiveStageOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.15.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/de783158-8b01-4818-8fb0-62523a5b3490
     MultitransportRequest(MultitransportRequestPdu),
+    /// Remote lock-key state from a Set Keyboard Indicators PDU
+    /// ([MS-RDPBCGR] 2.2.8.1.3.1), `CKF_*` / `KBD_SYNC_*` flags.
+    KeyboardIndicators(u16),
     /// Server-reported network characteristics ([\[MS-RDPBCGR\] 2.2.14.1.5]).
     ///
     /// Contains an [`AutoDetectRequest::NetworkCharacteristicsResult`] with
@@ -859,6 +885,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
             x224::ProcessorOutput::AutoReconnectCookie(cookie) => Ok(Self::AutoReconnectCookie(cookie)),
             x224::ProcessorOutput::AutoReconnectFailed => Ok(Self::AutoReconnectFailed),
+            x224::ProcessorOutput::KeyboardIndicators(flags) => Ok(Self::KeyboardIndicators(flags)),
             x224::ProcessorOutput::MonitorLayout(monitors) => Ok(Self::MonitorLayout(monitors)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
             // before reaching this conversion.
@@ -1064,6 +1091,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
 
@@ -1086,6 +1114,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let response = MultitransportResponsePdu::success(42);
@@ -1112,6 +1141,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1157,6 +1187,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: true,
             pointer_software_rendering: true,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 8, 8);
@@ -1231,6 +1262,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: true,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1294,6 +1326,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1339,6 +1372,7 @@ mod tests {
             share_id: 0,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1, 1);
@@ -1535,6 +1569,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build()
     }

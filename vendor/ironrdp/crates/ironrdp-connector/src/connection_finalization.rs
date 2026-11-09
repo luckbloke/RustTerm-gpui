@@ -1,12 +1,15 @@
+﻿use std::borrow::Cow;
 use core::mem;
 
-use ironrdp_core::WriteBuf;
+use ironrdp_core::{WriteBuf, encode_vec};
 use ironrdp_pdu::PduHint;
 use ironrdp_pdu::rdp::capability_sets::SERVER_CHANNEL_ID;
-use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::headers::{BasicSecurityHeaderFlags, ShareDataPdu};
+use ironrdp_pdu::rdp::standard_security::RdpSecurity;
 use ironrdp_pdu::rdp::{finalization_messages, server_error_info};
 use tracing::{debug, warn};
 
+use crate::standard_security::{encode_send_data_request_raw, seal_pdu, unseal_pdu};
 use crate::{
     ConnectorError, ConnectorErrorExt as _, ConnectorResult, MonotonicInstant, Sequence, State, Written, general_err,
     reason_err,
@@ -57,6 +60,9 @@ pub struct ConnectionFinalizationSequence {
     pub user_channel_id: u16,
     pub share_id: u32,
     pub monitor_layout: Option<finalization_messages::MonitorLayoutPdu>,
+    /// Standard RDP Security state, when the connection was established with
+    /// the legacy RC4 layer (local addition; see `NYATERM.md`).
+    pub security: crate::standard_security::SharedSecurity,
 }
 
 impl ConnectionFinalizationSequence {
@@ -67,6 +73,45 @@ impl ConnectionFinalizationSequence {
             user_channel_id,
             share_id,
             monitor_layout: None,
+            security: None,
+        }
+    }
+
+    /// Carries the negotiated Standard RDP Security state into this sequence.
+    pub fn with_security(mut self, security: crate::standard_security::SharedSecurity) -> Self {
+        self.security = security;
+        self
+    }
+
+    /// Encodes one outbound Share Data PDU, sealed when Standard RDP Security
+    /// is active ([MS-RDPBCGR] 5.3).
+    fn encode_share_data_sealed(&mut self, message: ShareDataPdu, output: &mut WriteBuf) -> ConnectorResult<usize> {
+        match self.security.as_ref().map(|s| s.lock().expect("standard security mutex")) {
+            Some(mut security) => {
+                let body = encode_vec(&ironrdp_pdu::rdp::headers::ShareControlHeader {
+                    share_control_pdu: ironrdp_pdu::rdp::headers::ShareControlPdu::Data(
+                        ironrdp_pdu::rdp::headers::ShareDataHeader {
+                            share_data_pdu: message,
+                            stream_priority: ironrdp_pdu::rdp::headers::StreamPriority::Medium,
+                            compression_flags: ironrdp_pdu::rdp::headers::CompressionFlags::empty(),
+                            compression_type: ironrdp_pdu::rdp::client_info::CompressionType::K8,
+                        },
+                    ),
+                    pdu_source: self.user_channel_id,
+                    share_id: self.share_id,
+                })
+                .map_err(ConnectorError::encode)?;
+                let user_data = seal_pdu(&mut security, BasicSecurityHeaderFlags::empty(), &body)?;
+                encode_send_data_request_raw(self.user_channel_id, self.io_channel_id, user_data, output)
+            }
+            None => ironrdp_pdu::rdp::headers::encode_share_data(
+                self.user_channel_id,
+                self.io_channel_id,
+                self.share_id,
+                message,
+                output,
+            )
+            .map_err(ConnectorError::encode),
         }
     }
 }
@@ -108,14 +153,7 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
-                    self.user_channel_id,
-                    self.io_channel_id,
-                    self.share_id,
-                    message,
-                    output,
-                )
-                .map_err(ConnectorError::encode)?;
+                let written = self.encode_share_data_sealed(message, output)?;
 
                 (
                     Written::from_size(written)?,
@@ -132,14 +170,7 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
-                    self.user_channel_id,
-                    self.io_channel_id,
-                    self.share_id,
-                    message,
-                    output,
-                )
-                .map_err(ConnectorError::encode)?;
+                let written = self.encode_share_data_sealed(message, output)?;
 
                 (
                     Written::from_size(written)?,
@@ -156,14 +187,7 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
-                    self.user_channel_id,
-                    self.io_channel_id,
-                    self.share_id,
-                    message,
-                    output,
-                )
-                .map_err(ConnectorError::encode)?;
+                let written = self.encode_share_data_sealed(message, output)?;
 
                 (Written::from_size(written)?, ConnectionFinalizationState::SendFontList)
             }
@@ -173,14 +197,7 @@ impl Sequence for ConnectionFinalizationSequence {
 
                 debug!(?message, "Send");
 
-                let written = ironrdp_pdu::rdp::headers::encode_share_data(
-                    self.user_channel_id,
-                    self.io_channel_id,
-                    self.share_id,
-                    message,
-                    output,
-                )
-                .map_err(ConnectorError::encode)?;
+                let written = self.encode_share_data_sealed(message, output)?;
 
                 (
                     Written::from_size(written)?,
@@ -189,8 +206,20 @@ impl Sequence for ConnectionFinalizationSequence {
             }
 
             ConnectionFinalizationState::WaitForResponse => {
-                let ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-                let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ctx).map_err(ConnectorError::decode)?;
+                let raw_ctx = ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
+
+                // Under Standard RDP Security every inbound I/O-channel PDU carries a
+                // BasicSecurityHeader; strip (and decrypt) it when present.
+                let user_data: Cow<'_, [u8]> = match self.security.as_ref().map(|s| s.lock().expect("standard security mutex")) {
+                    Some(mut security) => unseal_pdu(&mut security, raw_ctx.user_data)?,
+                    None => Cow::Borrowed(raw_ctx.user_data),
+                };
+                let ctx = ironrdp_pdu::rdp::headers::decode_share_data(ironrdp_pdu::mcs::SendDataIndicationCtx {
+                    initiator_id: raw_ctx.initiator_id,
+                    channel_id: raw_ctx.channel_id,
+                    user_data: user_data.as_ref(),
+                })
+                .map_err(ConnectorError::decode)?;
 
                 debug!(message = ?ctx.pdu, "Received");
 

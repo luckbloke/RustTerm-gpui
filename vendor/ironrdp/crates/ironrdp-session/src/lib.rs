@@ -12,6 +12,7 @@ pub mod x224;
 
 mod active_stage;
 mod palette;
+pub mod security;
 
 use core::fmt;
 

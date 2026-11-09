@@ -24,6 +24,9 @@ pub enum RdTabProtocol {
     Vnc,
     Rdp,
     Spice,
+    /// 内置 X11 服务：X server 就跑在本进程里，没有"远端主机"。
+    /// 不出现在「新建远程桌面」的协议选择里，由「X 服务」菜单直接打开。
+    X11,
 }
 
 impl RdTabProtocol {
@@ -32,6 +35,7 @@ impl RdTabProtocol {
             RdTabProtocol::Vnc => "VNC (RFB)",
             RdTabProtocol::Rdp => "RDP (Microsoft)",
             RdTabProtocol::Spice => "SPICE (QEMU)",
+            RdTabProtocol::X11 => "X11 (内置服务)",
         }
     }
 
@@ -40,6 +44,7 @@ impl RdTabProtocol {
             RdTabProtocol::Vnc => 5900,
             RdTabProtocol::Rdp => 3389,
             RdTabProtocol::Spice => 5930,
+            RdTabProtocol::X11 => 0,
         }
     }
 
@@ -48,6 +53,7 @@ impl RdTabProtocol {
             RdTabProtocol::Vnc => RdProtocol::Vnc,
             RdTabProtocol::Rdp => RdProtocol::Rdp,
             RdTabProtocol::Spice => RdProtocol::Spice,
+            RdTabProtocol::X11 => RdProtocol::X11,
         }
     }
 
@@ -61,6 +67,7 @@ impl RdTabProtocol {
             RdTabProtocol::Vnc => "vnc",
             RdTabProtocol::Rdp => "rdp",
             RdTabProtocol::Spice => "spice",
+            RdTabProtocol::X11 => "x11",
         }
     }
 
@@ -70,6 +77,7 @@ impl RdTabProtocol {
             "vnc" => Some(RdTabProtocol::Vnc),
             "rdp" => Some(RdTabProtocol::Rdp),
             "spice" => Some(RdTabProtocol::Spice),
+            "x11" => Some(RdTabProtocol::X11),
             _ => None,
         }
     }
@@ -241,11 +249,22 @@ pub struct RemoteDesktopTab {
     session: Option<RdSession>,
     /// 上一帧的修饰键状态（shift, ctrl, alt）
     prev_mods: (bool, bool, bool),
+    /// 最近一次通过 Sync 事件告知远端的锁定键状态（scroll, num, caps）。
+    ///
+    /// `None` = 未同步过（新会话）。只在锁定键状态变化、且没有按住修饰键时
+    /// 才发送 Sync——按住 Shift 等修饰键期间发 Sync 会让部分服务器重置修饰
+    /// 键状态（表现为"长按 Shift 输入失效"），必须避开。
+    last_sync_locks: Option<(bool, bool, bool)>,
     /// 当前按下的鼠标键位掩码
     buttons: u8,
     last_pointer: Option<(u16, u16)>,
     frames: u32,
     fps_t: std::time::Instant,
+    /// VNC：最近一次对远端生效的本地 CapsLock 状态（keysym 切换检测用）。
+    ///
+    /// gpui 不投递 CapsLock 按键，只能靠每次普通按键时对比本地状态：发现
+    /// 变化就发一次 Caps_Lock keysym 按下+抬起，让远端跟着切换。
+    caps_sent: bool,
     /// 后端最初报上来的尺寸（重连时沿用）
     desired: (u16, u16),
     /// 键盘焦点（首次渲染时创建）
@@ -267,11 +286,6 @@ pub struct RemoteDesktopTab {
     last_clip_write: Option<String>,
     /// 本机剪贴板轮询节流（VNC 没有剪贴板变化通知，只能定时查）
     clip_check_t: std::time::Instant,
-    /// 认为远端当前所处的 CapsLock 状态。
-    ///
-    /// VNC / RDP 都没有 LED 状态回传，只能假定「连上时远端是关的」，
-    /// 之后每次按键前比对本地状态，不一致就补发一次 Caps_Lock。
-    remote_caps: bool,
     /// 剪贴板文件传输的最近一条状态（进度 / 结果），显示在工具条右侧。
     transfer: Option<TransferUi>,
 }
@@ -317,6 +331,8 @@ impl RemoteDesktopTab {
             capture_keys: true,
             session: None,
             prev_mods: (false, false, false),
+            caps_sent: crate::win32::caps_lock_on(),
+            last_sync_locks: None,
             buttons: 0,
             last_pointer: None,
             frames: 0,
@@ -329,7 +345,6 @@ impl RemoteDesktopTab {
             last_local_clip: None,
             last_clip_write: None,
             clip_check_t: std::time::Instant::now(),
-            remote_caps: false,
             transfer: None,
         }
     }
@@ -365,7 +380,8 @@ impl RemoteDesktopTab {
         if self.is_connecting() || self.is_active() {
             return;
         }
-        if self.profile.host.trim().is_empty() {
+        // 内置 X11 服务没有"远端主机"：X server 就在本进程里
+        if self.profile.protocol != RdTabProtocol::X11 && self.profile.host.trim().is_empty() {
             self.state = RdState::Failed("请先填写主机地址".into());
             return;
         }
@@ -413,8 +429,8 @@ impl RemoteDesktopTab {
         // 剪贴板去重状态也随会话重置
         self.last_local_clip = None;
         self.last_clip_write = None;
-        // 新会话的远端 CapsLock 假定为关（没有 LED 回传，只能这样起步）
-        self.remote_caps = false;
+        // 锁定键同步基准也随会话重置：新会话首个无修饰按键会重新对齐
+        self.last_sync_locks = None;
     }
 
     pub fn disconnect(&mut self) {
@@ -502,6 +518,12 @@ impl RemoteDesktopTab {
             self.fps_t = std::time::Instant::now();
         }
 
+        // NyaTerm: 有新画面 → 让 app 的续帧循环立刻再画一帧。空闲时那边会降到
+        // ~10fps 兜底，不再无条件 60fps 重绘（那会把主线程占满）。
+        if got_frame {
+            crate::xsrv::counters::mark_ui_dirty();
+        }
+
         got_frame
     }
 
@@ -512,6 +534,10 @@ impl RemoteDesktopTab {
     pub fn apply_event(&mut self, ev: RdEvent) -> bool {
         let mut got_frame = false;
         match ev {
+            // 服务器告知远端锁定键状态（`TS_SET_KEYBOARD_INDICATORS_PDU`）。
+            // 大小写对齐不依赖它：RDP 每次按键都发绝对设置的 Sync 事件
+            // （见 send_key），这里仅为将来显示远端 LED 状态而保留管线。
+            RdEvent::KeyboardIndicators(_) => {}
             RdEvent::State(st) => match st {
                 RdState::Disconnected => {
                     // 会话线程在报错后还会再发一次 Disconnected：
@@ -676,49 +702,142 @@ impl RemoteDesktopTab {
     // 输入转发（由 app 层事件监听器调用）
     // ------------------------------------------------------------------
 
-    /// 让远端 CapsLock 状态与本地一致。
+    /// 把远端锁定键**绝对设置**为本地状态——但只在必要时发。
     ///
-    /// RFB / RDP 都没有「远端锁定键状态」的反馈通道，所以只能：
-    /// 连接时假定远端为关，之后每次按键前读一次本地状态，不一致就补发一次
-    /// Caps_Lock 按下 + 抬起。少了这一步，本地开灯后输入的字母在远端
-    /// 还是小写（反之亦然），是 VNC 客户端最常见的「大小写不听话」。
-    fn sync_caps_lock(&mut self) {
-        let local = crate::win32::caps_lock_on();
-        if local == self.remote_caps {
+    /// 规则（实测约束，都别动）：
+    /// 1. 只在锁定键状态与上次同步值不同时发送（幂等降频）；
+    /// 2. **按住任何修饰键时不发送**——实测部分服务器收到修饰键按住期间的
+    ///    Sync 事件会重置修饰键状态，表现为"长按 Shift 输入失效"；推迟到
+    ///    修饰键释放后的第一个无修饰按键再对齐；
+    /// 3. 新会话（`last_sync_locks = None`）的第一个无修饰按键必然触发一次
+    ///    对齐——这同时解决了 Win7/2008 进入会话时锁定键状态未知的(entry
+    ///    状态)问题。
+    ///
+    /// CapsLock 键本身 gpui 不投递按键事件（本地 LED 由系统切换），所以本地
+    /// 状态只能靠每次按键时读 `GetKeyState` 获得。
+    fn sync_lock_keys(&mut self, shift: bool, ctrl: bool, alt: bool) {
+        // VNC / SPICE：keysym 自带大小写 / 扫描码由远端 guest 状态解释，
+        // CapsLock 经透传切换（见 send_key），无需绝对同步。
+        if self.profile.protocol != RdTabProtocol::Rdp {
             return;
         }
-        self.remote_caps = local;
-        for down in [true, false] {
-            self.send(RdCommand::Key(remote::KeyInput {
-                // PC/AT set-1 的 CapsLock 扫描码；keysym 为 XK_Caps_Lock
-                scancode: 0x3a,
-                keysym: 0xffe5,
-                ch: None,
-                down,
-            }));
+        if shift || ctrl || alt {
+            // 修饰键按住期间不动锁定键，等释放后再对齐。
+            return;
         }
+        let local = (
+            crate::win32::scroll_lock_on(),
+            crate::win32::num_lock_on(),
+            crate::win32::caps_lock_on(),
+        );
+        if self.last_sync_locks == Some(local) {
+            return;
+        }
+        self.send(RdCommand::SyncLockKeys {
+            scroll: local.0,
+            num: local.1,
+            caps: local.2,
+        });
+        self.last_sync_locks = Some(local);
+        crate::xsrv::log_line(format_args!(
+            "[key] sync scroll={} num={} caps={}",
+            local.0, local.1, local.2
+        ));
     }
 
     fn send_key(&mut self, ks: &Keystroke, down: bool) {
-        // CapsLock 键本身不再透传：本地按下时系统已经切换了本地状态，
-        // 这里交给 sync_caps_lock 折算成「一次远端切换」，
-        // 否则本地按一次 + 同步补一次 = 远端连切两次（等于没切）。
+        // NyaTerm diagnostic: 按键轨迹（长按 Shift 失效问题的测量点）。
+        crate::xsrv::log_line(format_args!(
+            "[key] {} {:?} shift={} ctrl={} alt={} char={:?} prev_shift={}",
+            if down { "down" } else { "up" },
+            ks.key,
+            ks.modifiers.shift,
+            ks.modifiers.control,
+            ks.modifiers.alt,
+            ks.key_char,
+            self.prev_mods.0
+        ));
+        // CapsLock 键本身 gpui 不投递按键事件（本地 LED 由系统切换）；
+        // RDP 用 Sync 事件对齐（见下）。VNC / SPICE 是扫描码或 keysym 驱动、
+        // 远端 guest 自己维护锁定键状态——本地 CapsLock 状态变化时透传一次
+        // Caps_Lock（按下+抬起）让远端跟上；透传的触发点在下面 down 分支里
+        // （对比 caps_sent 检测本地状态变化）。
         if ks.key == "capslock" {
-            if down {
-                self.sync_caps_lock();
-            }
             return;
         }
-        self.sync_caps_lock();
+        // 按下事件前按需对齐远端锁定键（只在状态变化且无修饰键时发送）。
+        // VNC / SPICE 无需对齐：keysym 自带大小写 / 扫描码由远端 guest 状态解释。
+        // VNC 在这里顺带检测本地 CapsLock 状态变化（gpui 不投递 CapsLock 键），
+        // 变化时透传一次 Caps_Lock（按下+抬起）让远端跟上——**检测后继续走
+        // 普通按键路径**（此前在这里误加了 return，导致 VNC 全部按键丢失）。
+        if down
+            && matches!(
+                self.profile.protocol,
+                RdTabProtocol::Vnc | RdTabProtocol::Spice
+            )
+        {
+            // VNC / SPICE：gpui 不投递 CapsLock 键。这里对比本地 LED 状态，
+            // 变化时透传一次 Caps_Lock（按下+抬起）让远端跟上——**检测后继续
+            // 走普通按键路径**（此前在这里误加了 return，导致 VNC 全部按键丢失）。
+            // 同一个 KeyInput 对两个协议都正确：VNC 取 keysym 0xffe5（XK_Caps_Lock），
+            // SPICE 取 scancode 0x3a（Linux KEY_CAPSLOCK = 58）。
+            let local = crate::win32::caps_lock_on();
+            if local != self.caps_sent {
+                self.caps_sent = local;
+                for d in [true, false] {
+                    self.send(RdCommand::Key(remote::KeyInput {
+                        scancode: 0x3a,
+                        keysym: 0xffe5,
+                        ch: None,
+                        down: d,
+                    }));
+                }
+            }
+        }
+        if down && self.profile.protocol == RdTabProtocol::Rdp {
+            self.sync_lock_keys(ks.modifiers.shift, ks.modifiers.control, ks.modifiers.alt);
+        }
+
+        // NyaTerm: 远端 CapsLock 与本地不一致期间（对齐 Sync 被修饰键按住抑制，
+        // 只能等第一个无修饰按键），用 **Shift 补偿**保证字符仍然正确：
+        // 期望大写且远端 caps ON → 不发 Shift（caps 自给大写）；
+        // 期望小写且远端 caps ON → 反而发 Shift（caps+shift = 小写）。
+        // 只对字母生效——数字/符号的大小写不受 CapsLock 影响，照搬本地 Shift。
+        let want_upper = ks
+            .key_char
+            .as_ref()
+            .and_then(|s| s.chars().next())
+            .map(|ch| ch.is_uppercase());
+        let is_letter = ks.key.chars().next().is_some_and(|ch| ch.is_alphabetic());
+        let remote_caps = self.last_sync_locks.map(|(_, _, caps)| caps);
+        let shift_for_scancode = match (want_upper, remote_caps, is_letter) {
+            (Some(want), Some(remote), true) => want != remote,
+            _ => ks.modifiers.shift,
+        };
         self.apply_mods((
-            ks.modifiers.shift,
+            shift_for_scancode,
             ks.modifiers.control,
             ks.modifiers.alt,
         ));
         match remote::map_key(&ks.key) {
             Some((scancode, keysym)) => {
-                let keysym = remote::printable_keysym(&ks.key, ks.modifiers.shift)
-                    .unwrap_or(keysym);
+                // NyaTerm: VNC 的 keysym 自带大小写——直接按本地输出的字符构造
+                //（key_char 已反映 caps+shift）。ASCII 字符的 keysym 就是码点：
+                //'A'=0x41、'a'=0x61、'!'=0x21。此前用 printable_keysym 只看 shift
+                //不改 caps，本地大写锁开启时发出去的全是小写 keysym。
+                let keysym = if self.profile.protocol == RdTabProtocol::Vnc {
+                    ks.key_char
+                        .as_ref()
+                        .and_then(|s| s.chars().next())
+                        .filter(|c| c.is_ascii())
+                        .map(|c| c as u32)
+                        .unwrap_or_else(|| remote::printable_keysym(&ks.key, shift_for_scancode).unwrap_or(keysym))
+                } else {
+                    remote::printable_keysym(&ks.key, shift_for_scancode).unwrap_or(keysym)
+                };
+                crate::xsrv::log_line(format_args!(
+                    "[key]   -> scancode={scancode:#04x} keysym={keysym:#x} shift={shift_for_scancode}"
+                ));
                 self.send(RdCommand::Key(remote::KeyInput {
                     scancode,
                     keysym,
@@ -789,9 +908,15 @@ impl RemoteDesktopTab {
             y: ry,
             buttons,
         });
-        // 隐藏本地系统光标 —— 远端画面里已经有远端系统绘制的光标，
-        // 两个都显示就是「两个鼠标」。
-        crate::win32::hide_cursor();
+        // 只有在**确实要画远端光标**时才隐藏本地系统光标。
+        //
+        // 后端没有下发光标形状时（内置 X server 的 X11 会话就不发 Cursor 事件），
+        // 本地光标藏掉后画面上没有任何光标；而 Windows 每次鼠标移动都先发
+        // WM_SETCURSOR、gpui 会把它恢复成默认箭头——两者来回拉锯，表现就是
+        // 用户看到的「鼠标一直闪烁、飘忽不定」。此时保持本地光标可见才是对的。
+        if self.cursor.is_some() {
+            crate::win32::hide_cursor();
+        }
     }
 
     pub fn on_mouse_move(&mut self, pos: Point<Pixels>, area: Bounds<Pixels>) {
@@ -979,29 +1104,38 @@ impl RemoteDesktopTab {
             );
         }
 
-        if let Some(err) = self.error().map(|e| e.to_string()) {
-            toolbar = toolbar
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.colors.danger)
-                        .min_w_0()
-                        .text_ellipsis()
-                        .child(format!("⚠ {err}")),
-                )
-                .child(
-                    Button::new("rd-retry")
-                        .label("重试")
-                        .compact()
-                        .on_click(cx.listener(|this, _, _, _| {
-                            this.active_rd(|t| t.connect());
-                        })),
-                );
-        }
+        // 报错信息只在下方面板里展示（表单自带「连接」按钮可重试），
+        // 不再在工具栏重复一条，避免同一错误出现两遍。
 
         // ---- 画面 / 表单 ----
         let body = if !self.is_active() && self.image.is_none() {
-            self.connect_form(window, cx)
+            if self.profile.protocol == RdTabProtocol::X11 {
+                // 内置 X11 服务：没有连接表单——X server 随应用运行，
+                // SSH 会话启用 X11 转发后，远端 X 程序会自动出现在这里。
+                div()
+                    .v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(theme.colors.muted_foreground)
+                            .child("X server 已随应用运行。SSH 会话启用 X11 转发后，远端 X 程序会显示在这里。"),
+                    )
+                    .child(
+                        Button::new("x11-connect")
+                            .label("连接")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, _| {
+                                this.active_rd(|t| t.connect());
+                            })),
+                    )
+                    .into_any_element()
+            } else {
+                self.connect_form(window, cx)
+            }
         } else {
             self.screen_area(cx)
         };

@@ -1,4 +1,4 @@
-use std::io;
+﻿use std::io;
 
 use byteorder::{LittleEndian, WriteBytesExt as _};
 use ironrdp_core::{
@@ -96,7 +96,7 @@ impl ClientLicenseInfo {
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::LicenseInfo,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(size)
                 .map_err(|_| ServerLicenseError::InvalidField("preamble message size"))?,

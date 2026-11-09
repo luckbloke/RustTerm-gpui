@@ -1,4 +1,4 @@
-use core::net::SocketAddr;
+﻿use core::net::SocketAddr;
 use core::num::{NonZeroU16, NonZeroUsize};
 #[cfg(feature = "rdpdr")]
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -85,7 +85,7 @@ use crate::config::{Config, RDCleanPathConfig, Transport};
 use crate::rail::{RailClient, RailControlEvent, RailEvent, RailInputEvent};
 use ironrdp_rail::pdu::{ExecutePdu, ExecuteResultPdu};
 
-// ── Public event types ────────────────────────────────────────────────────────
+// 鈹€鈹€ Public event types 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// Explains why a dynamic display update must reconnect instead of completing in-session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +117,12 @@ pub enum RdpOutputEvent {
     ///
     /// The server may send this during activation or after activation.
     MonitorLayout(Vec<Monitor>),
+    /// The remote session's lock-key state ([MS-RDPBCGR] 2.2.8.1.3.1).
+    ///
+    /// `CKF_CAPSLOCK` is `0x0004` (FreeRDP's `KBD_SYNC_CAPS_LOCK`); a client
+    /// mirroring its local lock keys onto the remote needs this, since a
+    /// CapsLock toggle flips both sides and thereby preserves any mismatch.
+    KeyboardIndicators(u16),
     /// Server Save Session Info notification.
     ///
     /// The PDU can contain sensitive session data, so this event does not expose its contents.
@@ -689,7 +695,7 @@ impl ResizeQueue {
     }
 }
 
-// ── RdpClient ─────────────────────────────────────────────────────────────────
+// 鈹€鈹€ RdpClient 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 pub struct RdpClient {
     config: Config,
@@ -787,7 +793,7 @@ impl RdpClient {
             return;
         }
 
-        // ── Clipboard initialisation (compile-time gated) ─────────────────────
+        // 鈹€鈹€ Clipboard initialisation (compile-time gated) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         //
         // On Windows the WinClipboard object must outlive the entire connection loop, so we
         // keep it alive via `_win_clipboard`.  On non-Windows a StubClipboard backend is used
@@ -862,7 +868,7 @@ impl RdpClient {
             }
         }
 
-        // Resolve the per-connection cliprdr factory reference once.  `Option<&dyn …>` is `Copy`,
+        // Resolve the per-connection cliprdr factory reference once.  `Option<&dyn 鈥?` is `Copy`,
         // so it can be threaded into every connect attempt across reconnects.
         #[cfg(feature = "clipboard")]
         let cliprdr_factory: CliprdrFactoryRef<'_> = cliprdr_factory.as_deref();
@@ -875,7 +881,7 @@ impl RdpClient {
         #[cfg(not(feature = "rdpdr"))]
         let rdpdr_factory: RdpdrFactoryRef<'_> = core::marker::PhantomData;
 
-        // ── Connection + session loop ─────────────────────────────────────────
+        // 鈹€鈹€ Connection + session loop 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
         let auto_reconnect_policy = self.auto_reconnect_maximum_attempts.map(AutoReconnectPolicy::new);
         let mut auto_reconnect_cookie = None;
         let mut reconnect_attempt = 0;
@@ -1321,7 +1327,7 @@ async fn send_active_output_event(
         .map_err(|error| ironrdp_session::custom_err!("output_event_sender", error))
 }
 
-// ── Connector builder ─────────────────────────────────────────────────────────
+// 鈹€鈹€ Connector builder 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// Reference to the cliprdr backend factory threaded into the connect helpers.
 ///
@@ -1644,7 +1650,7 @@ fn build_connector(
     }
 
     // WebAuthn redirection (Windows + webauthn feature).
-    // Prefer System32\webauthn.dll via the DVC COM plugin host — that is the MSTSC path and the only
+    // Prefer System32\webauthn.dll via the DVC COM plugin host 鈥?that is the MSTSC path and the only
     // way to handle hash-only MS-RDPEWA hosts that omit clientDataJSON. Fall back to the pure-Rust
     // WebAuthN* backend when the plugin cannot be loaded.
     // IRONRDP_WEBAUTHN_FORCE_NATIVE=1 skips COM and always uses WindowsRdpewaBackend (smoke/debug).
@@ -1925,7 +1931,7 @@ fn build_connector(
     Ok(connector)
 }
 
-// ── Transport-specific connect helpers ────────────────────────────────────────
+// 鈹€鈹€ Transport-specific connect helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite {}
@@ -2064,7 +2070,7 @@ async fn bootstrap_udp_transport(
 
 type ConnectOutput = (ConnectionResult, UpgradedFramed, UdpTunnel);
 
-/// Direct TCP → TLS connection (no gateway).
+/// Direct TCP 鈫?TLS connection (no gateway).
 async fn connect_direct(
     config: &Config,
     input_sender: &RdpInputSender,
@@ -2190,7 +2196,7 @@ async fn connect_named_pipe(
     Box::pin(security_upgrade_and_finalize(framed, connector, config, None)).await
 }
 
-/// RDS gateway TCP → gateway auth → TLS connection.
+/// RDS gateway TCP 鈫?gateway auth 鈫?TLS connection.
 #[cfg(feature = "gateway")]
 async fn connect_gateway(
     config: &Config,
@@ -2294,7 +2300,7 @@ async fn connect_gateway(
     Box::pin(security_upgrade_and_finalize(framed, connector, config, None)).await
 }
 
-/// RDCleanPath WebSocket → RDCleanPath handshake connection.
+/// RDCleanPath WebSocket 鈫?RDCleanPath handshake connection.
 async fn connect_rdcleanpath_transport(
     config: &Config,
     rdcp: &RDCleanPathConfig,
@@ -2376,7 +2382,7 @@ async fn connect_rdcleanpath_transport(
     Ok((connection_result, upgraded_framed, UdpTunnel::default()))
 }
 
-// ── Shared security upgrade + finalize ────────────────────────────────────────
+// 鈹€鈹€ Shared security upgrade + finalize 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /// After X.224 negotiation, either perform TLS (enhanced security) or mark a no-op upgrade
 /// for standard RDP security / plain local transports (Windows Sandbox named pipe).
@@ -2632,7 +2638,7 @@ where
     Ok((connection_result, upgraded_framed, UdpTunnel::default()))
 }
 
-// ── RDCleanPath handshake ─────────────────────────────────────────────────────
+// 鈹€鈹€ RDCleanPath handshake 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 struct RDCleanPathHandshakeParams {
     server_name: ironrdp_connector::ServerName,
@@ -2875,7 +2881,7 @@ fn build_ordinary_rdcleanpath_request(
         .map_err(|e| ironrdp_connector::custom_err!("new RDCleanPath request", e))
 }
 
-// ── Active session ────────────────────────────────────────────────────────────
+// 鈹€鈹€ Active session 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 enum RdpControlFlow {
     ReconnectWithNewSize {
@@ -3070,6 +3076,7 @@ async fn active_session(
         compression_type: connection_result.compression_type,
         enable_server_pointer: connection_result.enable_server_pointer,
         pointer_software_rendering: connection_result.pointer_software_rendering,
+        security: connection_result.rdp_security,
     }
     .build();
     #[cfg(feature = "udp")]
@@ -3897,6 +3904,19 @@ async fn active_session(
                         ));
                     }
                 }
+                ActiveStageOutput::KeyboardIndicators(flags) => {
+                    if !send_active_output_event(
+                        output_event_sender,
+                        RdpOutputEvent::KeyboardIndicators(flags),
+                        close_receiver,
+                    )
+                    .await?
+                    {
+                        return Ok(RdpControlFlow::TerminatedGracefully(
+                            GracefulDisconnectReason::UserInitiated,
+                        ));
+                    }
+                }
                 ActiveStageOutput::MonitorLayout(monitors) => {
                     if !send_active_output_event(
                         output_event_sender,
@@ -3976,6 +3996,40 @@ async fn active_session(
                     // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/dfc234ce-481a-4674-9a5d-2a7bafb14432
                     debug!("Executing Deactivation-Reactivation Sequence");
                     let mut connection_activation = activation_factory.create();
+
+                    // NyaTerm diagnostic: file log the reactivation lifecycle so a
+                    // stalled sequence is visible without a debugger.
+                    let react_log = |msg: &str| {
+                        if let Some(path) = std::env::var_os("NYATERM_RDPDR_LOG") {
+                            if let Ok(mut file) =
+                                std::fs::OpenOptions::new().create(true).append(true).open(path)
+                            {
+                                use std::io::Write as _;
+                                let _ = writeln!(file, "[reactivation] {msg}");
+                            }
+                        }
+                    };
+                    react_log(&format!(
+                        "enter, security={}",
+                        connection_activation.security.is_some()
+                    ));
+
+                    // NyaTerm: no state sync is needed here. The connector's
+                    // `ConnectionResult::rdp_security` and the factory's handle
+                    // are the SAME `Arc<Mutex<RdpSecurity>>`, so the session and
+                    // every reactivation sequence already share one live state.
+                    // (An earlier revision copied one into the other -- locking
+                    // the same mutex twice, which deadlocked the RDP thread and
+                    // froze the picture right after "Deactivate All".)
+                    debug_assert!(
+                        match (active_stage.security.as_ref(), connection_activation.security.as_ref()) {
+                            (Some(session), Some(sequence)) => Arc::ptr_eq(session, sequence),
+                            (None, None) => true,
+                            _ => false,
+                        },
+                        "session and reactivation sequence must share the Standard RDP Security handle"
+                    );
+
                     let mut buf = WriteBuf::new();
                     'activation_seq: loop {
                         let step = single_sequence_step_read(&mut reader, &mut connection_activation, &mut buf);
@@ -4055,10 +4109,14 @@ async fn active_session(
                             ..
                         } = connection_activation.connection_activation_state()
                         {
+                            react_log("completed");
                             debug!(?desktop_size, "Deactivation-Reactivation Sequence completed");
                             image = DecodedImage::new(PixelFormat::RgbA32, desktop_size.width, desktop_size.height);
                             desktop_update_extent = None;
                             resize_queue.completed();
+
+                            react_log("completed");
+
                             if !active_stage.reactivate(
                                 connection_activation.io_channel_id(),
                                 connection_activation.user_channel_id(),
@@ -5278,6 +5336,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
 
@@ -5315,6 +5374,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
 

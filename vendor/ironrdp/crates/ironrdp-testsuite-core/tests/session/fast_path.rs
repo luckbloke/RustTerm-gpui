@@ -1,4 +1,4 @@
-//! Regression tests for bulk-compressed FastPath updates.
+﻿//! Regression tests for bulk-compressed FastPath updates.
 //!
 //! A FastPath `Processor` always owns a bulk decompressor: the library builds
 //! one in `ProcessorBuilder::build`. A server can send a compressed FastPath
@@ -28,6 +28,7 @@ fn processor() -> Processor {
         share_id: 0,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        security: None,
     }
     .build()
 }

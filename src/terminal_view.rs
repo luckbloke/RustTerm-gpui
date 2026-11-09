@@ -319,11 +319,11 @@ impl TerminalView {
         };
 
         // 2) 事件 + 数据
-        let (_title_changed, clip) = pane.drain_pane_events();
+        let (title_changed, clip) = pane.drain_pane_events();
         if let Some(text) = clip {
             term::copy_to_clipboard(cx, text);
         }
-        let _ = pane.pump();
+        let data_changed = pane.pump();
 
         // 3) 尺寸：首帧还没有测量值就保持创建时的列数/行数，下一帧再对齐
         let b = self.area.get();
@@ -336,10 +336,36 @@ impl TerminalView {
         }
 
         // 4) 光标实心/空心：dock 里显示中 + 键盘焦点在本面板
-        pane.has_focus = self.active && self.focus.is_focused(window);
-        self.snapshot = Some(Arc::new(pane.snapshot()));
+        let focus_now = self.active && self.focus.is_focused(window);
+        let focus_changed = focus_now != pane.has_focus;
+        pane.has_focus = focus_now;
+
+        // 5) 快照**按需重建**：每帧无条件重建整屏快照是主线程的固定开销
+        //    （空闲时也在烧 CPU）。内容没变就不重建；另外每 250ms 兜底重建一次，
+        //    覆盖光标闪烁以及这里没显式跟踪的状态变化。
+        let due = TERM_SNAPSHOT_MS.load(std::sync::atomic::Ordering::Relaxed) == 0
+            || term_snapshot_now_ms().saturating_sub(
+                TERM_SNAPSHOT_MS.load(std::sync::atomic::Ordering::Relaxed),
+            ) >= 250;
+        if self.snapshot.is_none() || data_changed || title_changed || focus_changed || due {
+            TERM_SNAPSHOT_MS.store(term_snapshot_now_ms(), std::sync::atomic::Ordering::Relaxed);
+            self.snapshot = Some(Arc::new(pane.snapshot()));
+        }
     }
 }
+
+/// 进程启动以来的毫秒数（终端快照节流用）。
+fn term_snapshot_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 上一次终端快照重建的时间（毫秒）。0 = 还没建过。
+static TERM_SNAPSHOT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

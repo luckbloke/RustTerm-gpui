@@ -1,4 +1,4 @@
-use ironrdp_core::{ReadCursor, decode, decode_cursor, encode_vec};
+﻿use ironrdp_core::{ReadCursor, decode, decode_cursor, encode_vec};
 use ironrdp_pdu::gcc::{ChannelName, ChannelOptions};
 use ironrdp_pdu::mcs;
 use ironrdp_pdu::rdp::headers::ShareControlHeader;
@@ -244,14 +244,17 @@ fn static_channel_rejects_malformed_chunk_sequences() {
 }
 
 #[test]
-fn static_channel_chunks_show_protocol_header() {
+fn static_channel_chunks_keep_the_channel_header_hidden_from_the_application() {
     let chunks = StaticVirtualChannel::chunkify(vec![SvcMessage::from(vec![0; CHANNEL_CHUNK_LENGTH + 1])])
         .expect("static channel message should chunk");
 
     assert_eq!(chunks.len(), 2);
     for chunk in chunks {
         let header = decode::<ChannelPduHeader>(chunk.filled()).expect("channel header should decode");
-        assert!(header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
+        // NyaTerm: `CHANNEL_FLAG_SHOW_PROTOCOL` means the channel PDU header must be
+        // visible to the application endpoint. RDPDR must not ask for that, or
+        // Windows feeds the header to rdpdr.sys and the redirected device dies.
+        assert!(!header.flags.contains(ChannelControlFlags::FLAG_SHOW_PROTOCOL));
     }
 }
 
@@ -286,6 +289,7 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
         compression_type: None,
         enable_server_pointer: false,
         pointer_software_rendering: false,
+        security: None,
     }
     .build();
     assert!(active_stage.reactivate(1003, 1002, 2, false, false, 4096));
@@ -306,7 +310,7 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
     assert!(
         first_header
             .flags
-            .contains(ChannelControlFlags::FLAG_FIRST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
+            .contains(ChannelControlFlags::FLAG_FIRST)
     );
     assert!(!first_header.flags.contains(ChannelControlFlags::FLAG_LAST));
 
@@ -316,7 +320,7 @@ fn reactivated_session_applies_the_static_channel_chunk_size() {
     assert!(
         second_header
             .flags
-            .contains(ChannelControlFlags::FLAG_LAST | ChannelControlFlags::FLAG_SHOW_PROTOCOL)
+            .contains(ChannelControlFlags::FLAG_LAST)
     );
     assert!(!second_header.flags.contains(ChannelControlFlags::FLAG_FIRST));
 

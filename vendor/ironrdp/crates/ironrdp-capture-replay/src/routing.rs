@@ -1,4 +1,4 @@
-use core::any::TypeId;
+﻿use core::any::TypeId;
 use core::convert::Infallible;
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -230,6 +230,7 @@ impl ReplayRouter {
             compression_type: activation.compression_type,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
         Ok(Self {

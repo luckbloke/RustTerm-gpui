@@ -1,4 +1,4 @@
-//! 应用外壳（GPUI 版）：工具栏 + 快速连接栏 + 左侧会话栏 + 中央工作区（标签页）
+﻿//! 应用外壳（GPUI 版）：工具栏 + 快速连接栏 + 左侧会话栏 + 中央工作区（标签页）
 //! + 右侧 SFTP / AI 助手面板 + 底部状态栏 + 各类对话框（覆盖层）。
 //!
 //! 标签页统一承载四类会话：本地 / SSH 终端、内置浏览器、远程桌面、SFTP。
@@ -79,6 +79,8 @@ pub struct SshFormInputs {
     pub key_path: Entity<InputState>,
     pub key_passphrase: Entity<InputState>,
     pub auth_key: bool,
+    /// SSH X11 转发（内置 X server）
+    pub x11: bool,
 }
 
 /// 新建/编辑会话表单的输入框实体。
@@ -95,6 +97,8 @@ pub struct AddFormInputs {
     pub share: Entity<InputState>,
     /// 旧版服务器兼容（仅 RDP：禁用 NLA，只用 TLS）
     pub legacy_compat: bool,
+    /// SSH X11 转发（内置 X server）
+    pub x11_forward: bool,
     pub kind: SessionKind,
     pub auth_key: bool,
     /// Some(id) = 编辑已有会话
@@ -242,6 +246,7 @@ pub enum ToolAction {
     RdpClient,
     VncClient,
     SpiceClient,
+    X11Server,
     LocalFiles,
     Browser,
     Ping,
@@ -436,6 +441,7 @@ impl RustTermApp {
         user: &str,
         auth: crate::backends::ssh::SshAuth,
         jump: Option<crate::backends::ssh::JumpHost>,
+        x11: bool,
     ) {
         let title = match &jump {
             Some(j) => format!("{user}@{host}（经 {}）", j.host),
@@ -449,7 +455,7 @@ impl RustTermApp {
         let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<TermPane>>();
         std::thread::spawn(move || {
             let result = runtime
-                .block_on(TermPane::new_ssh(tab_title, host, port, user, auth, jump, 80, 24));
+                .block_on(TermPane::new_ssh(tab_title, host, port, user, auth, jump, 80, 24, x11));
             let _ = tx.send(result);
         });
 
@@ -471,6 +477,28 @@ impl RustTermApp {
             ..Default::default()
         };
         self.push_tab(TabContent::RemoteDesktop(RemoteDesktopTab::new(profile)));
+    }
+
+    /// 打开内置 X11 服务的画面标签（已存在则切过去）。
+    ///
+    /// X server 是进程内全局单例：SSH 会话启用 X11 转发后，远端 X 程序的
+    /// 连接都灌进同一个屏幕；这个标签只是它的"取景器"。
+    pub fn open_x11_screen(&mut self) {
+        if let Some(idx) = self.tabs.iter().position(
+            |t| matches!(t, TabContent::RemoteDesktop(tab) if tab.profile.protocol == RdTabProtocol::X11),
+        ) {
+            self.active = idx;
+            return;
+        }
+        let lang = self.i18n.lang;
+        let profile = RdpConnectionProfile {
+            name: crate::i18n::tr(lang, "x11.screen_name"),
+            protocol: RdTabProtocol::X11,
+            ..Default::default()
+        };
+        let mut tab = RemoteDesktopTab::new(profile);
+        tab.connect();
+        self.push_tab(TabContent::RemoteDesktop(tab));
     }
 
     pub fn open_sftp(&mut self) {
@@ -593,7 +621,8 @@ impl RustTermApp {
             ));
         }
 
-        self.submit_ssh(&host, port, &user, auth, jump);
+        // 快速连接没有 X11 开关：X11 跟随保存的会话记录（编辑会话勾选）
+        self.submit_ssh(&host, port, &user, auth, jump, false);
     }
 
     /// 连接已保存的会话（listener 中传 jump 文本）。
@@ -616,7 +645,7 @@ impl RustTermApp {
                     crate::backends::ssh::SshAuth::Password(s.password.clone())
                 };
                 let jump = crate::backends::ssh::JumpHost::parse(jump_host, &s.user, auth.clone());
-                self.submit_ssh(&s.host, s.port, &s.user, auth, jump);
+                self.submit_ssh(&s.host, s.port, &s.user, auth, jump, s.x11);
             }
             kind => {
                 let proto = match kind {
@@ -818,7 +847,13 @@ impl RustTermApp {
                     let auth = self.resolve_ssh_auth(&host, port, &user, session_id.as_deref(), &key_path);
                     match auth {
                         Some(auth) => {
-                            self.submit_ssh(&host, port, &user, auth, None);
+                            // X11 转发跟随保存的会话记录（最后标签快照里没有这个字段）
+                            let x11 = session_id
+                                .as_deref()
+                                .and_then(|id| self.sessions.by_id(id))
+                                .map(|s| s.x11)
+                                .unwrap_or(false);
+                            self.submit_ssh(&host, port, &user, auth, None, x11);
                             restored += 1;
                         }
                         None => need_login += 1,
@@ -999,6 +1034,7 @@ impl RustTermApp {
             ToolAction::Tunnel => self.tunnel_open = true,
             ToolAction::Macro => self.open_macro_tab(),
             ToolAction::PortScan => self.open_port_scan_tab(),
+            ToolAction::X11Server => self.open_x11_screen(),
         }
     }
 
@@ -1272,13 +1308,14 @@ impl RustTermApp {
                 user,
                 auth,
                 jump,
+                x11,
             } => {
                 let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<TermPane>>();
                 let runtime = self.runtime.clone();
                 let tab_title = title.clone();
                 std::thread::spawn(move || {
                     let result = runtime.block_on(TermPane::new_ssh(
-                        tab_title, host, port, user, auth, jump, cols, rows,
+                        tab_title, host, port, user, auth, jump, cols, rows, x11,
                     ));
                     let _ = tx.send(result);
                 });
@@ -1332,7 +1369,11 @@ impl RustTermApp {
             .and_then(|tree| tree.find_panel_node(target));
         let handle = new_view.read(cx).focus_handle(cx);
         dock.update(cx, |area, acx| {
-            // 先入区（成为同组标签），再挪到目标节点旁边成为分割
+            // 先在 dock 里登记面板实体（panel() 查找需要它），再用 move_panel
+            // 挪到分割位置——move_panel 会先从 add_panel_view 落位的地方摘除。
+            // 此前用 split_at（只插不摘），同一个面板实体被两个节点引用，
+            // 渲染两遍：主窗格 + 上下各一格，且上下"同步输入"（其实是同一个
+            // pty 被画了两遍）。
             area.add_panel_view(
                 panel_handle(new_view.clone()),
                 DockPlacement::Center,
@@ -1341,7 +1382,16 @@ impl RustTermApp {
                 acx,
             );
             if let Some(node) = node {
-                area.split_at(node, new_id, placement, window, acx);
+                area.move_panel(
+                    new_id,
+                    gpui_kit::base::dock::InsertTarget::Split {
+                        node,
+                        placement,
+                        size: None,
+                    },
+                    window,
+                    acx,
+                );
             }
         });
         window.focus(&handle, cx);
@@ -2034,6 +2084,13 @@ impl RustTermApp {
                             false,
                             |this, _cx| this.open_remote_desktop(RdTabProtocol::Spice),
                         ));
+                        m = m.item(menu_item(
+                            &sub_app,
+                            tr(lang, "menu.x11"),
+                            None,
+                            false,
+                            |this, _cx| this.open_x11_screen(),
+                        ));
                         let _ = (window, cx);
                         m
                     },
@@ -2102,6 +2159,13 @@ impl RustTermApp {
                     None,
                     false,
                     |this, cx| this.run_tool_action(ToolAction::PortScan, cx),
+                ));
+                m = m.item(menu_item(
+                    &app,
+                    tr(lang, "menu.x11"),
+                    None,
+                    false,
+                    |this, cx| this.run_tool_action(ToolAction::X11Server, cx),
                 ));
                 m = m.separator();
                 m = m.item(menu_item(
@@ -2756,6 +2820,7 @@ impl RustTermApp {
             legacy_compat: false,
             kind: SessionKind::Ssh,
             auth_key: false,
+            x11_forward: false,
             editing: None,
         });
         self.focus_dialog = true;
@@ -2794,6 +2859,7 @@ impl RustTermApp {
             legacy_compat: s.legacy_compat,
             kind: s.kind,
             auth_key: s.uses_key(),
+            x11_forward: s.x11,
             editing: Some(s.id),
         });
         self.focus_dialog = true;
@@ -2808,6 +2874,7 @@ impl RustTermApp {
             (ToolAction::RdpClient, "RDP 远程桌面"),
             (ToolAction::VncClient, "VNC 远程桌面"),
             (ToolAction::SpiceClient, "SPICE 远程桌面"),
+            (ToolAction::X11Server, "X 服务（内置 X11）"),
             (ToolAction::LocalFiles, "本地文件浏览"),
             (ToolAction::Browser, "内置浏览器"),
         ];
@@ -4321,6 +4388,7 @@ impl RustTermApp {
                 key_path,
                 key_passphrase,
                 auth_key: false,
+                x11: false,
             });
             self.focus_dialog = true;
         }
@@ -4375,6 +4443,17 @@ impl RustTermApp {
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         if let Some(f) = this.ssh_form.as_mut() {
                             f.auth_key = *checked;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Checkbox::new("ssh-x11")
+                    .label(crate::i18n::tr(self.i18n.lang, "item.x11_forward"))
+                    .checked(form.x11)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        if let Some(f) = this.ssh_form.as_mut() {
+                            f.x11 = *checked;
                         }
                         cx.notify();
                     })),
@@ -4462,7 +4541,7 @@ impl RustTermApp {
         }
         self.ssh_form_open = false;
         self.ssh_form = None;
-        self.submit_ssh(&host, port, &user, auth, None);
+        self.submit_ssh(&host, port, &user, auth, None, form.x11);
     }
 
     fn add_session_dialog_ui(
@@ -4589,6 +4668,19 @@ impl RustTermApp {
                         cx.notify();
                     })),
             )
+            .when(form.kind == SessionKind::Ssh, |d| {
+                d.child(
+                    Checkbox::new("add-x11-forward")
+                        .label(crate::i18n::tr(self.i18n.lang, "item.x11_forward"))
+                        .checked(form.x11_forward)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            if let Some(f) = this.add_form.as_mut() {
+                                f.x11_forward = *checked;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 div()
                     .h_flex()
@@ -4675,6 +4767,7 @@ impl RustTermApp {
             domain,
             share_dir,
             legacy_compat,
+            x11: form.kind == SessionKind::Ssh && form.x11_forward,
             group,
         };
         self.sessions.update(entry);
@@ -5185,6 +5278,7 @@ impl Render for RustTermApp {
                 self.set_toast(format!("扫描完成，发现 {n} 个开放端口"));
             }
             if changed {
+                crate::xsrv::counters::mark_ui_dirty();
                 cx.notify();
             }
         }
@@ -5454,6 +5548,30 @@ impl Render for RustTermApp {
             )
         }) || self.port_scan.is_running();
         if live {
+            // NyaTerm: dock 化之后 gpui 只重绘「被 notify 过」的视图——终端视图
+            // 藏在 dock 里，不显式通知的话 PTY 输出要等偶发事件（鼠标移动、
+            // 切标签）触发重绘才显示，打字回显就成了数秒一批的慢镜头。
+            // 这里逐帧通知当前工作区的所有终端面板，恢复"有终端标签就一直
+            // 重绘"的设计意图（帧成本有行级 shaping 缓存兜底）。
+            let idx = self.active.min(self.tabs.len().saturating_sub(1));
+            let dock = self
+                .tabs
+                .get(idx)
+                .and_then(|t| t.workspace())
+                .and_then(|ws| ws.dock.clone());
+            if let Some(dock) = dock {
+                for view in crate::tabs::dock_panels(&dock, cx) {
+                    view.update(cx, |_, vcx| vcx.notify());
+                }
+            }
+            // NyaTerm: 这里必须**每帧**续帧，不能改成"按需/降频"。
+            //
+            // 教训（实测踩过）：GPUI 只在被 notify 时才重绘，而远程画面的
+            // RdEvent 只在 render() 里被 poll() 消费——没有任何后台任务会在
+            // 新帧到达时 notify。所以一旦停掉续帧，新帧就再也唤不醒 UI，画面
+            // 卡到下一次偶发 notify（鼠标划过）才动，终端也跟着卡。
+            // CPU 优化只能做在"每帧少做无用功"上（见 terminal_view 的快照按需
+            // 重建），不能省掉续帧本身。
             window.request_animation_frame();
         }
 
@@ -5461,3 +5579,4 @@ impl Render for RustTermApp {
         root
     }
 }
+

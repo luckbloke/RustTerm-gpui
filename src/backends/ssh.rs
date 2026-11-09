@@ -6,15 +6,57 @@
 //! - 认证：password 失败后 fallback 到 keyboard-interactive（PAM 场景）。
 
 use anyhow::{anyhow, bail, Result};
-use russh::client::{self, Handle};
+use russh::client::{self, ChannelOpenHandle, Handle, Session};
 use russh::keys::PrivateKeyWithHashAlg;
-use russh::{Channel, ChannelMsg};
+use russh::{Channel, ChannelMsg, ChannelOpenFailure};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::TermIo;
+
+/// SSH X11 转发：服务端反向打开的 X11 协议通道（`x11` 与兼容模式的
+/// `forwarded-tcpip`），交给内置 X server（`crate::remote::x11`）。
+pub type X11Channel = Channel<client::Msg>;
+
+/// 等 `x11-req` 回复的上限。超过就不能再等：用户在等一个能用的终端，
+/// 而「没有回复」本身就是要报出去的结论。
+const X11_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// 等 `tcpip-forward` 回复的上限（真实服务端都会回）。
+const X11_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 生成 X11 转发的认证 cookie：16 个随机字节 → 32 个 hex 字符。
+/// 内置 X server 不校验 cookie，只求格式合法且每次连接不同。
+fn x11_cookie() -> String {
+    let uuid = uuid::Uuid::new_v4();
+    let mut out = String::with_capacity(32);
+    for byte in uuid.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// 等一个通道请求的回复：`Some(true)` = Success，`Some(false)` = Failure，
+/// `None` = 超时或通道结束。
+///
+/// 调用点保证此时只有这一条请求要回复（pty-req 与 shell 都是 want_reply=false）。
+async fn await_channel_reply(channel: &mut Channel<client::Msg>) -> Option<bool> {
+    let deadline = tokio::time::Instant::now() + X11_REPLY_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(left, channel.wait()).await {
+            Ok(Some(ChannelMsg::Success)) => return Some(true),
+            Ok(Some(ChannelMsg::Failure)) => return Some(false),
+            Ok(Some(_)) => continue,
+            Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
+}
 
 /// SSH 认证方式。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,10 +148,28 @@ fn known_hosts_path() -> Option<PathBuf> {
 /// - 命中记录 → 信任；
 /// - 全新主机 → 写入 known_hosts 后放行（TOFU）；
 /// - 记录不一致 → 拒绝（防中间人，无可协商）。
+///
+/// 启用 SSH X11 转发时，它还负责接收服务端反向打开的 X11 通道
+/// （`x11` 与兼容模式的 `forwarded-tcpip`），交给内置 X server。
 struct HostKeyChecker {
     host: String,
     port: u16,
     path: Option<PathBuf>,
+    /// 服务端反向打开的 `x11` 通道（sshd 自己的转发）。
+    x11_sink: Option<mpsc::UnboundedSender<X11Channel>>,
+    /// 兼容模式：`tcpip_forward` 建立反向端口后，服务端把每条远端连接
+    /// 反向打开成 `forwarded-tcpip` 通道。承载的同样是 X11 协议字节流。
+    forward_sink: Option<mpsc::UnboundedSender<X11Channel>>,
+}
+
+impl HostKeyChecker {
+    /// 让该连接接受服务端反向打开的 X11 通道。两种通道承载的都是
+    /// X11 协议字节流，交给同一个接收端。
+    fn with_x11_sink(mut self, sink: mpsc::UnboundedSender<X11Channel>) -> Self {
+        self.forward_sink = Some(sink.clone());
+        self.x11_sink = Some(sink);
+        self
+    }
 }
 
 impl client::Handler for HostKeyChecker {
@@ -158,6 +218,60 @@ impl client::Handler for HostKeyChecker {
             }
         }
     }
+
+    /// 远端 X 客户端连到 sshd 时，sshd 会反向打开一条 `x11` 通道。
+    /// 接受后把通道交给内置 X server；没有启用转发的连接直接拒绝。
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: X11Channel,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        match self.x11_sink.as_ref() {
+            Some(sink) => {
+                reply.accept().await;
+                if sink.send(channel).is_err() {
+                    eprintln!("[ssh] X11 通道接收端已关闭，丢弃本次连接");
+                }
+            }
+            None => {
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// 兼容模式：`tcpip_forward` 出来的远端端口被连接时，sshd 反向打开
+    /// `forwarded-tcpip` 通道。字节流同样是 X11 协议，交给同一个 X server。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: X11Channel,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        match self.forward_sink.as_ref() {
+            Some(sink) => {
+                reply.accept().await;
+                if sink.send(channel).is_err() {
+                    eprintln!("[ssh] 反向转发通道接收端已关闭，丢弃本次连接");
+                }
+            }
+            None => {
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 显式配置：在默认安全算法之后，追加旧算法兜底（与主工程一致）。
@@ -190,6 +304,16 @@ fn hardened_config() -> client::Config {
         let mut key: Vec<russh::keys::Algorithm> = p.key.iter().cloned().collect();
         key.push(russh::keys::Algorithm::Rsa { hash: None });
         p.key = Cow::Owned(key);
+
+        // NyaTerm: 压缩——X11 转发的 PutImage 是大块 RGB 像素（整窗重绘一次
+        // 1~4MB），zlib 对 UI 内容压缩比 2~5x，直接决定远程 X 应用是否流畅。
+        // ZLIB 立即生效；ZLIB_LEGACY（zlib@openssh.com）认证后才启用，兜底。
+        // 服务器不支持时协商回落 none，无害。
+        let mut compression: Vec<russh::compression::Name> =
+            p.compression.iter().copied().collect();
+        compression.insert(0, russh::compression::ZLIB);
+        compression.insert(1, russh::compression::ZLIB_LEGACY);
+        p.compression = Cow::Owned(compression);
     }
     config
 }
@@ -266,7 +390,13 @@ pub async fn spawn(
     jump: Option<JumpHost>,
     cols: u16,
     rows: u16,
+    x11: bool,
 ) -> Result<TermIo> {
+    // 启用 X11 转发时：接收端通道把服务端反向打开的 X11 通道交给内置 X server
+    let (x11_tx, x11_rx) = mpsc::unbounded_channel::<X11Channel>();
+    let x11_rx = x11.then_some(x11_rx);
+    let x11_sink = if x11 { Some(x11_tx) } else { None };
+
     let jump = jump.filter(|j| !j.host.trim().is_empty());
     match jump {
         None => {
@@ -279,7 +409,7 @@ pub async fn spawn(
             .map_err(|_| anyhow!("连接 {host}:{port} 超时"))?
             .map_err(|e| anyhow!("连接 {host}:{port} 失败: {e}"))?;
             let _ = tcp.set_nodelay(true);
-            open_shell(tcp, host, port, user, auth, cols, rows, None).await
+            open_shell(tcp, host, port, user, auth, cols, rows, None, x11, x11_rx, x11_sink).await
         }
         Some(j) => {
             // 经跳板机：在跳板机连接上开 direct-tcpip 通道
@@ -288,6 +418,8 @@ pub async fn spawn(
                 host: j.host.clone(),
                 port: j.port,
                 path: known_hosts_path(),
+                x11_sink: None,
+                forward_sink: None,
             };
             let mut jh: Handle<HostKeyChecker> = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
@@ -317,6 +449,9 @@ pub async fn spawn(
                 cols,
                 rows,
                 Some(Arc::new(jh)),
+                x11,
+                x11_rx,
+                x11_sink,
             )
             .await
         }
@@ -355,6 +490,11 @@ impl SshHandle {
 }
 
 /// 在给定字节流上完成目标机 SSH 握手、认证并开 shell。
+///
+/// `x11 = true` 时：会话通道发 `x11-req`（必须在 shell 之前，sshd 才会写
+/// `DISPLAY`），sshd 反向打开的 `x11` / `forwarded-tcpip` 通道由接收端交给
+/// 内置 X server；`x11-req` 被拒/未回时退回**兼容模式**——`tcpip_forward`
+/// 反向端口 + 往 shell 写 `export DISPLAY=localhost:{p-6000}.0`。
 async fn open_shell<S>(
     stream: S,
     host: String,
@@ -364,6 +504,9 @@ async fn open_shell<S>(
     cols: u16,
     rows: u16,
     keep_jump: Option<Arc<Handle<HostKeyChecker>>>,
+    x11: bool,
+    x11_rx: Option<mpsc::UnboundedReceiver<X11Channel>>,
+    x11_sink: Option<mpsc::UnboundedSender<X11Channel>>,
 ) -> Result<TermIo>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -373,6 +516,8 @@ where
         host: host.clone(),
         port,
         path: known_hosts_path(),
+        x11_sink,
+        forward_sink: None,
     };
     let mut handle: Handle<HostKeyChecker> =
         tokio::time::timeout(
@@ -389,7 +534,52 @@ where
     channel
         .request_pty(false, "xterm-256color", cols as u32, rows as u32, 0, 0, &[])
         .await?;
+
+    // `x11-req` 必须在 `request_shell` 之前发：sshd 只有在 shell 启动前收到它，
+    // 才会给远端设置 DISPLAY/XAUTHORITY，并把后续的 `x11` 通道转回来。
+    let mut x11_status: Option<bool> = None;
+    if x11 {
+        channel
+            .request_x11(true, false, "MIT-MAGIC-COOKIE-1", x11_cookie(), 0)
+            .await?;
+        x11_status = await_channel_reply(&mut channel).await;
+        if x11_status != Some(true) {
+            eprintln!(
+                "[ssh] sshd 未接受 x11-req（{:?}），尝试反向端口转发兼容模式",
+                x11_status
+            );
+        }
+    }
+
     channel.request_shell(false).await?;
+
+    // 兼容模式：`x11-req` 没被接受时，把远端 loopback 的一个端口反向转回
+    // 本机 X server，再往 shell 写一条 `DISPLAY`。不依赖 xauth / X11Forwarding。
+    if x11 && x11_status != Some(true) {
+        let asked =
+            tokio::time::timeout(X11_FORWARD_TIMEOUT, handle.tcpip_forward("127.0.0.1", 0)).await;
+        match asked {
+            // port == 0 由服务端挑空闲端口并回传；X 的 display 编号是 端口 - 6000
+            Ok(Ok(port)) if (6001..=65535).contains(&port) => {
+                let name = format!("localhost:{}.0", port - 6000);
+                channel
+                    .data(format!("export DISPLAY={name}\n").as_bytes())
+                    .await?;
+                eprintln!(
+                    "[ssh] sshd 未转发 x11（{x11_status:?}），已用反向端口 {port} 设置 DISPLAY={name}"
+                );
+            }
+            Ok(Ok(port)) => {
+                eprintln!("[ssh] sshd 未转发 x11（{x11_status:?}），反向端口申请返回 {port}，放弃兼容模式");
+            }
+            Ok(Err(e)) => {
+                eprintln!("[ssh] sshd 未转发 x11（{x11_status:?}），反向端口申请失败（远端可能禁用了 AllowTcpForwarding）：{e}");
+            }
+            Err(_) => {
+                eprintln!("[ssh] sshd 未转发 x11（{x11_status:?}），反向端口申请超时，放弃兼容模式");
+            }
+        }
+    }
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
@@ -403,6 +593,28 @@ where
         target: format!("{}@{}:{}", user, host, port),
     });
     let keep_for_task = keep.clone();
+
+    // 启用 X11 转发：把服务端反向打开的 X11 通道接进内置 X server。
+    // 每条通道的 X11 协议字节流直接灌进 `serve_stream`，不需要 TCP 端口。
+    if let Some(mut x11_rx) = x11_rx {
+        tokio::spawn(async move {
+            let server = match crate::remote::x11::ensure_xserver(1280, 800).await {
+                Ok(server) => server,
+                Err(e) => {
+                    eprintln!("[ssh] 启动内置 X server 失败，X11 转发不可用：{e}");
+                    return;
+                }
+            };
+            eprintln!(
+                "[ssh] X11 转发就绪：远端 X 程序将显示在内置 X server（display :{}）",
+                server.display
+            );
+            while let Some(channel) = x11_rx.recv().await {
+                let index = server.next_client_index();
+                server.serve_channel(channel.into_stream(), index);
+            }
+        });
+    }
 
     tokio::spawn(async move {
         let handle = keep_for_task.clone(); // 心跳用它（Handle 是 Arc，发包不占通道）

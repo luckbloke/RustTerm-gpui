@@ -1,4 +1,4 @@
-//! RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）
+﻿//! RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）
 //!
 //! P1: 产品骨架（统一标签页/SFTP双栏/状态栏/配置面板/i18n）
 //! P2: 远程桌面（VNC/RDP/SPICE 帧渲染，后端零改动）
@@ -39,6 +39,7 @@ mod tunnel;
 mod ui_icons;
 mod widgets;
 mod win32;
+mod xsrv;
 
 use gpui_kit::{AppContext as _, Bounds, WindowBounds, WindowOptions, px, point, size};
 
@@ -105,6 +106,76 @@ fn enable_child_window_embedding() {
 ///
 /// 窗口是 GUI 子系统程序，panic 只会弹一个「XX 已停止工作」的框，
 /// 堆栈信息全丢。这里落一份文本日志，用户把文件发回来就能定位。
+/// 5 秒一次的心跳：把**进程 CPU 时间**与各子系统计数写进诊断日志。
+///
+/// 排障用：「打字像慢镜头」这类"整个应用都慢"的问题，必须先回答 CPU 花在哪。
+/// 计数全都不涨而 CPU 仍高 → 不在 X 路径（终端渲染/UI）；某个计数猛涨 → 直接点名。
+fn spawn_heartbeat() {
+    std::thread::Builder::new()
+        .name("rustterm-heartbeat".to_string())
+        .spawn(|| {
+            let mut last = (0u64, 0u64, 0u64, 0u64, 0f64, 0u64, 0u64);
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let (reqs, composes, frames, bytes) = crate::xsrv::counters::snapshot();
+                let cpu = process_cpu_seconds();
+                let conns = crate::xsrv::counters::CONNECTIONS.load(std::sync::atomic::Ordering::Relaxed);
+                let disc = crate::xsrv::counters::DISCONNECTS.load(std::sync::atomic::Ordering::Relaxed);
+                crate::xsrv::log_line(format_args!(
+                    "[hb] cpu=+{:.2}s reqs=+{} composes=+{} frames=+{} bytes=+{} conns=+{}/-{}",
+                    cpu - last.4,
+                    reqs - last.0,
+                    composes - last.1,
+                    frames - last.2,
+                    bytes - last.3,
+                    conns - last.5,
+                    disc - last.6
+                ));
+                last.5 = conns;
+                last.6 = disc;
+                // 请求直方图 top-6：客户端在刷什么请求一目了然
+                let histo = crate::xsrv::counters::take_histo();
+                if !histo.is_empty() {
+                    let parts: Vec<String> = histo.iter().map(|(k, v)| format!("{:#06x}x{}", k, v)).collect();
+                    crate::xsrv::log_line(format_args!("[hb] reqs-top: {}", parts.join(" ")));
+                }
+                last.0 = reqs;
+                last.1 = composes;
+                last.2 = frames;
+                last.3 = bytes;
+                last.4 = cpu;
+            }
+        })
+        .ok();
+}
+
+/// 本进程累计 CPU 时间（用户态 + 内核态，秒）。
+#[cfg(windows)]
+fn process_cpu_seconds() -> f64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    // SAFETY: GetProcessTimes 只写这四个出参；句柄来自 GetCurrentProcess 的伪句柄。
+    let ok = unsafe { GetProcessTimes(GetCurrentProcess(), &mut creation, &mut exit, &mut kernel, &mut user) };
+    if ok == 0 {
+        return 0.0;
+    }
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0
+}
+
+#[cfg(not(windows))]
+fn process_cpu_seconds() -> f64 {
+    0.0
+}
+
 fn install_crash_log() {
     let Some(dir) = dirs::config_dir() else { return };
     let path = dir.join("rustterm-gpui").join("crash.log");
@@ -133,14 +204,16 @@ fn install_crash_log() {
 /// 的每条失败 IRP 落到 `%APPDATA%/rustterm-gpui/rdpdr.log`，复现一次就能定位。
 ///
 /// vendored IronRDP 里通过 `NYATERM_RDPDR_LOG` 读取该路径；每次启动清空旧日志。
-/// `NYATERM_RDPDR_TRACE=1` 追加每条 IRP 的全量跟踪（排查拷贝失败期间开启，
-/// 问题修复后应移除）。
+/// 需要每条 IRP 的全量跟踪时，启动前设 `NYATERM_RDPDR_TRACE=1` 即可。
 fn install_rdpdr_log() {
     let Some(dir) = dirs::config_dir() else { return };
     let path = dir.join("rustterm-gpui").join("rdpdr.log");
     let _ = std::fs::remove_file(&path);
     std::env::set_var("NYATERM_RDPDR_LOG", &path);
-    std::env::set_var("NYATERM_RDPDR_TRACE", "1");
+    // 构建指纹：编译期 Unix 时间戳写进日志首行，远端排障时一眼确认版本，
+    // 避免「测的是旧版」的往返（微信传输不保留文件修改时间）。
+    const BUILD_TS: &str = env!("NYATERM_BUILD_UNIX_TS");
+    let _ = std::fs::write(&path, format!("[build] BUILD_UNIX_TS={BUILD_TS}\n"));
 }
 
 /// 主逻辑跑在**大栈线程**上。
@@ -158,6 +231,7 @@ fn main() {
     env_logger::init();
     install_crash_log();
     install_rdpdr_log();
+    spawn_heartbeat();
     enable_child_window_embedding();
 
     let handle = std::thread::Builder::new()

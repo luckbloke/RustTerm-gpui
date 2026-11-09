@@ -1,4 +1,4 @@
-#[cfg(test)]
+﻿#[cfg(test)]
 mod tests;
 
 use std::io;
@@ -100,7 +100,7 @@ impl ClientNewLicenseRequest {
                 flags: BasicSecurityHeaderFlags::LICENSE_PKT,
             },
             preamble_message_type: PreambleType::NewLicenseRequest,
-            preamble_flags: PreambleFlags::empty(),
+            preamble_flags: PreambleFlags::EXTENDED_ERROR_MSG_SUPPORTED,
             preamble_version: PreambleVersion::V3,
             preamble_message_size: u16::try_from(
                 RANDOM_NUMBER_SIZE

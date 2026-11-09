@@ -4855,6 +4855,7 @@ dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "der-parser",
+ "des",
  "hmac 0.12.1",
  "ironrdp-core",
  "ironrdp-error",
@@ -8726,7 +8727,7 @@ dependencies = [
 
 [[package]]
 name = "rustterm-gpui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8762,6 +8763,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "winresource",
  "wry",
+ "x11rb-protocol",
 ]
 
 [[package]]
