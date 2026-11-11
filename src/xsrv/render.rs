@@ -28,7 +28,7 @@ use x11rb_protocol::protocol::xproto;
 use x11rb_protocol::x11_utils::Serialize;
 
 use super::error::{BAD_VALUE, XError};
-use super::handshake::{ROOT_VISUAL, SCREEN_DEPTH};
+use super::handshake::{ARGB32_VISUAL, ROOT_VISUAL, SCREEN_DEPTH};
 use super::raster::{self, Span};
 use super::region::Rects;
 use super::state::{Glyph, GlyphSetData, PictureData, PictureSource, ServerState};
@@ -56,6 +56,17 @@ pub const RENDER_MINOR_VERSION: u32 = 11;
 pub const FORMAT_ARGB32: u32 = 1;
 pub const FORMAT_RGB24: u32 = 2;
 pub const FORMAT_A8: u32 = 3;
+/// 1 位与 4 位 alpha-only 格式。
+///
+/// libXrender 的 `XRenderFindStandardFormat` 支持 5 种标准格式
+/// （ARGB32/RGB24/A8/A4/A1）；cairo 建遮罩类 Picture 时会按需查 A1/A4。
+/// **我们只宣告 3 种时，查不到的格式会让它拿到 NULL**，随后
+/// `XRenderCreatePicture(dpy, drawable, NULL, ...)` 在 libXrender 内部解引用
+/// `format->id` → 段错误 at 0（2026-11-11 用户实测 zenity/firefox 崩在
+/// libXrender `XRenderCreatePicture+0x85`，调用链 cairo_paint → gdk → gtk；
+/// 补了 visual 映射后仍崩，说明缺的是**标准格式**而不是 visual 绑定）。
+pub const FORMAT_A4: u32 = 4;
+pub const FORMAT_A1: u32 = 5;
 
 /// 格式深度；不认识的 ID 返回 `None`（调用方回 BadPictFormat）。
 pub fn pict_format_depth(id: u32) -> Option<u8> {
@@ -63,6 +74,8 @@ pub fn pict_format_depth(id: u32) -> Option<u8> {
         FORMAT_ARGB32 => Some(32),
         FORMAT_RGB24 => Some(24),
         FORMAT_A8 => Some(8),
+        FORMAT_A4 => Some(4),
+        FORMAT_A1 => Some(1),
         _ => None,
     }
 }
@@ -77,6 +90,10 @@ fn pict_form_info(id: u32) -> render::Pictforminfo {
     let (depth, red, green, blue, alpha) = match id {
         FORMAT_ARGB32 => (32, (16u16, 0xffu16), (8, 0xff), (0, 0xff), (24, 0xff)),
         FORMAT_RGB24 => (24, (16, 0xff), (8, 0xff), (0, 0xff), (0, 0)),
+        FORMAT_A8 => (8, (0, 0), (0, 0), (0, 0), (0, 0xff)),
+        // alpha-only：只有 alpha 通道，RGB 掩码为 0（与真实 X.org 的 depth 4/1 格式一致）
+        FORMAT_A4 => (4, (0, 0), (0, 0), (0, 0), (0, 0x0f)),
+        FORMAT_A1 => (1, (0, 0), (0, 0), (0, 0), (0, 0x01)),
         _ => (8, (0, 0), (0, 0), (0, 0), (0, 0xff)),
     };
     render::Pictforminfo {
@@ -94,6 +111,56 @@ fn pict_form_info(id: u32) -> render::Pictforminfo {
             alpha_mask: alpha.1,
         },
         colormap: 0,
+    }
+}
+
+// ---- 光栅化耗时统计（task-14 的 before/after 证据）----
+//
+/// 每秒一行的 `[hb-raster]`：合成次数、像素量、光栅化纯耗时。
+/// 读数用法：`ms` 与 `[hb] reqs` 对照——绘制请求数不变而耗时下降 = 快路径
+/// 生效；耗时不变而 XIQueryPointer 应答变快 = 批处理/快路径生效（两者互补）。
+pub mod raster_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// 合成/填充请求数（进入光栅化的）。
+    pub static OPS: AtomicU64 = AtomicU64::new(0);
+    /// 光栅化的像素总数。
+    pub static PIXELS: AtomicU64 = AtomicU64::new(0);
+    /// 光栅化纯耗时（纳秒）。
+    pub static NS: AtomicU64 = AtomicU64::new(0);
+
+    static LAST_REPORT: Mutex<Option<(std::time::Instant, u64, u64, u64)>> = Mutex::new(None);
+
+    /// 记录一次光栅化并在跨过 1s 边界时汇报一行。
+    pub fn record(pixels: u64, ns: u64) {
+        OPS.fetch_add(1, Ordering::Relaxed);
+        PIXELS.fetch_add(pixels, Ordering::Relaxed);
+        NS.fetch_add(ns, Ordering::Relaxed);
+        maybe_report();
+    }
+
+    fn maybe_report() {
+        let now = std::time::Instant::now();
+        if let Ok(mut guard) = LAST_REPORT.try_lock() {
+            match *guard {
+                None => *guard = Some((now, 0, 0, 0)),
+                Some((t0, ops0, px0, ns0)) => {
+                    if now.duration_since(t0).as_millis() >= 1_000 {
+                        let ops = OPS.load(Ordering::Relaxed);
+                        let px = PIXELS.load(Ordering::Relaxed);
+                        let ns = NS.load(Ordering::Relaxed);
+                        crate::xsrv::log_line(format_args!(
+                            "[hb-raster] ops=+{} pixels=+{} ms=+{:.1}",
+                            ops - ops0,
+                            px - px0,
+                            (ns - ns0) as f64 / 1e6,
+                        ));
+                        *guard = Some((now, ops, px, ns));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -606,9 +673,54 @@ fn composite_setup(
     })
 }
 
-/// Composite 的逐像素混合（带可选 mask，只取 mask 的 alpha 通道）。
+/// Composite 的像素混合入口：计时进 `raster_stats`，实际混合在 `*_inner`。
 #[allow(clippy::too_many_arguments)]
 fn composite_pixels(
+    state: &mut ServerState,
+    setup: &CompositeSetup,
+    mask: Option<(&PictureData, &BorrowedPixels)>,
+    dst_x: i16,
+    dst_y: i16,
+    src_x: i16,
+    src_y: i16,
+    mask_x: i16,
+    mask_y: i16,
+    width: u16,
+    height: u16,
+) -> Result<(), XError> {
+    let t0 = std::time::Instant::now();
+    let result = composite_pixels_inner(
+        state, setup, mask, dst_x, dst_y, src_x, src_y, mask_x, mask_y, width, height,
+    );
+    raster_stats::record(
+        u64::from(width) * u64::from(height),
+        t0.elapsed().as_nanos() as u64,
+    );
+    result
+}
+
+/// 这几个 op 在「源不透明（alpha=255）」时结果都与源完全相同
+/// （目标是不透明的 0x00RRGGBB，见 blend_pixel 的 Porter-Duff 推导），
+/// 可以整行/整块直拷或直写。
+fn op_replaces_dst_with_opaque_src(op: u8) -> bool {
+    op == u8::from(render::PictOp::SRC)
+        || op == u8::from(render::PictOp::OVER)
+        || op == u8::from(render::PictOp::ATOP)
+        || op == u8::from(render::PictOp::IN)
+}
+
+/// Composite 的逐像素混合（带可选 mask，只取 mask 的 alpha 通道）。
+///
+/// NyaTerm（task-14）：firefox 重绘是海量小 Composite，逐像素循环里每像素
+/// 都做采样 + 裁剪判定 + 索引计算。这里加了三条行级快路径（语义与逐像素
+/// 路径严格一致，有离线对照测试）：
+/// 1. **Solid 源 + 无 mask**：预乘色只算一次（原来每像素重算一遍）；
+///    源不透明且 op ∈ {SRC,OVER,ATOP,IN} 时整行 `fill`（memcpy 级）。
+/// 2. **Drawable 源 + 无 mask + 非 32 位 + 不 repeat + op 同上**：源行完整
+///    落在源内时整行 `copy_from_slice`。
+/// 其余（渐变 / mask / depth32 / repeat / 带 clip）走原逐像素路径。
+#[allow(clippy::too_many_arguments)]
+fn composite_pixels_inner(
     state: &mut ServerState,
     setup: &CompositeSetup,
     mask: Option<(&PictureData, &BorrowedPixels)>,
@@ -625,12 +737,101 @@ fn composite_pixels(
         Some(window) => &mut window.pixels,
         None => &mut state.pixmaps.get_mut(&setup.drawable).expect("composite_setup 已确认存在").pixels,
     };
+    let dst_w = setup.width as i32;
+    let dst_h = setup.height as i32;
+    // 钳到目标范围内的行/列区间：越界像素原本也是 continue 跳过
+    let row0 = i32::from(dst_y).max(0);
+    let row1 = (i32::from(dst_y) + height as i32).min(dst_h);
+    let col0 = i32::from(dst_x).max(0);
+    let col1 = (i32::from(dst_x) + width as i32).min(dst_w);
+    if row0 >= row1 || col0 >= col1 {
+        return Ok(());
+    }
+    let clip = setup.dst.clip.as_ref();
+    let dstride = setup.width as usize;
+
+    // ---- 快路径 1：Solid 源 + 无 mask ----
+    if mask.is_none() {
+        if matches!(&setup.src.source, PictureSource::Solid { .. }) {
+            let color = sample_picture(&setup.src, 0, 0, &setup.src_pixels);
+            let solid = pixel_of(color.0, color.1, color.2);
+            let op = setup.op;
+            for dy in row0..row1 {
+                let row = dy as usize * dstride;
+                match (clip, op_replaces_dst_with_opaque_src(op) && color.3 == 255) {
+                    (None, true) => pixels[row + col0 as usize..row + col1 as usize].fill(solid),
+                    (None, false) => {
+                        for dx in col0..col1 {
+                            let index = row + dx as usize;
+                            let Some(value) = blend_pixel(op, pixels[index], color) else {
+                                return Err(XError::new(BAD_PICT_OP, op as u32));
+                            };
+                            pixels[index] = value;
+                        }
+                    }
+                    (Some(_), _) => {
+                        for dx in col0..col1 {
+                            if !clip_contains(&setup.dst, dx, dy) {
+                                continue;
+                            }
+                            let index = row + dx as usize;
+                            let Some(value) = blend_pixel(op, pixels[index], color) else {
+                                return Err(XError::new(BAD_PICT_OP, op as u32));
+                            };
+                            pixels[index] = value;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // ---- 快路径 2：Drawable 源 + 无 mask + 非 32 位 + 不 repeat ----
+        if let PictureSource::Drawable(_) = &setup.src.source {
+            if !setup.src.repeat && setup.src_pixels.depth != 32 && clip.is_none() {
+                if let (true, Some((spixels, sw, sh))) = (
+                    op_replaces_dst_with_opaque_src(setup.op),
+                    setup.src_pixels.view(),
+                ) {
+                    for dy in row0..row1 {
+                        let sy = i32::from(src_y) + (dy - i32::from(dst_y));
+                        let sx0 = i32::from(src_x) + (col0 - i32::from(dst_x));
+                        let sx1 = sx0 + (col1 - col0);
+                        let drow = dy as usize * dstride;
+                        // 源行完整落在源缓冲内 → 整行拷贝；否则逐像素
+                        // （源外的采样是透明色，语义只能由逐像素路径保证）
+                        if sy >= 0 && sy < sh as i32 && sx0 >= 0 && sx1 <= sw as i32 {
+                            let srow = sy as usize * sw as usize;
+                            pixels[drow + col0 as usize..drow + col1 as usize]
+                                .copy_from_slice(&spixels[srow + sx0 as usize..srow + sx1 as usize]);
+                            continue;
+                        }
+                        for dx in col0..col1 {
+                            let sx = i32::from(src_x) + (dx - i32::from(dst_x));
+                            let source = sample_picture(&setup.src, sx, sy, &setup.src_pixels);
+                            let index = drow + dx as usize;
+                            let Some(value) = blend_pixel(setup.op, pixels[index], source) else {
+                                return Err(XError::new(BAD_PICT_OP, setup.op as u32));
+                            };
+                            pixels[index] = value;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // ---- 通用逐像素路径（渐变 / mask / depth32 / repeat / clip）----
     for row in 0..i32::from(height) {
+        let dy = i32::from(dst_y) + row;
+        if dy < 0 || dy >= dst_h {
+            continue;
+        }
         for col in 0..i32::from(width) {
             let dx = i32::from(dst_x) + col;
-            let dy = i32::from(dst_y) + row;
             // 目标越界与 picture 裁剪：跳过（与 Xorg 的 clip 语义一致）
-            if dx < 0 || dy < 0 || dx >= setup.width as i32 || dy >= setup.height as i32 {
+            if dx < 0 || dx >= dst_w {
                 continue;
             }
             if !clip_contains(&setup.dst, dx, dy) {
@@ -649,7 +850,7 @@ fn composite_pixels(
                 source.2 = source.2 * mask_alpha / 255;
                 source.3 = source.3 * mask_alpha / 255;
             }
-            let index = dy as usize * setup.width + dx as usize;
+            let index = dy as usize * dstride + dx as usize;
             let Some(value) = blend_pixel(setup.op, pixels[index], source) else {
                 return Err(XError::new(BAD_PICT_OP, setup.op as u32));
             };
@@ -701,10 +902,14 @@ impl ServerState {
         // 三种直接格式；screen 结构按 toolkit 的遍历顺序组装：
         // depth 24 → RGB24 绑定根 visual；depth 32 → ARGB32（visualid 0，
         // Xorg 也是这么报的：32 位格式没有对应的 visual）。
+        // 必须覆盖 libXrender 的 5 种标准格式：ARGB32/RGB24/A8/A4/A1。
+        // 少一种，cairo 对应路径就会拿到 NULL format 并在 libXrender 里段错误。
         let formats = vec![
             pict_form_info(FORMAT_ARGB32),
             pict_form_info(FORMAT_RGB24),
             pict_form_info(FORMAT_A8),
+            pict_form_info(FORMAT_A4),
+            pict_form_info(FORMAT_A1),
         ];
         let depths = vec![
             render::Pictdepth {
@@ -716,8 +921,14 @@ impl ServerState {
             },
             render::Pictdepth {
                 depth: 32,
+                // 必须是握手阶段真实宣告的那个 32 位 visual（ARGB32_VISUAL），
+                // 不能写 0！cairo 建 Picture 前先 XRenderFindVisualFormat(visual)，
+                // 拿不到映射就返回 NULL，随后 XRenderCreatePicture(..., NULL, ...)
+                // 在 libXrender 内部解引用 format->id → 段错误 at 0
+                // （2026-11-11 实测：zenity/firefox 崩在 libXrender
+                //   XRenderCreatePicture+0x85，调用链 cairo_paint → gdk → gtk）。
                 visuals: vec![render::Pictvisual {
-                    visual: 0,
+                    visual: ARGB32_VISUAL,
                     format: render::Pictformat::from(FORMAT_ARGB32),
                 }],
             },
@@ -732,7 +943,9 @@ impl ServerState {
                 fallback: render::Pictformat::from(FORMAT_RGB24),
                 depths,
             }],
-            subpixels: Vec::new(),
+            // 规范：subpixels 与 visuals 一一对应（真实 X 服务器每个 visual 一项）。
+            // 之前发空数组，虽不致命，但让"我们比真服务器少给东西"的差异又多一处。
+            subpixels: vec![render::SubPixel::UNKNOWN; 2],
         };
         // 这份回复的 length 字段 x11rb 不会自动回填：序列化后手工改写
         // （变长数据按 4 字节单位计）。
@@ -1102,11 +1315,13 @@ impl ServerState {
             return Ok(());
         }
 
+        let t0 = std::time::Instant::now();
         {
             let pixels = match self.windows.get_mut(&drawable) {
                 Some(window) => &mut window.pixels,
                 None => &mut self.pixmaps.get_mut(&drawable).expect("上面已确认存在").pixels,
             };
+            let has_clip = dst.clip.is_some();
             for rect in request.rects.iter() {
                 let left = i32::from(rect.x).max(0);
                 let top = i32::from(rect.y).max(0);
@@ -1115,6 +1330,13 @@ impl ServerState {
                 if let Some(color) = fill {
                     for y in top..bottom {
                         let row = y as usize * width as usize;
+                        if !has_clip {
+                            // 行 span 写色：无 clip 时裁剪判定可以整行跳过（task-14）
+                            if right > left {
+                                pixels[row + left as usize..row + right as usize].fill(color);
+                            }
+                            continue;
+                        }
                         for x in left..right {
                             if !clip_contains(&dst, x, y) {
                                 continue;
@@ -1138,6 +1360,12 @@ impl ServerState {
                     }
                 }
             }
+            let pixels_n = request
+                .rects
+                .iter()
+                .map(|r| u64::from(r.width) * u64::from(r.height))
+                .sum();
+            raster_stats::record(pixels_n, t0.elapsed().as_nanos() as u64);
         }
 
         finish_draw(self, drawable);
@@ -1915,7 +2143,81 @@ mod tests {
         assert_eq!(reply.screens[0].depths.len(), 2);
         assert_eq!(reply.screens[0].fallback, render::Pictformat::from(FORMAT_RGB24));
         assert_eq!(reply.screens[0].depths[0].visuals[0].visual, ROOT_VISUAL);
-        assert_eq!(reply.num_formats(), 3);
+        // libXrender 的 5 种标准格式必须齐全：cairo 按需查 A8/A4/A1，
+        // 缺一个就拿到 NULL format → XRenderCreatePicture 在 libXrender 里段错误 at 0
+        assert_eq!(reply.num_formats(), 5, "ARGB32/RGB24/A8/A4/A1 五种标准格式都要有");
+        for (id, depth) in [
+            (FORMAT_ARGB32, 32u8),
+            (FORMAT_RGB24, 24),
+            (FORMAT_A8, 8),
+            (FORMAT_A4, 4),
+            (FORMAT_A1, 1),
+        ] {
+            let f = reply
+                .formats
+                .iter()
+                .find(|f| u32::from(f.id) == id)
+                .unwrap_or_else(|| panic!("缺标准格式 id={id}（深度 {depth}）"));
+            assert_eq!(f.depth, depth, "格式 id={id} 的深度");
+            assert_eq!(u8::from(f.type_), u8::from(render::PictType::DIRECT));
+        }
+        // A1/A4 是 alpha-only：只有 alpha 掩码，RGB 必须为 0
+        for id in [FORMAT_A4, FORMAT_A1] {
+            let f = reply.formats.iter().find(|f| u32::from(f.id) == id).unwrap();
+            assert_eq!(
+                (f.direct.red_mask, f.direct.green_mask, f.direct.blue_mask),
+                (0, 0, 0),
+                "alpha-only 格式的 RGB 掩码必须为 0"
+            );
+            assert_ne!(f.direct.alpha_mask, 0, "alpha-only 格式必须有 alpha 掩码");
+        }
+
+        // ---- visual → format 映射必须覆盖握手阶段宣告的**每一个** visual ----
+        // 这是 cairo 的 XRenderFindVisualFormat 的查表来源：漏一个，cairo 就拿到
+        // NULL format，随后 XRenderCreatePicture 在 libXrender 里段错误 at 0
+        // （2026-11-11 用户实测的 zenity/firefox 崩溃）。
+        let mapped: Vec<u32> = reply
+            .screens
+            .iter()
+            .flat_map(|s| s.depths.iter())
+            .flat_map(|d| d.visuals.iter())
+            .map(|v| v.visual)
+            .collect();
+        let format_ids: Vec<u32> = reply.formats.iter().map(|f| u32::from(f.id)).collect();
+        for visual in [ROOT_VISUAL, ARGB32_VISUAL] {
+            assert!(
+                mapped.contains(&visual),
+                "visual {visual:#x} 必须在 RENDER 的 visuals 列表里（否则 cairo 拿到 NULL format）"
+            );
+        }
+        // 每个映射到的 format 都必须是应答里真实存在的格式 id
+        for v in reply.screens.iter().flat_map(|s| s.depths.iter()).flat_map(|d| d.visuals.iter()) {
+            assert!(
+                format_ids.contains(&u32::from(v.format)),
+                "Pictvisual 指向的 format id {} 必须在 formats 列表里",
+                u32::from(v.format)
+            );
+        }
+        // ARGB32 视觉必须映射到 FORMAT_ARGB32（而不是被写成 0）
+        let argb_visual = reply
+            .screens
+            .iter()
+            .flat_map(|s| s.depths.iter())
+            .flat_map(|d| d.visuals.iter())
+            .find(|v| v.visual == ARGB32_VISUAL)
+            .expect("ARGB32 视觉必须在列表里");
+        assert_eq!(u32::from(argb_visual.format), FORMAT_ARGB32);
+        // subpixels 与 visuals 一一对应（x11rb 没有 num_visuals()，自己数）
+        let visual_count: usize = reply
+            .screens
+            .iter()
+            .flat_map(|s| s.depths.iter())
+            .map(|d| d.visuals.len())
+            .sum();
+        assert_eq!(
+            reply.num_subpixel() as usize, visual_count,
+            "subpixels 必须与 visuals 一一对应"
+        );
     }
 
     #[test]
@@ -2543,5 +2845,235 @@ mod tests {
             "源 drawable 的像素缓冲必须被归还（不能是空 Vec）"
         );
         assert_eq!(after, &original, "归还的像素内容不应被改动");
+    }
+
+    // ---- task-14：快路径语义一致性 + 性能对照 ----
+    //（返工说明：22:0x 会话实测「帧边界延迟合成」会丢绘制——flush 时 firefox
+    // 已 FreePixmap，X 的绘制/释放必须按序。延迟合成已撤销，这两条测试改为
+    // 直接验证「按序即时执行 + 行级快路径」的正确性与吞吐。）
+
+    use super::super::state::PixmapData;
+
+    /// 建两个 32x32 的 depth-24 pixmap + 包装它们的 picture。返回 (state, src_pm, dst_pm, src_pic, dst_pic)。
+    fn pixmap_fixture(size: u16) -> (ServerState, u32, u32, u32, u32) {
+        let mut state = ServerState::new(Default::default());
+        let (src_pm, dst_pm) = (0x5100_0001, 0x5100_0002);
+        let (src_pic, dst_pic) = (0x5100_0011, 0x5100_0012);
+        for (id, seed) in [(src_pm, 0xA5u32), (dst_pm, 0x3C)] {
+            let n = size as usize * size as usize;
+            let pixels: Vec<u32> =
+                (0u32..n as u32).map(|i| (i.wrapping_mul(seed) | 0x0020_2010) & 0x00FF_FFFF).collect();
+            state.pixmaps.insert(
+                id,
+                PixmapData { id, depth: 24, width: size, height: size, pixels, owner: 0 },
+            );
+        }
+        for (id, pm) in [(src_pic, src_pm), (dst_pic, dst_pm)] {
+            state.pictures.insert(
+                id,
+                PictureData {
+                    id,
+                    owner: 0,
+                    format: FORMAT_RGB24,
+                    source: PictureSource::Drawable(pm),
+                    repeat: false,
+                    clip: None,
+                    clip_x_origin: 0,
+                    clip_y_origin: 0,
+                    filter: String::new(),
+                },
+            );
+        }
+        (state, src_pm, dst_pm, src_pic, dst_pic)
+    }
+
+    /// 与**优化前**逐像素循环完全一致的参考实现（快路径的对照基准）。
+    #[allow(clippy::too_many_arguments)]
+    fn naive_composite(
+        dst: &mut [u32],
+        dw: usize,
+        dh: usize,
+        src: &[u32],
+        sw: usize,
+        sh: usize,
+        op: u8,
+        dst_x: i16,
+        dst_y: i16,
+        src_x: i16,
+        src_y: i16,
+        width: u16,
+        height: u16,
+        solid: Option<(u32, u32, u32, u32)>,
+    ) {
+        for row in 0..i32::from(height) {
+            for col in 0..i32::from(width) {
+                let dx = i32::from(dst_x) + col;
+                let dy = i32::from(dst_y) + row;
+                if dx < 0 || dy < 0 || dx >= dw as i32 || dy >= dh as i32 {
+                    continue;
+                }
+                let source = match solid {
+                    Some(c) => c,
+                    None => {
+                        let sx = i32::from(src_x) + col;
+                        let sy = i32::from(src_y) + row;
+                        if sx < 0 || sy < 0 || sx >= sw as i32 || sy >= sh as i32 {
+                            (0, 0, 0, 0)
+                        } else {
+                            let p = src[sy as usize * sw + sx as usize];
+                            (channel(p, 16), channel(p, 8), channel(p, 0), 255)
+                        }
+                    }
+                };
+                let index = dy as usize * dw + dx as usize;
+                let Some(value) = blend_pixel(op, dst[index], source) else {
+                    panic!("参考实现遇到不支持的 op {op}");
+                };
+                dst[index] = value;
+            }
+        }
+    }
+
+    fn composite_req(
+        op: render::PictOp,
+        src: u32,
+        dst: u32,
+        dx: i16,
+        dy: i16,
+        sx: i16,
+        sy: i16,
+        w: u16,
+        h: u16,
+    ) -> render::CompositeRequest {
+        render::CompositeRequest {
+            op,
+            src,
+            mask: 0,
+            dst,
+            src_x: sx,
+            src_y: sy,
+            dst_x: dx,
+            dst_y: dy,
+            mask_x: 0,
+            mask_y: 0,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn solid_picture(state: &mut ServerState, id: u32, color: render::Color) {
+        state.pictures.insert(
+            id,
+            PictureData {
+                id,
+                owner: 0,
+                format: FORMAT_ARGB32,
+                source: PictureSource::Solid {
+                    red: color.red,
+                    green: color.green,
+                    blue: color.blue,
+                    alpha: color.alpha,
+                },
+                repeat: false,
+                clip: None,
+                clip_x_origin: 0,
+                clip_y_origin: 0,
+                filter: String::new(),
+            },
+        );
+    }
+
+    fn dst_pixels(state: &ServerState, pm: u32) -> Vec<u32> {
+        state.pixmaps.get(&pm).expect("dst pixmap 还在").pixels.clone()
+    }
+
+    /// 快路径（行拷贝/行填充）必须与优化前的逐像素语义**逐位一致**。
+    #[test]
+    fn composite_fast_paths_match_naive_reference() {
+        let op_over = u8::from(render::PictOp::OVER);
+        let size = 32u16;
+        let (sw, sh) = (size as usize, size as usize);
+
+        // 1) Drawable 源 + OVER（不透明）→ 行拷贝路径 vs 参考
+        let (mut state, src_pm, dst_pm, src_pic, dst_pic) = pixmap_fixture(size);
+        let mut naive = dst_pixels(&state, dst_pm);
+        let src = state.pixmaps.get(&src_pm).expect("src").pixels.clone();
+        naive_composite(&mut naive, size as usize, size as usize, &src, sw, sh, op_over, 3, 5, 1, 2, 20, 10, None);
+        state
+            .render_composite(&composite_req(render::PictOp::OVER, src_pic, dst_pic, 3, 5, 1, 2, 20, 10))
+            .expect("composite 应当成功");
+        assert_eq!(dst_pixels(&state, dst_pm), naive, "行拷贝快路径必须与逐像素参考一致");
+
+        // 2) 越界 + 源越界混合（走逐像素回退，但入口相同）
+        let (mut state, _src_pm, dst_pm, src_pic, dst_pic) = pixmap_fixture(size);
+        let mut naive = dst_pixels(&state, dst_pm);
+        let src = state.pixmaps.get(&src_pm).expect("src").pixels.clone();
+        naive_composite(&mut naive, size as usize, size as usize, &src, sw, sh, op_over, 24, 24, 28, 30, 16, 16, None);
+        state
+            .render_composite(&composite_req(render::PictOp::OVER, src_pic, dst_pic, 24, 24, 28, 30, 16, 16))
+            .expect("部分越界的 composite 应当成功");
+        assert_eq!(dst_pixels(&state, dst_pm), naive, "越界混合必须与逐像素参考一致");
+
+        // 3) Solid 源 + OVER（不透明纯色）→ 行填充路径 vs 参考
+        //    参考值是 premultiply(0xFFFF,0x8000,0x4000,0xFFFF) = (255,128,64,255)
+        let (mut state, _src_pm, dst_pm, _src_pic, dst_pic) = pixmap_fixture(size);
+        solid_picture(&mut state, 0x5100_0013, render::Color { red: 0xFFFF, green: 0x8000, blue: 0x4000, alpha: 0xFFFF });
+        let mut naive = dst_pixels(&state, dst_pm);
+        naive_composite(&mut naive, size as usize, size as usize, &[], sw, sh, op_over, 0, 0, 0, 0, size, size, Some((255, 128, 64, 255)));
+        state
+            .render_composite(&composite_req(render::PictOp::OVER, 0x5100_0013, dst_pic, 0, 0, 0, 0, size, size))
+            .expect("solid composite 应当成功");
+        assert_eq!(dst_pixels(&state, dst_pm), naive, "行填充快路径必须与逐像素参考一致");
+
+        // 4) Solid 半透明（alpha=128）→ 逐像素混合路径 vs 参考
+        //    参考值是 premultiply(0xFFFF,0x8000,0x4000,0x8000) = (128,64,32,128)
+        let (mut state, _src_pm, dst_pm, _src_pic, dst_pic) = pixmap_fixture(size);
+        solid_picture(&mut state, 0x5100_0014, render::Color { red: 0xFFFF, green: 0x8000, blue: 0x4000, alpha: 0x8000 });
+        let mut naive = dst_pixels(&state, dst_pm);
+        naive_composite(&mut naive, size as usize, size as usize, &[], sw, sh, op_over, 2, 2, 0, 0, 10, 10, Some((128, 64, 32, 128)));
+        state
+            .render_composite(&composite_req(render::PictOp::OVER, 0x5100_0014, dst_pic, 2, 2, 0, 0, 10, 10))
+            .expect("半透明 solid composite 应当成功");
+        assert_eq!(dst_pixels(&state, dst_pm), naive, "半透明 solid 必须与逐像素参考一致");
+    }
+
+    /// 性能对照（task-14 的 before/after 离线读数）：模拟 firefox 重绘负载
+    /// —— 400 个 40x20 的不透明纯色 OVER + 400 个 40x20 的位图 OVER。
+    /// 断言只保证正确性；耗时打印在测试输出里（`cargo test -- --nocapture` 可见）。
+    #[test]
+    fn raster_fast_path_vs_naive_benchmark() {
+        let size = 128u16;
+        let (mut state, src_pm, dst_pm, src_pic, dst_pic) = pixmap_fixture(size);
+        solid_picture(&mut state, 0x5100_0015, render::Color { red: 0xF000, green: 0xE000, blue: 0xD000, alpha: 0xFFFF });
+
+        // —— naive 参考实现跑同一负载 ——
+        let src = state.pixmaps.get(&src_pm).expect("src").pixels.clone();
+        let mut naive = state.pixmaps.get(&dst_pm).expect("dst").pixels.clone();
+        let (sw, sh) = (size as usize, size as usize);
+        let t0 = std::time::Instant::now();
+        for i in 0..400usize {
+            let dx = (i % 7 * 8) as i16;
+            let dy = (i % 11 * 6) as i16;
+            naive_composite(&mut naive, size as usize, size as usize, &src, sw, sh, u8::from(render::PictOp::OVER), dx, dy, 0, 0, 40, 20, Some((240, 224, 208, 255)));
+            naive_composite(&mut naive, size as usize, size as usize, &src, sw, sh, u8::from(render::PictOp::OVER), dx, dy, 4, 4, 40, 20, None);
+        }
+        let naive_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // —— 优化实现 ——
+        let t1 = std::time::Instant::now();
+        for i in 0..400usize {
+            let dx = (i % 7 * 8) as i16;
+            let dy = (i % 11 * 6) as i16;
+            state.render_composite(&composite_req(render::PictOp::OVER, 0x5100_0015, dst_pic, dx, dy, 0, 0, 40, 20)).expect("solid ok");
+            state.render_composite(&composite_req(render::PictOp::OVER, src_pic, dst_pic, dx, dy, 4, 4, 40, 20)).expect("bitmap ok");
+        }
+        let fast_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        // 正确性：整体结果必须一致（负载覆盖两种快路径 + 逐像素回退的混合）
+        assert_eq!(dst_pixels(&state, dst_pm), naive, "基准负载下快路径与参考实现结果必须一致");
+        println!(
+            "[bench] naive={naive_ms:.2}ms fast={fast_ms:.2}ms speedup={:.2}x",
+            naive_ms / fast_ms.max(0.001)
+        );
     }
 }

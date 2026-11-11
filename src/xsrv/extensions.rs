@@ -1,4 +1,4 @@
-﻿//! X11 扩展支持：注册表与各扩展请求的服务端语义。
+//! X11 扩展支持：注册表与各扩展请求的服务端语义。
 //!
 //! 线格式编解码（请求解析、回复/事件序列化）全部复用 `x11rb-protocol`
 //! 对应模块的类型，本文件只实现"解析之后做什么"：
@@ -19,7 +19,7 @@
 //! opcode 用固定值（参考 Xorg 的常见分配），first_event/error 基址避开核心
 //! 协议的事件（2..=34）与错误（1..=17）即可。
 
-use x11rb_protocol::protocol::{bigreq, composite, damage, render, shape, shm, xc_misc, xfixes, xproto, xtest};
+use x11rb_protocol::protocol::{bigreq, composite, damage, render, shape, shm, xc_misc, xfixes, xinput, xproto, xtest, xkb};
 use x11rb_protocol::x11_utils::{ExtInfoProvider, ExtensionInformation};
 use x11rb_protocol::x11_utils::Serialize;
 
@@ -46,6 +46,10 @@ pub const OPCODE_COMPOSITE: u8 = 139;
 /// RENDER 的 major opcode（Composite 之后的第一个空闲值；语义在 `render.rs`）。
 pub const OPCODE_RENDER: u8 = 140;
 pub const OPCODE_DAMAGE: u8 = 143;
+/// XKEYBOARD 的 major opcode（DAMAGE 之后的第一个空闲值）。
+/// GTK3 的 `use_xkb` 开关靠它宣告成功（gdkkeys-x11.c 核心键表路径存在
+/// 首次按键必然 NULL 解引用的死代码 bug，详见 `xkb.rs` 模块注释）。
+pub const OPCODE_XKEYBOARD: u8 = 145;
 
 /// 事件基址：只需要避开核心事件段，本服务器内部自洽即可
 /// （QueryExtension 回复与 `ExtInfoProvider` 必须用同一组数字）。
@@ -53,10 +57,16 @@ pub const FIRST_EVENT_SHAPE: u8 = 90;
 pub const FIRST_EVENT_MIT_SHM: u8 = 91;
 pub const FIRST_EVENT_XFIXES: u8 = 92;
 pub const FIRST_EVENT_DAMAGE: u8 = 94;
+/// XKB 的事件基址：XKB 只占 1 个 X 事件码（XkbEventCode=0），子类型在
+/// xkbType 字节。GDK 用 QueryExtension 返回的 event_base 作为
+/// xkb_event_type——**不能为 0**（会与核心事件冲突）。
+pub const FIRST_EVENT_XKB: u8 = 95;
 
 /// 错误基址：XFIXES 的 BadRegion 与 DAMAGE 的 BadDamage。
 pub const FIRST_ERROR_XFIXES: u8 = 128;
 pub const FIRST_ERROR_DAMAGE: u8 = 129;
+/// XKB 的错误基址（只有 BadKeyboard 一种）。
+pub const FIRST_ERROR_XKB: u8 = 130;
 /// RENDER 的错误基址（PictFormat/Picture/PictOp/GlyphSet/Glyph 五种扩展错误）。
 pub const FIRST_ERROR_RENDER: u8 = 150;
 /// RENDER 没有事件（注册表约定用 0）。
@@ -89,17 +99,20 @@ pub struct ExtensionEntry {
 pub const EXTENSIONS: &[ExtensionEntry] = &[
     ExtensionEntry { name: xc_misc::X11_EXTENSION_NAME, opcode: OPCODE_XC_MISC, first_event: 0, event_count: 0, first_error: 0, error_count: 0 },
     ExtensionEntry { name: xtest::X11_EXTENSION_NAME, opcode: OPCODE_XTEST, first_event: 0, event_count: 0, first_error: 0, error_count: 0 },
-    // NyaTerm: **不宣告 XInputExtension**（XI2 Phase 1 暂缓）——XI2 探测链
-    // 每拔出一个雷又冒出下一个（GetExtensionVersion → XIGetProperty →
-    // XIChangeCursor → "Extra reply data"），把"基本可用"拖进崩溃循环。
-    // 回滚到核心设备路径：点击/键盘/悬停/抓取全部实测可用（回归测试覆盖）。
-    // XI2 实现代码保留（xinput.rs + 兜底臂），后续作为正式项目重启。
+    // NyaTerm: XI2 二期（2026-11-10）重新宣告——一期撤下时修复了全部探测雷
+    // （GetExtensionVersion/XIGetProperty/XIChangeCursor/"Extra reply data"），
+    // 二期两轮审计把全部应答改为框架序列化（send_reply，length 按实际字节
+    // 回填，天然免"Extra reply data"）+ 每类型 round-trip 零残留测试 +
+    // 事件投递全类型 wire 断言（mods 16B、Crossing 72B、Focus 56B、按钮
+    // 掩码 bit8 起、抑制矩阵、多客户端）。109+ 测试全绿后由用户实测验收。
+    ExtensionEntry { name: xinput::X11_EXTENSION_NAME, opcode: OPCODE_XINPUT, first_event: 0, event_count: 0, first_error: 0, error_count: 0 },
     ExtensionEntry { name: shape::X11_EXTENSION_NAME, opcode: OPCODE_SHAPE, first_event: FIRST_EVENT_SHAPE, event_count: 1, first_error: 0, error_count: 0 },
     ExtensionEntry { name: xfixes::X11_EXTENSION_NAME, opcode: OPCODE_XFIXES, first_event: FIRST_EVENT_XFIXES, event_count: 2, first_error: FIRST_ERROR_XFIXES, error_count: 1 },
     ExtensionEntry { name: composite::X11_EXTENSION_NAME, opcode: OPCODE_COMPOSITE, first_event: 0, event_count: 0, first_error: 0, error_count: 0 },
     ExtensionEntry { name: render::X11_EXTENSION_NAME, opcode: OPCODE_RENDER, first_event: FIRST_EVENT_RENDER, event_count: 0, first_error: FIRST_ERROR_RENDER, error_count: 5 },
     ExtensionEntry { name: damage::X11_EXTENSION_NAME, opcode: OPCODE_DAMAGE, first_event: FIRST_EVENT_DAMAGE, event_count: 1, first_error: FIRST_ERROR_DAMAGE, error_count: 1 },
     ExtensionEntry { name: bigreq::X11_EXTENSION_NAME, opcode: OPCODE_BIG_REQUESTS, first_event: 0, event_count: 0, first_error: 0, error_count: 0 },
+    ExtensionEntry { name: xkb::X11_EXTENSION_NAME, opcode: OPCODE_XKEYBOARD, first_event: FIRST_EVENT_XKB, event_count: 1, first_error: FIRST_ERROR_XKB, error_count: 1 },
 ];
 
 /// `ExtInfoProvider` 实现：`Request::parse` / `Event::parse` 靠它识别扩展
@@ -170,16 +183,29 @@ impl ExtInfoProvider for ExtTable {
 
 /// `QueryExtension` 的名字查找：返回 `(present, major_opcode, first_event, first_error)`。
 pub fn query_extension(name: &str) -> Option<(u8, u8, u8)> {
+    // 输入协议开关（config.rs）：Core 模式不宣告 XInputExtension——客户端
+    // （GDK/firefox）据此自动退回核心 Motion/Button/Key 路径（兼容排障）。
+    // 只影响新连接的握手查表；其余扩展不受影响。
+    if name.eq_ignore_ascii_case(xinput::X11_EXTENSION_NAME)
+        && !crate::config::xinput_enabled()
+    {
+        return None;
+    }
     EXTENSIONS
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(name))
         .map(|entry| (entry.opcode, entry.first_event, entry.first_error))
 }
 
-/// `ListExtensions` 的名字列表（保持注册表顺序）。
+/// `ListExtensions` 的名字列表（保持注册表顺序；Core 输入协议下不列
+/// XInputExtension——与 `query_extension` 的可见性保持一致）。
 pub fn extension_names() -> Vec<Vec<u8>> {
+    let xinput_hidden = !crate::config::xinput_enabled();
     EXTENSIONS
         .iter()
+        .filter(|entry| {
+            !(xinput_hidden && entry.name == xinput::X11_EXTENSION_NAME)
+        })
         .map(|entry| entry.name.as_bytes().to_vec())
         .collect()
 }
@@ -411,6 +437,7 @@ impl ServerState {
             self.set_shape_kind(request.destination_window, request.destination_kind, result);
         }
         self.mark_compose_dirty();
+        self.shape_notify(request.destination_window, request.destination_kind);
         Ok(())
     }
 
@@ -499,6 +526,7 @@ impl ServerState {
         };
         self.set_shape_kind(request.destination_window, kind, result);
         self.mark_compose_dirty();
+        self.shape_notify(request.destination_window, kind);
         Ok(())
     }
 
@@ -519,6 +547,7 @@ impl ServerState {
         };
         self.set_shape_kind(request.destination_window, request.destination_kind, result);
         self.mark_compose_dirty();
+        self.shape_notify(request.destination_window, request.destination_kind);
         Ok(())
     }
 
@@ -530,6 +559,7 @@ impl ServerState {
         moved.translate(request.x_offset, request.y_offset);
         self.set_shape_kind(request.destination_window, kind, moved);
         self.mark_compose_dirty();
+        self.shape_notify(request.destination_window, kind);
         Ok(())
     }
 
@@ -567,17 +597,73 @@ impl ServerState {
         Ok(())
     }
 
+    /// ShapeSelectInput：登记/撤销形状变化事件选择（SHAPE 协议要求变化时
+    /// 给选择者发 ShapeNotify；GDK 的 shape 支持靠它避免"查询一次然后过期"）。
+    pub fn shape_select_input(
+        &mut self,
+        client: u32,
+        request: &shape::SelectInputRequest,
+    ) -> Result<(), XError> {
+        self.window(request.destination_window)?;
+        let selections = self
+            .shape_event_selections
+            .entry(request.destination_window)
+            .or_default();
+        if request.enable {
+            selections.insert(client);
+        } else {
+            selections.remove(&client);
+        }
+        Ok(())
+    }
+
     pub fn shape_input_selected(&mut self, client: u32, sequence: u16) -> Result<(), XError> {
-        // ShapeSelectInput（形状变化通知）没实现：恒回"没选"
+        // 协议语义：本客户端是否在任何窗口上选择了形状事件
+        let enabled = self
+            .shape_event_selections
+            .values()
+            .any(|set| set.contains(&client));
         self.send_reply(
             client,
             &shape::InputSelectedReply {
-                enabled: false,
+                enabled,
                 sequence,
                 length: 0,
             },
         );
         Ok(())
+    }
+
+    /// 形状变化后向**该窗口上选择了 ShapeNotifyMask 的客户端**发 ShapeNotify。
+    /// 没有选择者时静默（协议语义）。
+    ///
+    /// `shaped` 语义 = 该 kind 是否被**显式设置**（与 QueryExtentsReply 的
+    /// `bounding_shaped` 一致）：取消形状（SET 空）后 shaped=0，extents 回
+    /// 隐式全窗口矩形——真实 X.org 服务器同款行为。
+    pub fn shape_notify(&mut self, window: u32, kind: shape::SK) {
+        let Some(selectors) = self.shape_event_selections.get(&window) else {
+            return;
+        };
+        let clients: Vec<u32> = selectors.iter().copied().collect();
+        let stored = self
+            .shapes
+            .get(&window)
+            .and_then(|shape| match kind {
+                shape::SK::BOUNDING => shape.bounding.as_ref(),
+                shape::SK::CLIP => shape.clip.as_ref(),
+                shape::SK::INPUT => shape.input.as_ref(),
+                _ => None,
+            });
+        let shaped = stored.is_some();
+        let empty = xproto::Rectangle { x: 0, y: 0, width: 0, height: 0 };
+        let extents = match stored {
+            Some(rects) => rects.extents().unwrap_or(empty),
+            None => self.implicit_shape(window).extents().unwrap_or(empty),
+        };
+        for client in clients {
+            let frame = Self::shape_notify_frame_for(window, kind, shaped, extents);
+            self.send_client_event(client, frame);
+        }
     }
 
     pub fn shape_get_rectangles(
@@ -600,17 +686,78 @@ impl ServerState {
                 })
             })
             .collect();
+        // ordering 必须诚实反映矩形列表的真实排布：我们是 `rects.rows()` 逐行展开
+        // ——每行一条 span（height=1）、按 y 递增、行内按 x 递增，同 y 的矩形同高
+        // 且按 x 有序，**这正是 YXBanded 的定义**（band = 同 y 同高的一组，按 x 排序）。
+        // 之前写 UNSORTED 会让 GDK 打印
+        //   `Gdk-WARNING: non YXBanded shape masks not supported`
+        // 然后按 banded 语义解释这份数据（2026-11-11 实测：该告警出现在 firefox
+        // 崩溃前毫秒级、且 X11 标签同时"很卡"，怀疑与反复处理 shape/区域有关）。
+        // 注意 ClipOrdering 的值：Unsorted=0 / YSorted=1 / YXSorted=2 / YXBanded=3。
+        let ordering = xproto::ClipOrdering::YX_BANDED;
+        debug_assert!(
+            {
+                // 不变式：y 非递减；同 y 的矩形 height 一致且 x 递增
+                let mut ok = true;
+                let mut prev_y: Option<i16> = None;
+                let mut prev_x: Option<i16> = None;
+                let mut band_h: Option<u16> = None;
+                for r in &rectangles {
+                    match prev_y {
+                        Some(y) if r.y == y => {
+                            if band_h != Some(r.height) || prev_x.is_some_and(|px| r.x <= px) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        Some(y) if r.y < y => {
+                            ok = false;
+                            break;
+                        }
+                        _ => band_h = Some(r.height),
+                    }
+                    prev_y = Some(r.y);
+                    prev_x = Some(r.x);
+                }
+                ok
+            },
+            "shape 矩形列表必须满足 YXBanded 不变式（否则 ordering 字段就是谎报）"
+        );
         let length = rectangles.len() as u32 * 2;
         self.send_reply(
             client,
             &shape::GetRectanglesReply {
-                ordering: xproto::ClipOrdering::UNSORTED,
+                ordering,
                 sequence,
                 length,
                 rectangles,
             },
         );
         Ok(())
+    }
+
+    /// 编码一条 ShapeNotify 事件帧（事件码 = FIRST_EVENT_SHAPE + 0，
+    /// 发送前由 `send_client_event` 盖写接收方的序列号）。
+    pub(crate) fn shape_notify_frame_for(
+        window: u32,
+        kind: shape::SK,
+        shaped: bool,
+        extents: xproto::Rectangle,
+    ) -> Vec<u8> {
+        shape::NotifyEvent {
+            response_type: FIRST_EVENT_SHAPE + shape::NOTIFY_EVENT,
+            shape_kind: kind,
+            sequence: 0,
+            affected_window: window,
+            extents_x: extents.x,
+            extents_y: extents.y,
+            extents_width: extents.width,
+            extents_height: extents.height,
+            server_time: 0,
+            shaped,
+        }
+        .serialize()
+        .to_vec()
     }
 }
 
@@ -984,6 +1131,32 @@ mod tests {
         assert_eq!(query_extension("BIG-REQUESTS").map(|e| e.0), Some(OPCODE_BIG_REQUESTS));
         assert_eq!(query_extension("XC-MISC").map(|e| e.0), Some(OPCODE_XC_MISC));
         assert_eq!(query_extension("RENDER").map(|e| e.0), Some(OPCODE_RENDER), "RENDER 已注册");
+
+    /// 输入协议开关（task-8）：Core 模式下 QueryExtension("XInputExtension")
+    /// 必须回不存在、ListExtensions 不列它；Xi2 模式恢复后重新可见。
+    #[test]
+    fn core_input_mode_hides_xinput_extension() {
+        crate::config::set_xinput_mode(crate::config::XInputMode::Core);
+        assert_eq!(
+            query_extension("XInputExtension"),
+            None,
+            "Core 模式不得宣告 XInputExtension"
+        );
+        assert!(
+            !extension_names()
+                .iter()
+                .any(|n| n.as_slice() == b"XInputExtension"),
+            "ListExtensions 也不得列出它"
+        );
+        // 其余扩展不受影响
+        assert!(query_extension("XKEYBOARD").is_some(), "XKB 与开关无关");
+
+        crate::config::set_xinput_mode(crate::config::XInputMode::Xi2);
+        assert!(
+            query_extension("XInputExtension").is_some(),
+            "Xi2 模式恢复后重新宣告"
+        );
+    }
         // 事件基址自洽：ExtInfoProvider 与 QueryExtension 用同一组数字
         let table = ExtTable;
         let (_, info) = table
@@ -1156,6 +1329,85 @@ mod tests {
         ok(&mut state, client, 3, Request::ShmDetach(shm::DetachRequest { shmseg: 0x0020_0001 }));
     }
 
+    /// `ShapeGetRectangles` 的 `ordering` 字段必须**诚实反映真实排布**：我们输出的是
+    /// 逐行 span（同 y 同高、行内按 x 有序）= 协议里的 **YXBanded(3)**。
+    ///
+    /// 此前写死 `UNSORTED`，GDK 会打印
+    /// `Gdk-WARNING: non YXBanded shape masks not supported`，然后**仍按 banded
+    /// 语义**解释这份数据。2026-11-11 用户在 firefox 上实测到该告警出现在崩溃前
+    /// 毫秒级（同时 X11 标签"很卡"），所以这里既断言字段值，也断言列表本身满足
+    /// YXBanded 不变式——两者必须同时成立，否则 ordering 就是谎报。
+    #[test]
+    fn shape_get_rectangles_reports_yx_banded_ordering() {
+        let (mut state, client, mut rx) = fixture();
+        let window = 0x0021_0001u32;
+        ok(&mut state, client, 1, Request::CreateWindow(xproto::CreateWindowRequest {
+            depth: 0,
+            wid: window,
+            parent: super::super::handshake::ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            border_width: 0,
+            class: xproto::WindowClass::INPUT_OUTPUT,
+            visual: 0,
+            value_list: Cow::default(),
+        }));
+        state.map_window(window, 2).unwrap();
+
+        // L 形 bounding：上半 64 宽、下半只留左边 16 像素
+        ok(&mut state, client, 3, Request::ShapeRectangles(shape::RectanglesRequest {
+            operation: shape::SO::SET,
+            destination_kind: shape::SK::BOUNDING,
+            ordering: xproto::ClipOrdering::YX_BANDED,
+            destination_window: window,
+            x_offset: 0,
+            y_offset: 0,
+            rectangles: Cow::Owned(vec![
+                xproto::Rectangle { x: 0, y: 0, width: 64, height: 32 },
+                xproto::Rectangle { x: 0, y: 32, width: 16, height: 32 },
+            ]),
+        }));
+
+        while rx.try_recv().is_ok() {} // 清掉前面的回复，只留 GetRectangles
+        ok(&mut state, client, 4, Request::ShapeGetRectangles(shape::GetRectanglesRequest {
+            window,
+            source_kind: shape::SK::BOUNDING,
+        }));
+        let frame = rx.try_recv().expect("ShapeGetRectangles 应当有回复");
+
+        // ① wire 偏移 1 就是 ordering；协议值 YXBanded = 3
+        assert_eq!(frame[0], 1, "回复类型");
+        assert_eq!(
+            frame[1], 3,
+            "ordering 必须是 YXBanded(3)：写 UNSORTED 会让 GDK 打印 non YXBanded 告警"
+        );
+        let (reply, _) = shape::GetRectanglesReply::try_parse(&frame).expect("解析回复");
+        assert_eq!(u8::from(reply.ordering), 3);
+
+        // ② 列表本身必须真是 YXBanded：y 非递减；同 y 内 height 一致且 x 递增
+        let mut prev_y: Option<i16> = None;
+        let mut prev_x: Option<i16> = None;
+        let mut band_h: Option<u16> = None;
+        let mut area: i64 = 0;
+        for r in &reply.rectangles {
+            match prev_y {
+                Some(y) if r.y == y => {
+                    assert_eq!(band_h, Some(r.height), "同一 band 内 height 必须一致");
+                    assert!(prev_x.is_none_or(|px| r.x > px), "同一 band 内 x 必须递增");
+                }
+                Some(y) => assert!(r.y > y, "y 必须非递减（yx-banded 的前提）"),
+                None => band_h = Some(r.height),
+            }
+            prev_y = Some(r.y);
+            prev_x = Some(r.x);
+            area += i64::from(r.width) * i64::from(r.height);
+        }
+        // ③ 面积守恒：L 形 = 64*32 + 16*32
+        assert_eq!(area, 64 * 32 + 16 * 32, "区域面积必须与设置的一致");
+    }
+
     #[test]
     fn shape_rectangles_affect_extents_and_hit_testing() {
         let (mut state, client, _rx) = fixture();
@@ -1203,6 +1455,169 @@ mod tests {
             window,
             source_kind: shape::SK::BOUNDING,
         }));
+    }
+
+    /// GetRectangles 应答的 `ordering` 字节（偏移 1）必须诚实为 **YXBanded=3**，
+    /// 且矩形集合满足 YXBanded 不变式（同 y 同高、行内 x 递增、y 非递减）。
+    /// 回归点：曾谎报 UNSORTED，GDK 打印
+    /// `Gdk-WARNING: non YXBanded shape masks not supported`（2026-11-11
+    /// 实测：告警出现在 firefox 崩溃前毫秒级，且伴随 X11 标签"很卡"）。
+    #[test]
+    fn get_rectangles_reply_declares_yx_banded_ordering() {
+        let (mut state, client, mut rx) = fixture();
+        let window = 0x0020_0001u32;
+        ok(&mut state, client, 1, Request::CreateWindow(xproto::CreateWindowRequest {
+            depth: 0,
+            wid: window,
+            parent: super::super::handshake::ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            border_width: 0,
+            class: xproto::WindowClass::INPUT_OUTPUT,
+            visual: 0,
+            value_list: Cow::default(),
+        }));
+        ok(&mut state, client, 2, Request::ShapeRectangles(shape::RectanglesRequest {
+            operation: shape::SO::SET,
+            destination_kind: shape::SK::BOUNDING,
+            ordering: xproto::ClipOrdering::UNSORTED,
+            destination_window: window,
+            x_offset: 0,
+            y_offset: 0,
+            rectangles: Cow::Owned(vec![
+                xproto::Rectangle { x: 0, y: 0, width: 64, height: 32 },
+                xproto::Rectangle { x: 0, y: 32, width: 16, height: 32 },
+            ]),
+        }));
+
+        ok(&mut state, client, 3, Request::ShapeGetRectangles(shape::GetRectanglesRequest {
+            window,
+            source_kind: shape::SK::BOUNDING,
+        }));
+        let frame = rx.try_recv().expect("GetRectangles 应当有回复");
+        // **字节级断言**：应答偏移 1 的 ordering == YXBanded(3)
+        assert_eq!(frame[1], 3, "ordering 必须是 YXBanded=3（GDK 的 banded 快速路径）");
+        // 变长部分直接从应答字节解码矩形，检查 YXBanded 不变式
+        let rect_count = u16::from_ne_bytes([frame[8], frame[9]]) as usize;
+        assert!(rect_count > 0);
+        let mut prev_y: Option<i16> = None;
+        let mut prev_x: Option<i16> = None;
+        let mut band_h: Option<u16> = None;
+        for i in 0..rect_count {
+            let base = 32 + i * 8;
+            let x = i16::from_ne_bytes(frame[base..base + 2].try_into().unwrap());
+            let y = i16::from_ne_bytes(frame[base + 2..base + 4].try_into().unwrap());
+            let w = u16::from_ne_bytes(frame[base + 4..base + 6].try_into().unwrap());
+            let h = u16::from_ne_bytes(frame[base + 6..base + 8].try_into().unwrap());
+            match prev_y {
+                Some(py) if y == py => {
+                    assert_eq!(band_h, Some(h), "同 band 的矩形必须同高");
+                    assert!(prev_x.is_some_and(|px| x > px), "band 内按 x 递增");
+                }
+                Some(py) => assert!(y > py, "y 必须递增（band 边界）"),
+                None => {}
+            }
+            prev_y = Some(y);
+            prev_x = Some(x);
+            band_h = Some(h);
+        }
+    }
+
+    /// ShapeNotify：形状变化必须发给**选择了** ShapeNotifyMask 的客户端，
+    /// 未选择者不得收到；ShapeInputSelected 如实回报告。
+    #[test]
+    fn shape_notify_is_sent_only_to_selecting_clients() {
+        let (mut state, client, mut rx) = fixture();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        state.register_client(1, tx2);
+        let window = 0x0020_0001u32;
+        ok(&mut state, client, 1, Request::CreateWindow(xproto::CreateWindowRequest {
+            depth: 0,
+            wid: window,
+            parent: super::super::handshake::ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+            border_width: 0,
+            class: xproto::WindowClass::INPUT_OUTPUT,
+            visual: 0,
+            value_list: Cow::default(),
+        }));
+        // 客户端 0 选择形状事件；客户端 1 不选
+        ok(&mut state, client, 2, Request::ShapeSelectInput(shape::SelectInputRequest {
+            destination_window: window,
+            enable: true,
+        }));
+        ok(&mut state, client, 3, Request::ShapeInputSelected(shape::InputSelectedRequest {
+            destination_window: window,
+        }));
+        let frame = rx.try_recv().expect("InputSelected 应当有回复");
+        let (reply, _) = shape::InputSelectedReply::try_parse(&frame).expect("应能解析");
+        assert!(reply.enabled, "已选择 → InputSelected 必须回 true");
+
+        // 改形状 → 选择者收到 ShapeNotify，未选择者收不到
+        ok(&mut state, client, 4, Request::ShapeRectangles(shape::RectanglesRequest {
+            operation: shape::SO::SET,
+            destination_kind: shape::SK::BOUNDING,
+            ordering: xproto::ClipOrdering::UNSORTED,
+            destination_window: window,
+            x_offset: 0,
+            y_offset: 0,
+            rectangles: Cow::Owned(vec![xproto::Rectangle { x: 0, y: 0, width: 32, height: 64 }]),
+        }));
+        let notify = rx.try_recv().expect("选择者必须收到 ShapeNotify");
+        assert_eq!(notify[0], FIRST_EVENT_SHAPE, "事件码 = SHAPE 的 event base");
+        assert_eq!(notify[1], u8::from(shape::SK::BOUNDING), "shape_kind = Bounding");
+        let affected = u32::from_ne_bytes(notify[4..8].try_into().unwrap());
+        assert_eq!(affected, window, "affected_window 字段");
+        let (event, _) = shape::NotifyEvent::try_parse(&notify).expect("ShapeNotify 必须能解析");
+        assert!(event.shaped, "有形状 → shaped=true");
+        assert_eq!(event.extents_width, 32);
+
+        assert!(
+            rx2.try_recv().is_err(),
+            "未选择者严禁收到 ShapeNotify"
+        );
+
+        // 取消选择后 InputSelected 如实回 false
+        ok(&mut state, client, 5, Request::ShapeSelectInput(shape::SelectInputRequest {
+            destination_window: window,
+            enable: false,
+        }));
+        ok(&mut state, client, 6, Request::ShapeInputSelected(shape::InputSelectedRequest {
+            destination_window: window,
+        }));
+        let frame = rx.try_recv().expect("InputSelected 应当有回复");
+        let (reply, _) = shape::InputSelectedReply::try_parse(&frame).expect("应能解析");
+        assert!(!reply.enabled);
+
+        // 重新选择后：SET 空区域 = 取消形状 → shaped=false 的边界事件
+        ok(&mut state, client, 7, Request::ShapeSelectInput(shape::SelectInputRequest {
+            destination_window: window,
+            enable: true,
+        }));
+        assert!(
+            rx.try_recv().is_err() && rx2.try_recv().is_err(),
+            "step8 之前两个通道都不得有滞留帧"
+        );
+        ok(&mut state, client, 8, Request::ShapeRectangles(shape::RectanglesRequest {
+            operation: shape::SO::SET,
+            destination_kind: shape::SK::BOUNDING,
+            ordering: xproto::ClipOrdering::UNSORTED,
+            destination_window: window,
+            x_offset: 0,
+            y_offset: 0,
+            rectangles: Cow::Owned(Vec::new()),
+        }));
+        let notify = rx.try_recv().expect("取消形状也必须发 ShapeNotify");
+        let (event, _) = shape::NotifyEvent::try_parse(&notify).expect("应能解析");
+        assert!(!event.shaped, "SET 空区域 → shaped=0");
+        // 取消形状后 extents 回隐式全窗口矩形（真实 X.org 行为）
+        assert_eq!(event.extents_width, 64, "无形状 → extents = 隐式窗口矩形");
+        assert_eq!(event.extents_height, 64);
     }
 
     /// 回复的 `length` 字段必须与总长自洽（单位 4 字节，不含 32 字节固定头）。

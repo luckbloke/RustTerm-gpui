@@ -1,4 +1,4 @@
-﻿//! 服务端共享状态：资源表、atom 表、窗口树和屏幕像素。
+//! 服务端共享状态：资源表、atom 表、窗口树和屏幕像素。
 //!
 //! 所有客户端连接共享同一份 `ServerState`（X11 的资源本来就是跨连接可见的：
 //! 一个客户端创建的窗口，另一个客户端可以查询、绘制、监听事件）。并发访问用
@@ -199,6 +199,18 @@ pub struct PixmapData {
     pub height: u16,
     pub pixels: Vec<u32>,
     pub owner: u32,
+}
+impl Clone for PixmapData {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            depth: self.depth,
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.clone(),
+            owner: self.owner,
+        }
+    }
 }
 
 /// 图形上下文。M1 只实现影响核心绘制的那部分字段，其余字段照收不报错。
@@ -416,6 +428,9 @@ pub struct ServerState {
     pub cursors: HashMap<Cursor, CursorRef>,
     /// 窗口的 SHAPE 形状（`extensions.rs` 的 SHAPE 请求维护，合成与命中测试消费）。
     pub shapes: HashMap<Window, WindowShape>,
+    /// SHAPE 事件选择（`ShapeSelectInput`）：窗口 → 选择它的客户端集合。
+    /// 形状变化时向选择者发 ShapeNotify（`extensions.rs` 的 shape_notify）。
+    pub shape_event_selections: HashMap<Window, std::collections::HashSet<u32>>,
     /// XFIXES Region ID → 矩形区域（`region.rs` 的规范形）。
     pub regions: HashMap<u32, Rects>,
     /// DAMAGE 的 damage ID → 记录（compose 后按 dirty 发 DamageNotify）。
@@ -522,6 +537,7 @@ impl ServerState {
             fonts: HashMap::new(),
             cursors: HashMap::new(),
             shapes: HashMap::new(),
+            shape_event_selections: HashMap::new(),
             regions: HashMap::new(),
             damages: HashMap::new(),
             pictures: HashMap::new(),

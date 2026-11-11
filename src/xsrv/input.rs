@@ -490,37 +490,91 @@ impl ServerState {
         e.extend_from_slice(&evtype.to_ne_bytes());
         e.extend_from_slice(&deviceid.to_ne_bytes());
         e.extend_from_slice(&0u32.to_ne_bytes()); // time（见核心路径的同款取舍）
-        e.extend_from_slice(&detail.to_ne_bytes());
-        e.extend_from_slice(&ROOT_WINDOW.to_ne_bytes());
-        e.extend_from_slice(&event_window.to_ne_bytes());
-        e.extend_from_slice(&child.to_ne_bytes());
-        e.extend_from_slice(&fp(x)); // root_x
-        e.extend_from_slice(&fp(y)); // root_y
-        e.extend_from_slice(&fp((x as i32 - origin_x) as i16)); // event_x
-        e.extend_from_slice(&fp((y as i32 - origin_y) as i16)); // event_y
-        e.extend_from_slice(&sourceid.to_ne_bytes());
-        e.extend_from_slice(&0u16.to_ne_bytes()); // pad
-        e.extend_from_slice(&0u32.to_ne_bytes()); // flags
-        // buttons：1 个 u32 字（位 8.. = 按钮 1..；按下掩码位 1<<(7+n) 对应位 (n-1+8)）
-        e.extend_from_slice(&1u16.to_ne_bytes()); // buttons_len（字数）
-        e.extend_from_slice(&0u16.to_ne_bytes()); // valuators_len（字数）
-        // mods（16B）：base/latched/locked/effective —— 只填 effective
-        e.extend_from_slice(&state_mask.to_ne_bytes()); // base_mods
-        e.extend_from_slice(&0u32.to_ne_bytes()); // latched
-        e.extend_from_slice(&0u32.to_ne_bytes()); // locked
-        e.extend_from_slice(&state_mask.to_ne_bytes()); // effective
-        // group（4B）
-        e.extend_from_slice(&[0u8; 4]);
-        // 按钮掩码（buttons_len * 4 字节）：bit (n-1+8) = 按钮 n
-        let mut bm = [0u32; 1];
-        for b in 1..=5u16 {
-            if buttons & (1u16 << (7 + b)) != 0 {
-                bm[0] |= 1u32 << (b - 1 + 8);
+        // 偏移 16..20 的语义**按事件族不同**（XI2proto.h 权威布局）：
+        //  - 设备事件（xXIDeviceEvent）：detail 是 u32
+        //  - Enter/Leave/FocusIn/FocusOut（xXIEnterEvent，Focus 是同结构别名）：
+        //    sourceid(2) + mode(1) + detail(1)
+        // 这里曾经一律写 detail(u32) → Enter/Focus 帧里 **sourceid 从未写入**，
+        // GDK 在偏移 16 读到 0 → 设备表查 0 号 → NULL → GDK_IS_DEVICE
+        // criticals（firefox 启动即崩，实测三连 critical 正是 XI_Enter 分支）。
+        let enter_family = matches!(evtype, 7 | 8 | 9 | 10);
+        if enter_family {
+            e.extend_from_slice(&sourceid.to_ne_bytes()); // 16: sourceid
+            e.push(0); // 18: mode = XINotifyNormal
+            e.push(3); // 19: detail = XINotifyNonlinear（指针跨窗口，与真实 X 一致）
+        } else {
+            e.extend_from_slice(&detail.to_ne_bytes()); // 16: detail
+        }
+        e.extend_from_slice(&ROOT_WINDOW.to_ne_bytes()); // 20 root
+        e.extend_from_slice(&event_window.to_ne_bytes()); // 24 event
+        e.extend_from_slice(&child.to_ne_bytes()); // 28 child
+        // mods（xXIModifierInfo：base/latched/locked/effective 各 u32 = 16B）。
+        let write_mods = |e: &mut Vec<u8>| {
+            e.extend_from_slice(&u32::from(state_mask).to_ne_bytes()); // base
+            e.extend_from_slice(&0u32.to_ne_bytes()); // latched
+            e.extend_from_slice(&0u32.to_ne_bytes()); // locked
+            e.extend_from_slice(&u32::from(state_mask).to_ne_bytes()); // effective
+        };
+        // group（xXIGroupInfo：base/latched/locked/effective 各 u8 = 4B）
+        let write_group = |e: &mut Vec<u8>| {
+            e.extend_from_slice(&[0u8; 4]);
+        };
+        // XI2 事件布局按 evtype 分两族（XI2proto.h）：
+        // - 设备事件（Motion/Key/Button）：xXIDeviceEvent，88B：坐标(32..48)、
+        //   buttons_len(48)、valuators_len(50)、sourceid(52)、pad(54)、
+        //   flags(56)、mods(60)、group(76)、按钮掩码(80)、valuator 掩码(84)
+        // - Enter/Leave/FocusIn/FocusOut：xXIEnterEvent（Focus 是它的 typedef
+        //   别名）：坐标(32..48)、same_screen(48 BOOL u32)、focus(52 BOOL u32)、
+        //   buttons_len(56)+pad、mods(60)、group(76)、按钮掩码(80)
+        //   = 84B。**固定部分必须 ≥ sizeof(xXIEnterEvent)=80B**——不足的话
+        //   libXi wireToEnterLeave 判 event_bytes < sizeof(*in) 直接整帧丢弃
+        //   （焦点/跨越事件静默消失）。
+        match evtype {
+            7 | 8 | 9 | 10 => {
+                e.extend_from_slice(&fp(x)); // 32 root_x
+                e.extend_from_slice(&fp(y)); // 36 root_y
+                e.extend_from_slice(&fp((x as i32 - origin_x) as i16)); // 40 event_x
+                e.extend_from_slice(&fp((y as i32 - origin_y) as i16)); // 44 event_y
+                e.push(1); // 48 same_screen = TRUE（BOOL 在 X11 线格式里是 **1 字节**）
+                let is_focus = matches!(evtype, 9 | 10);
+                e.push(u8::from(is_focus)); // 49 focus
+                e.extend_from_slice(&0u16.to_ne_bytes()); // 50 buttons_len = 0（无尾随掩码）
+                write_mods(&mut e); // 52..68
+                write_group(&mut e); // 68..72
+                // 到此 72 字节 = sizeof(xXIEnterEvent)（BOOL 1 字节版）。
+                // 再补 16 字节零填充，让 libXi 的 `event_bytes < sizeof(*in)`
+                // 下限校验在两种 BOOL 解释下都通过（BOOL=4B 时 sizeof=80）。
+                // 多余尾字节会被按偏移读取的实现忽略；length 字段随实际长度
+                // 自洽（send 前由 deliver_xi2_input 回填），不会造成流错位。
+                e.extend_from_slice(&[0u8; 16]); // 72..88
+            }
+            _ => {
+                e.extend_from_slice(&fp(x)); // 32 root_x
+                e.extend_from_slice(&fp(y)); // 36 root_y
+                e.extend_from_slice(&fp((x as i32 - origin_x) as i16)); // 40 event_x
+                e.extend_from_slice(&fp((y as i32 - origin_y) as i16)); // 44 event_y
+                e.extend_from_slice(&1u16.to_ne_bytes()); // 48 buttons_len（字数）
+                // valuators_len = 1：**必须留出这一个字**——GDK 的 translate_axes
+                // 会按设备轴数读掩码字节，valuators_len=0 时它仍可能读到帧尾之外
+                // （越界读）。发一个全零掩码字最安全（没有置位 → 不读值）。
+                e.extend_from_slice(&1u16.to_ne_bytes()); // 50 valuators_len
+                e.extend_from_slice(&sourceid.to_ne_bytes()); // 52 sourceid
+                e.extend_from_slice(&0u16.to_ne_bytes()); // 54 pad0
+                e.extend_from_slice(&0u32.to_ne_bytes()); // 56 flags
+                write_mods(&mut e); // 60..76
+                write_group(&mut e); // 76..80
+                // 80：按钮掩码（buttons_len * 4 字节）；bit (n+7) = 按钮 n
+                let mut bm = 0u32;
+                for b in 1..=5u16 {
+                    if buttons & (1u16 << (7 + b)) != 0 {
+                        bm |= 1u32 << (b - 1 + 8);
+                    }
+                }
+                e.extend_from_slice(&bm.to_ne_bytes());
+                // 84：valuators 掩码 1 字（全零）→ 共 88 字节
+                e.extend_from_slice(&[0u8; 4]);
             }
         }
-        e.extend_from_slice(&bm[0].to_ne_bytes());
-        // valuators：len=0 → 掩码 4 字节（零）即可，无值
-        e.extend_from_slice(&[0u8; 4]);
         e
     }
 
@@ -541,6 +595,9 @@ impl ServerState {
         // deviceid 语义：指针类事件用 VCP/ALL_MASTER 的选择，键盘类用 VCK/ALL
         let key_like = matches!(evtype, 2 | 3 | 9 | 10);
         let deviceid = if key_like { device_id::VCK } else { device_id::VCP };
+        // sourceid 同族：键盘/焦点事件由主键盘"产生"（真实 X.org 里是物理从
+        // 键盘；我们无从设备，用 VCK 保证 GDK 查表非 NULL 且语义一致）
+        let sourceid = if key_like { device_id::VCK } else { sourceid };
 
         // 1) 链上第一个有 XI2 选择的窗口
         let mut current = start;
@@ -575,6 +632,27 @@ impl ServerState {
         frame[4..8].copy_from_slice(&len_units.to_ne_bytes());
 
         // 3) 发给该窗口上选择了该事件的全部 XI2 客户端（按各自序列号盖写）
+        // 白屏/criticals 排查：限频（≥1s）记录每个 XI2 事件的投递要素。
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+            let now_ms = {
+                use std::sync::OnceLock;
+                static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+                EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+            };
+            let last = LAST_LOG_MS.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) >= 1000
+                && LAST_LOG_MS
+                    .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                crate::xsrv::log_line(format_args!(
+                    "[xi2-deliver] evtype={} deviceid={} sourceid={} win={:#x} start={:#x} detail={} xy=({},{}) buttons={:#x} state={:#x}",
+                    evtype, deviceid, sourceid, win_id, start, detail, x, y, buttons, state_mask,
+                ));
+            }
+        }
         let Some(selectors) = self.xi2_selections.get(&win_id) else {
             return true;
         };
@@ -820,7 +898,9 @@ let motion_mask = if self.input.button_mask == 0 {
                 u32::from(EventMask::BUTTON_PRESS),
                 4, // XI_ButtonPress
                 u32::from(button),
-                self.input.button_mask,
+                // XI2 帧的按钮掩码反映**按下之后**的状态（核心 state 字段仍不含
+                // 本按钮，保持 X 核心协议语义不变）
+                self.input.button_mask | bit,
                 state,
                 |event, child, event_x, event_y| {
                     ButtonPressEvent {
@@ -1513,12 +1593,464 @@ mod tests {
         let root_y = i32::from_ne_bytes(frame[36..40].try_into().unwrap());
         assert_eq!((root_x / 65536, root_y / 65536), (100, 60));
 
-        // buttons_len（variable 起点 32+16=48 → 偏移 56..58）= 1 字
-        let buttons_len = u16::from_ne_bytes(frame[56..58].try_into().unwrap());
-        assert_eq!(buttons_len, 1, "按钮掩码 1 个 u32 字");
+        // xXIDeviceEvent：buttons_len 在 48..50（valuators_len 50..52、sourceid 52..54）
+        let buttons_len = u16::from_ne_bytes(frame[48..50].try_into().unwrap());
+        assert_eq!(buttons_len, 1, "按钮掩码 1 个 u32 字（偏移 48）");
+        let valuators_len = u16::from_ne_bytes(frame[50..52].try_into().unwrap());
+        assert_eq!(valuators_len, 1, "valuator 掩码 1 个 u32 字（偏移 50）");
+        assert_eq!(
+            u32::from_ne_bytes(frame[84..88].try_into().unwrap()),
+            0,
+            "valuator 掩码字本身在 84..88（全零；缺了它 GDK translate_axes 会越界读）"
+        );
+        let sourceid = u16::from_ne_bytes(frame[52..54].try_into().unwrap());
+        assert_eq!(sourceid, device_id::VCP, "sourceid 在偏移 52（不是 16）");
 
-        // mods.effective（60..62 的低 16 位）= 无按键按下 = 0
-        let effective = u16::from_ne_bytes(frame[68..70].try_into().unwrap());
+        // mods.effective（mods 起点 60：base 60..64, latched 64..68, locked
+        // 68..72, effective 72..76 的低 16 位）= 无按键按下 = 0
+        let effective = u16::from_ne_bytes(frame[72..74].try_into().unwrap());
         assert_eq!(effective, 0, "无修饰键按下");
+    }
+
+    // ==== XI2 全事件类型 wire 测试（任务 XI2 二期-B）====
+    //
+    // 共用小工具：额外客户端、XI2 选择、按 GenericEvent(35)/核心事件分流。
+
+    /// 注册第 `id` 号客户端并返回其接收通道。
+    fn extra_client(
+        state: &mut ServerState,
+        id: u32,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.register_client(id, tx);
+        rx
+    }
+
+    /// XIQueryVersion + 在 `window` 上以 AllMasterDevices 选择一组 XI2 掩码。
+    fn xi2_select(
+        state: &mut ServerState,
+        client: u32,
+        seq: &mut u16,
+        window: u32,
+        masks: &[xinput::XIEventMask],
+    ) {
+        ok(state, client, *seq, Request::XinputXIQueryVersion(xinput::XIQueryVersionRequest {
+            major_version: 2,
+            minor_version: 4,
+        }));
+        *seq += 1;
+        ok(state, client, *seq, Request::XinputXISelectEvents(xinput::XISelectEventsRequest {
+            window,
+            masks: Cow::Owned(vec![xinput::EventMask {
+                deviceid: xinput::DeviceId::from(device_id::ALL_MASTER),
+                mask: masks.to_vec(),
+            }]),
+        }));
+        *seq += 1;
+    }
+
+    /// 清空通道并分流：GenericEvent（type=35）按 evtype 收集，核心事件按
+    /// response_type 计数。返回 (generic 帧, 核心 response_type → 次数)。
+    fn drain_events(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> (
+        Vec<(u16, Vec<u8>)>,
+        std::collections::HashMap<u8, usize>,
+    ) {
+        let mut generic = Vec::new();
+        let mut core: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() < 32 {
+                continue;
+            }
+            if frame[0] == 35 {
+                let evtype = u16::from_ne_bytes(frame[8..10].try_into().unwrap());
+                generic.push((evtype, frame));
+            } else {
+                *core.entry(frame[0]).or_insert(0) += 1;
+            }
+        }
+        (generic, core)
+    }
+
+    /// 取某 evtype 的第一个 GenericEvent 帧。
+    fn take_generic(generic: &[(u16, Vec<u8>)], evtype: u16) -> Vec<u8> {
+        generic
+            .iter()
+            .find(|(t, _)| *t == evtype)
+            .map(|(_, f)| f.clone())
+            .unwrap_or_else(|| panic!("必须收到 XI2 GenericEvent(evtype={evtype})"))
+    }
+
+    /// 断言 GenericEvent 信封自洽：extension 操作码 + length 字段 = 尾部字节数。
+    fn assert_envelope(frame: &[u8]) {
+        assert_eq!(frame[1], crate::xsrv::extensions::OPCODE_XINPUT, "extension 操作码");
+        let len_units = u32::from_ne_bytes(frame[4..8].try_into().unwrap());
+        assert_eq!(
+            frame.len() as u32,
+            32 + len_units * 4,
+            "length 必须等于信封之后的字节数/4"
+        );
+    }
+
+    /// XI2 KeyPress(2)/KeyRelease(3) wire 布局：detail=keycode、deviceid=VCK(3)、
+    /// mods.effective 反映当前修饰键状态；核心 KeyPress/Release 被抑制。
+    #[test]
+    fn xi2_key_press_release_wire_layout() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win);
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            win,
+            &[xinput::XIEventMask::KEY_PRESS, xinput::XIEventMask::KEY_RELEASE],
+        );
+
+        // 焦点默认 PointerRoot，指针 (0,0) 命中 win → 键盘事件目标是 win。
+        // Shift_L 按下 → q 按下（state 含 Shift）→ Shift 抬起 → q 抬起（state 干净）。
+        state.key_event(50, true, false);
+        state.key_event(24, true, false);
+        state.key_event(50, false, false);
+        state.key_event(24, false, false);
+
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&2), None, "XI2 客户端不得收到核心 KeyPress");
+        assert_eq!(core.get(&3), None, "XI2 客户端不得收到核心 KeyRelease");
+
+        // 取 keycode=24（q）的 KeyPress：Shift_L(50) 的按下事件先到，按 detail 过滤
+        let press = generic
+            .iter()
+            .find(|(t, f)| {
+                *t == 2 && u32::from_ne_bytes(f[16..20].try_into().unwrap()) == 24
+            })
+            .map(|(_, f)| f.clone())
+            .expect("必须收到 keycode=24 的 XI2 KeyPress");
+        assert_envelope(&press);
+        assert_eq!(
+            press.len(),
+            32 + 56,
+            "xXIDeviceEvent 88 字节（32 头 + 16 坐标 + buttons/valuators/sourceid/pad/flags 12 + 16 mods + 4 group + 4 按钮掩码 + 4 valuator 掩码）"
+        );
+        let evtype = u16::from_ne_bytes(press[8..10].try_into().unwrap());
+        assert_eq!(evtype, 2, "XI_KeyPress");
+        let deviceid = u16::from_ne_bytes(press[10..12].try_into().unwrap());
+        assert_eq!(deviceid, device_id::VCK, "键盘事件 deviceid = VCK(3)");
+        let detail = u32::from_ne_bytes(press[16..20].try_into().unwrap());
+        assert_eq!(detail, 24, "detail = keycode");
+        let event = u32::from_ne_bytes(press[24..28].try_into().unwrap());
+        assert_eq!(event, win, "事件窗口 = 选择 XI2 的窗口");
+        let sourceid = u16::from_ne_bytes(press[52..54].try_into().unwrap());
+        assert_eq!(sourceid, device_id::VCK, "sourceid 在协议偏移 52；键盘事件源 = VCK");
+        let buttons_len = u16::from_ne_bytes(press[48..50].try_into().unwrap());
+        assert_eq!(buttons_len, 1);
+        let base = u16::from_ne_bytes(press[60..62].try_into().unwrap());
+        assert_eq!(base, MASK_SHIFT, "mods.base 含 Shift");
+        let effective = u16::from_ne_bytes(press[72..74].try_into().unwrap());
+        assert_eq!(effective, MASK_SHIFT, "mods.effective 反映按住的 Shift");
+        let button_mask_word = u32::from_ne_bytes(press[80..84].try_into().unwrap());
+        assert_eq!(button_mask_word, 0, "键盘事件无按钮按下");
+
+        let release = generic
+            .iter()
+            .find(|(t, f)| {
+                *t == 3 && u32::from_ne_bytes(f[16..20].try_into().unwrap()) == 24
+            })
+            .map(|(_, f)| f.clone())
+            .expect("必须收到 keycode=24 的 XI2 KeyRelease");
+        let detail = u32::from_ne_bytes(release[16..20].try_into().unwrap());
+        assert_eq!(detail, 24, "Release detail = keycode");
+        let effective = u16::from_ne_bytes(release[72..74].try_into().unwrap());
+        assert_eq!(effective, 0, "修饰键全部抬起后 effective = 0");
+    }
+
+    /// XI2 ButtonPress(4)/ButtonRelease(5) wire 布局：detail=按钮号、
+    /// buttons 掩码字反映按下状态（按钮 n → bit 8+n-1）；press 的 state 不含
+    /// 本次按下的键。核心 ButtonPress/Release 被抑制。
+    #[test]
+    fn xi2_button_press_release_wire_layout() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win);
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            win,
+            &[xinput::XIEventMask::BUTTON_PRESS, xinput::XIEventMask::BUTTON_RELEASE],
+        );
+
+        state.input.pointer_x = 50;
+        state.input.pointer_y = 50;
+        state.pointer_button(1, true);
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&4), None, "不得收到核心 ButtonPress");
+        let press = take_generic(&generic, 4);
+        assert_envelope(&press);
+        assert_eq!(press.len(), 32 + 56, "xXIDeviceEvent 88 字节（含 valuator 掩码字）");
+        let evtype = u16::from_ne_bytes(press[8..10].try_into().unwrap());
+        assert_eq!(evtype, 4, "XI_ButtonPress");
+        assert_eq!(u16::from_ne_bytes(press[10..12].try_into().unwrap()), device_id::VCP);
+        assert_eq!(u32::from_ne_bytes(press[16..20].try_into().unwrap()), 1, "detail = 按钮号");
+        assert_eq!(u32::from_ne_bytes(press[24..28].try_into().unwrap()), win);
+        // X 语义：ButtonPress 的 state 不含本次按下的键
+        assert_eq!(u32::from_ne_bytes(press[72..76].try_into().unwrap()), 0, "press 的 effective（mods 60..76 末字段）不含本按钮");
+        let buttons = u32::from_ne_bytes(press[80..84].try_into().unwrap());
+        assert_eq!(buttons, 1 << 8, "按钮 1 按下 → 掩码 bit 8");
+
+        state.pointer_button(1, false);
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&5), None, "不得收到核心 ButtonRelease");
+        let release = take_generic(&generic, 5);
+        assert_eq!(
+            u32::from_ne_bytes(release[80..84].try_into().unwrap()),
+            0,
+            "抬起后按钮掩码清零"
+        );
+        assert_eq!(
+            u16::from_ne_bytes(release[72..74].try_into().unwrap()),
+            0,
+            "Release 的 state 同样不含该按钮"
+        );
+    }
+
+    /// XI2 Enter(7)/Leave(8) 逐字段：xXIEnterEvent 是 72 字节布局（mode 在
+    /// 70..72 的 u16），不是设备事件的 88 字节——GDK 按 Crossing 布局解析。
+    #[test]
+    fn xi2_enter_leave_wire_layout() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win);
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            win,
+            &[xinput::XIEventMask::ENTER, xinput::XIEventMask::LEAVE],
+        );
+
+        // 指针在窗外 → 进入 → 离开
+        state.pointer_motion(400, 400);
+        state.pointer_motion(50, 50);
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&7), None, "不得收到核心 EnterNotify");
+        let enter = take_generic(&generic, 7);
+        assert_envelope(&enter);
+        assert_eq!(
+            enter.len(),
+            88,
+            "xXIEnterEvent 本体 72B（BOOL 1B：same_screen@48 focus@49 buttons_len@50 mods@52 group@68）+ 16B 稳健填充"
+        );
+        let evtype = u16::from_ne_bytes(enter[8..10].try_into().unwrap());
+        assert_eq!(evtype, 7, "XI_Enter");
+        assert_eq!(u16::from_ne_bytes(enter[10..12].try_into().unwrap()), device_id::VCP);
+        // xXIEnterEvent：sourceid 在 16..18、mode 在 18、detail 在 19
+        assert_eq!(
+            u16::from_ne_bytes(enter[16..18].try_into().unwrap()),
+            device_id::VCP,
+            "sourceid 在偏移 16（此前漏写 → GDK 读到 0 → 设备表查 0 → NULL criticals）"
+        );
+        assert_eq!(enter[18], 0, "mode = XINotifyNormal");
+        assert_eq!(enter[19], 3, "detail = XINotifyNonlinear");
+        // 尾部布局（BOOL 1 字节）：same_screen@48、focus@49、buttons_len@50、
+        // mods@52..68、group@68..72。整帧必须正好 72 字节。
+        assert_eq!(enter[48], 1, "same_screen@48（BOOL 1 字节，不是 u32）");
+        assert_eq!(enter[49], 0, "focus@49（Enter 时无焦点）");
+        assert_eq!(
+            u16::from_ne_bytes(enter[50..52].try_into().unwrap()),
+            0,
+            "buttons_len@50 = 0（无尾随按钮掩码）"
+        );
+        assert_eq!(u32::from_ne_bytes(enter[24..28].try_into().unwrap()), win, "event 在 24");
+        assert_eq!(u32::from_ne_bytes(enter[64..68].try_into().unwrap()), 0, "effective = 无修饰键（mods @52..68）");
+
+        state.pointer_motion(400, 400);
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&8), None, "不得收到核心 LeaveNotify");
+        let leave = take_generic(&generic, 8);
+        assert_eq!(leave.len(), 88, "Leave 同布局（72B 本体 + 16B 填充）");
+        assert_eq!(u32::from_ne_bytes(leave[24..28].try_into().unwrap()), win);
+        assert_eq!(
+            u16::from_ne_bytes(leave[16..18].try_into().unwrap()),
+            device_id::VCP,
+            "Leave 同样在 16 写 sourceid"
+        );
+        assert_eq!(leave[18], 0, "mode = NORMAL");
+    }
+
+    /// XI2 FocusIn(9)/FocusOut(10)：协议里是 `typedef xXIEnterEvent
+    /// xXIFocusInEvent;` —— 与 Enter **同布局 72 字节**（mode 在偏移 18 的 u8，
+    /// 不是 56 字节的独立结构）；set_input_focus 路径投递 XI2 版并抑制核心版。
+    #[test]
+    fn xi2_focus_in_out_wire_layout_on_focus_change() {
+        let (mut state, client, mut rx) = fixture();
+        let win1 = 0x0020_0001u32;
+        let win2 = 0x0020_0002u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win1);
+        make_window(&mut state, client, &mut seq, win2);
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            win2,
+            &[xinput::XIEventMask::FOCUS_IN, xinput::XIEventMask::FOCUS_OUT],
+        );
+        // 同时选择核心 FOCUS_CHANGE（GDK XI2 模式不撤核心掩码 → 必须被抑制）
+        ok(&mut state, client, seq, Request::ChangeWindowAttributes(xproto::ChangeWindowAttributesRequest {
+            window: win2,
+            value_list: Cow::Owned(xproto::ChangeWindowAttributesAux {
+                event_mask: Some(EventMask::FOCUS_CHANGE),
+                ..Default::default()
+            }),
+        }));
+        seq += 1;
+
+        state.set_input_focus(win1, u8::from(InputFocus::POINTER_ROOT));
+        drain_events(&mut rx); // win1 上无 XI2 焦点选择，丢弃
+        state.set_input_focus(win2, u8::from(InputFocus::POINTER_ROOT));
+        let (generic, core) = drain_events(&mut rx);
+        assert_eq!(core.get(&9), None, "不得收到核心 FocusIn");
+        assert_eq!(core.get(&10), None, "不得收到核心 FocusOut");
+        let focus_in = take_generic(&generic, 9);
+        assert_envelope(&focus_in);
+        assert_eq!(focus_in.len(), 88, "FocusIn 是 xXIEnterEvent 别名（72B 本体 + 16B 填充）");
+        assert_eq!(u16::from_ne_bytes(focus_in[10..12].try_into().unwrap()), device_id::VCK, "焦点事件 deviceid = VCK");
+        assert_eq!(u32::from_ne_bytes(focus_in[24..28].try_into().unwrap()), win2);
+        assert_eq!(
+            u16::from_ne_bytes(focus_in[16..18].try_into().unwrap()),
+            device_id::VCK,
+            "焦点事件的 sourceid 也在偏移 16"
+        );
+        assert_eq!(focus_in[18], 0, "mode = XINotifyNormal");
+        assert_eq!(focus_in[48], 1, "same_screen@48");
+        assert_eq!(focus_in[49], 1, "FocusIn 的 focus@49 = TRUE");
+
+        state.set_input_focus(win1, u8::from(InputFocus::POINTER_ROOT));
+        let (generic, _) = drain_events(&mut rx);
+        let focus_out = take_generic(&generic, 10);
+        assert_eq!(focus_out.len(), 88, "FocusOut 同布局（72B + 16B 填充）");
+        assert_eq!(u32::from_ne_bytes(focus_out[24..28].try_into().unwrap()), win2, "FocusOut 投给失焦窗口");
+        assert_eq!(
+            u16::from_ne_bytes(focus_out[16..18].try_into().unwrap()),
+            device_id::VCK,
+            "FocusOut 同样在 16 写 sourceid"
+        );
+        assert_eq!(focus_out[18], 0, "mode = NORMAL");
+    }
+
+    /// 抑制矩阵完整性：客户端同时选了核心掩码和 XI2 掩码时，全部六类
+    /// 事件（KeyPress=2/KeyRelease=3/ButtonPress=4/ButtonRelease=5/Motion=6
+    /// 各一对）只收 XI2 GenericEvent，核心版本计数为 0。
+    #[test]
+    fn xi2_suppression_matrix_all_six_event_classes() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win); // 已含核心 Button/Motion
+        // 补上核心 KeyPress/KeyRelease
+        ok(&mut state, client, seq, Request::ChangeWindowAttributes(xproto::ChangeWindowAttributesRequest {
+            window: win,
+            value_list: Cow::Owned(xproto::ChangeWindowAttributesAux {
+                event_mask: Some(EventMask::from(
+                    u32::from(EventMask::KEY_PRESS) | u32::from(EventMask::KEY_RELEASE),
+                )),
+                ..Default::default()
+            }),
+        }));
+        seq += 1;
+        // XI2 六类掩码选在根窗口（真实 GDK 就这么干）
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            ROOT_WINDOW,
+            &[
+                xinput::XIEventMask::KEY_PRESS,
+                xinput::XIEventMask::KEY_RELEASE,
+                xinput::XIEventMask::BUTTON_PRESS,
+                xinput::XIEventMask::BUTTON_RELEASE,
+                xinput::XIEventMask::MOTION,
+            ],
+        );
+
+        state.input.pointer_x = 50;
+        state.input.pointer_y = 50;
+        state.pointer_motion(50, 50);
+        state.pointer_button(1, true);
+        state.pointer_button(1, false);
+        state.key_event(24, true, false);
+        state.key_event(24, false, false);
+
+        let (generic, core) = drain_events(&mut rx);
+        for evtype in [2u16, 3, 4, 5, 6] {
+            assert!(
+                generic.iter().any(|(t, _)| *t == evtype),
+                "evtype={evtype} 必须收到 XI2 GenericEvent"
+            );
+            // 核心 response_type 与 XI2 evtype 数值相同，但已按 frame[0] 分流
+            assert_eq!(
+                core.get(&(evtype as u8)),
+                None,
+                "evtype={evtype} 的核心版本必须被抑制（计数 0）"
+            );
+        }
+    }
+
+    /// 多客户端：client0 选 XI2、client1 纯核心——前者收 GenericEvent、
+    /// 后者收核心事件，互不干扰。
+    #[test]
+    fn xi2_multiclient_xi2_client_and_core_client_do_not_interfere() {
+        let (mut state, client0, mut rx0) = fixture();
+        let mut rx1 = extra_client(&mut state, 1);
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client0, &mut seq, win);
+        xi2_select(
+            &mut state,
+            client0,
+            &mut seq,
+            win,
+            &[
+                xinput::XIEventMask::MOTION,
+                xinput::XIEventMask::BUTTON_PRESS,
+                xinput::XIEventMask::BUTTON_RELEASE,
+            ],
+        );
+        // client1 在根窗口上选核心事件（client0 的 XI2 抑制不影响它）
+        ok(&mut state, 1, 1, Request::ChangeWindowAttributes(xproto::ChangeWindowAttributesRequest {
+            window: ROOT_WINDOW,
+            value_list: Cow::Owned(xproto::ChangeWindowAttributesAux {
+                event_mask: Some(EventMask::from(
+                    u32::from(EventMask::POINTER_MOTION)
+                        | u32::from(EventMask::BUTTON_PRESS)
+                        | u32::from(EventMask::BUTTON_RELEASE),
+                )),
+                ..Default::default()
+            }),
+        }));
+
+        state.input.pointer_x = 50;
+        state.input.pointer_y = 50;
+        state.pointer_motion(50, 50);
+        state.pointer_button(1, true);
+        state.pointer_button(1, false);
+
+        let (generic0, core0) = drain_events(&mut rx0);
+        assert!(generic0.iter().any(|(t, _)| *t == 6), "XI2 客户端收 Motion GenericEvent");
+        assert!(generic0.iter().any(|(t, _)| *t == 4), "XI2 客户端收 ButtonPress GenericEvent");
+        assert!(generic0.iter().any(|(t, _)| *t == 5), "XI2 客户端收 ButtonRelease GenericEvent");
+        assert_eq!(core0.get(&6), None, "XI2 客户端不收核心 Motion");
+        assert_eq!(core0.get(&4), None, "XI2 客户端不收核心 ButtonPress");
+
+        let (generic1, core1) = drain_events(&mut rx1);
+        assert!(generic1.is_empty(), "纯核心客户端不得收到 GenericEvent");
+        assert!(core1.get(&6).copied().unwrap_or(0) >= 1, "核心客户端收 MotionNotify");
+        assert!(core1.get(&4).copied().unwrap_or(0) >= 1, "核心客户端收 ButtonPress");
+        assert!(core1.get(&5).copied().unwrap_or(0) >= 1, "核心客户端收 ButtonRelease");
     }
 }

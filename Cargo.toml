@@ -3,7 +3,7 @@ winresource = "0.1"
 
 [package]
 name = "rustterm-gpui"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）"
 
@@ -29,6 +29,9 @@ base64 = "0.22"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 crossbeam-channel = "0.5"
+# ZMODEM（rz/sz）文件收发：caller-driven 无 I/O 状态机（no_std/heapless），
+# 正好嵌进 Term::pump 的每帧同步循环，不需要 async 改造。
+zmodem2 = "0.7"
 async-trait = "0.1"
 once_cell = "1"
 urlencoding = "2"

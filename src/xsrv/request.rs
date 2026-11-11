@@ -1,4 +1,4 @@
-﻿//! 核心协议请求的分发与语义。
+//! 核心协议请求的分发与语义。
 //!
 //! 线格式解析在 `server.rs`（用 `Request::parse`），这里只处理"解析之后做什么"：
 //! 资源校验、窗口树维护、事件投递、像素绘制。未实现的请求统一返回
@@ -713,7 +713,7 @@ impl ServerState {
             Request::ShapeQueryExtents(request) => {
                 self.shape_query_extents(client, sequence, request.destination_window)
             }
-            Request::ShapeSelectInput(_) => Ok(()),
+            Request::ShapeSelectInput(request) => self.shape_select_input(client, request),
             Request::ShapeInputSelected(_) => self.shape_input_selected(client, sequence),
             Request::ShapeGetRectangles(request) => self.shape_get_rectangles(client, sequence, request),
             Request::XfixesQueryVersion(request) => {
@@ -1018,6 +1018,49 @@ impl ServerState {
             Request::XinputXISetClientPointer(_) => Ok(()),
             Request::XinputXISetFocus(_) => Ok(()),
             Request::XinputUngrabDevice(_) => Ok(()),
+
+            // ---- XKEYBOARD：语义在 `xkb.rs`（GTK3 use_xkb 开关 + 键表）----
+            // 有应答的给最小合法应答（走 send_reply，length 自动回填）；
+            // **void 的一律静默**——多回 32 字节会造成应答流错位。
+            Request::XkbUseExtension(request) => self.xkb_use_extension(client, sequence, request),
+            Request::XkbGetState(request) => self.xkb_get_state(client, sequence, request),
+            Request::XkbGetControls(request) => self.xkb_get_controls(client, sequence, request),
+            Request::XkbGetMap(request) => self.xkb_get_map(client, sequence, request),
+            Request::XkbGetNames(request) => self.xkb_get_names(client, sequence, request),
+            Request::XkbGetIndicatorState(request) => {
+                self.xkb_get_indicator_state(client, sequence, request)
+            }
+            Request::XkbGetCompatMap(request) => self.xkb_get_compat_map(client, sequence, request),
+            Request::XkbGetIndicatorMap(request) => {
+                self.xkb_get_indicator_map(client, sequence, request)
+            }
+            Request::XkbGetNamedIndicator(request) => {
+                self.xkb_get_named_indicator(client, sequence, request)
+            }
+            Request::XkbPerClientFlags(request) => {
+                self.xkb_per_client_flags(client, sequence, request)
+            }
+            Request::XkbListComponents(request) => {
+                self.xkb_list_components(client, sequence, request)
+            }
+            Request::XkbGetKbdByName(request) => self.xkb_get_kbd_by_name(client, sequence, request),
+            Request::XkbGetDeviceInfo(request) => self.xkb_get_device_info(client, sequence, request),
+            Request::XkbSetDebuggingFlags(request) => {
+                self.xkb_set_debugging_flags(client, sequence, request)
+            }
+            // void：SelectEvents / Bell / LatchLockState / SetControls / SetMap /
+            // SetCompatMap / SetIndicatorMap / SetNamedIndicator / SetNames /
+            // SetGeometry / SetDeviceInfo
+            Request::XkbSelectEvents(_) => Ok(()),
+            Request::XkbBell(_) => Ok(()),
+            Request::XkbLatchLockState(_) => Ok(()),
+            Request::XkbSetControls(_) => Ok(()),
+            Request::XkbSetMap(_) => Ok(()),
+            Request::XkbSetCompatMap(_) => Ok(()),
+            Request::XkbSetIndicatorMap(_) => Ok(()),
+            Request::XkbSetNamedIndicator(_) => Ok(()),
+            Request::XkbSetNames(_) => Ok(()),
+            Request::XkbSetDeviceInfo(_) => Ok(()),
             _ => Err(XError::bad_request()),
         };
 

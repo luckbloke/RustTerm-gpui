@@ -149,6 +149,41 @@ impl ConfigPanel {
                     .h_flex()
                     .items_center()
                     .gap_2()
+                    .child(div().w(px(110.0)).text_size(px(12.0)).child("输入协议"))
+                    .child(
+                        Button::new("cfg-xinput-xi2")
+                            .label("XInput2（推荐）")
+                            .compact()
+                            .selected(config.xinput_mode == crate::config::XInputMode::Xi2)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.config.xinput_mode = crate::config::XInputMode::Xi2;
+                                crate::config::set_xinput_mode(this.config.xinput_mode);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("cfg-xinput-core")
+                            .label("核心事件（兼容）")
+                            .compact()
+                            .selected(config.xinput_mode == crate::config::XInputMode::Core)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.config.xinput_mode = crate::config::XInputMode::Core;
+                                crate::config::set_xinput_mode(this.config.xinput_mode);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(dim)
+                    .child("X11 输入协议：XInput2 为事件推送（默认）；核心事件为兼容排障模式。切换后对新连接生效——已有 X11 标签请重开。"),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
                     .child(div().w(px(110.0)).text_size(px(12.0)).child("主题"))
                     .child(
                         Button::new("cfg-theme-dark")

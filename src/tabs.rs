@@ -66,18 +66,62 @@ impl TabType {
     }
 }
 
-/// 取出一个 dock 区域里的所有终端面板（按布局顺序）。
+/// dock 里的一个面板。
 ///
-/// dock 是「有哪些面板」的唯一真相：面板实体以 `Arc<dyn PanelView>` 形式存在
-/// dock 里，这里通过 `PanelView::view() -> AnyView` 反查回具体类型。
-pub fn dock_panels(dock: &Entity<DockArea>, cx: &App) -> Vec<Entity<TerminalView>> {
+/// 分屏不再只收终端：远程桌面（RDP/VNC/SPICE/X11）标签也能被拖进分屏格，
+/// 与终端同屏并排。以枚举区分类型，调用方按需 match。
+#[derive(Clone)]
+pub enum DockPanel {
+    /// 终端面板
+    Terminal(Entity<TerminalView>),
+    /// 远程桌面面板（RDP/VNC/SPICE/X11）
+    Remote(Entity<RemoteDesktopTab>),
+}
+
+impl DockPanel {
+    /// 面板标题（标签栏 / 状态栏用）。
+    pub fn title(&self, cx: &App) -> String {
+        match self {
+            DockPanel::Terminal(t) => t.read(cx).title(),
+            DockPanel::Remote(t) => t.read(cx).title(),
+        }
+    }
+}
+
+/// 取出一个 dock 区域里的**所有**面板（终端 + 远程桌面，按布局顺序）。
+///
+/// 这是 `dock_panels` 的泛化版本：需要一个能同时容纳多种面板类型的调用点
+/// （关闭/分屏/通知/FPS 统计）用它。
+pub fn dock_items(dock: &Entity<DockArea>, cx: &App) -> Vec<DockPanel> {
     let area = dock.read(cx);
     let Some(tree) = area.layout(DockPlacement::Center) else {
         return Vec::new();
     };
     tree.panels()
         .filter_map(|id| area.panel(id))
-        .filter_map(|handle| handle.view().downcast::<TerminalView>().ok())
+        .filter_map(|handle| {
+            if let Ok(view) = handle.view().downcast::<TerminalView>() {
+                return Some(DockPanel::Terminal(view));
+            }
+            if let Ok(view) = handle.view().downcast::<RemoteDesktopTab>() {
+                return Some(DockPanel::Remote(view));
+            }
+            None
+        })
+        .collect()
+}
+
+/// 取出一个 dock 区域里的所有终端面板（按布局顺序）。
+///
+/// dock 是「有哪些面板」的唯一真相：面板实体以 `Arc<dyn PanelView>` 形式存在
+/// dock 里，这里通过 `PanelView::view() -> AnyView` 反查回具体类型。
+pub fn dock_panels(dock: &Entity<DockArea>, cx: &App) -> Vec<Entity<TerminalView>> {
+    dock_items(dock, cx)
+        .into_iter()
+        .filter_map(|p| match p {
+            DockPanel::Terminal(t) => Some(t),
+            DockPanel::Remote(_) => None,
+        })
         .collect()
 }
 
@@ -164,8 +208,11 @@ impl TerminalWorkspace {
             .first()
             .map(|v| v.read(cx).title())
             .unwrap_or_else(|| "终端".to_string());
-        if panels.len() > 1 {
-            format!("{base} ⟨{} 格⟩", panels.len())
+        // 格数要把**远程桌面**面板也算上（与状态栏一致）：1 终端 + 1 远程时
+        // 标签写「1 格」、状态栏写「2 格」会让人以为分屏没生效。
+        let cells = dock_items(dock, cx).len();
+        if cells > 1 {
+            format!("{base} ⟨{cells} 格⟩")
         } else {
             base
         }
@@ -201,8 +248,12 @@ pub enum TabContent {
     Failed(String),
     /// 内置浏览器
     Browser(BrowserTab),
-    /// 远程桌面
-    RemoteDesktop(RemoteDesktopTab),
+    /// 远程桌面。
+    ///
+    /// 持有**实体**（而不是值）：这样它既能在标签里渲染，也能被直接装进
+    /// 终端工作区的 dock 成为分屏格——「把远程桌面标签拖进分屏」正是靠
+    /// 把这里的实体交给 `DockArea::add_panel_view` 实现的。
+    RemoteDesktop(Entity<RemoteDesktopTab>),
     /// 本地文件浏览器（宽栏）
     LocalFiles(FileBrowser),
     /// 键宏管理器（面板本体在 `RustTermApp::macros`，这里只是「视图入口」）
@@ -232,7 +283,7 @@ impl TabContent {
             TabContent::Terminal(ws) => ws.title(cx),
             TabContent::Failed(_) => "连接失败".to_string(),
             TabContent::Browser(tab) => tab.display_title(),
-            TabContent::RemoteDesktop(tab) => tab.title(),
+            TabContent::RemoteDesktop(tab) => tab.read(cx).title(),
             TabContent::LocalFiles(_) => "本地文件".to_string(),
             TabContent::Macro => "键宏".to_string(),
             TabContent::PortScan => "端口扫描".to_string(),

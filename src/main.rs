@@ -1,4 +1,4 @@
-﻿//! RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）
+//! RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）
 //!
 //! P1: 产品骨架（统一标签页/SFTP双栏/状态栏/配置面板/i18n）
 //! P2: 远程桌面（VNC/RDP/SPICE 帧渲染，后端零改动）
@@ -12,6 +12,7 @@
 // app.rs 体量很大，测试宏展开时容易撞到默认递归深度
 
 
+mod agent;
 mod ai;
 mod ai_assistant;
 mod ai_config_panel;
@@ -188,11 +189,13 @@ fn install_crash_log() {
             .append(true)
             .open(&path)
         {
-            let _ = writeln!(
+            let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(
                 f,
-                "=== panic @ {} ===\n{}\n",
+                "=== panic @ {} ===\n{}\n--- backtrace ---\n{}\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                info
+                info,
+                bt
             );
             let _ = f.flush();
         }
@@ -212,8 +215,28 @@ fn install_rdpdr_log() {
     std::env::set_var("NYATERM_RDPDR_LOG", &path);
     // 构建指纹：编译期 Unix 时间戳写进日志首行，远端排障时一眼确认版本，
     // 避免「测的是旧版」的往返（微信传输不保留文件修改时间）。
+    //
+    // 注意：该时间戳来自 cargo build script，build.rs 未重跑时 cargo 会复用上次的
+    // `cargo:rustc-env`，于是**新 exe 里可能仍是旧时间戳**（2026-11-11 实测踩到：
+    // 06:20 构建的 exe 里写着前一天的 23:24）。所以再补运行时指纹：当前 exe 的
+    // 绝对路径 + 文件修改时间——这个骗不了人，直接回答「在跑哪个文件、是不是刚构建的」。
     const BUILD_TS: &str = env!("NYATERM_BUILD_UNIX_TS");
-    let _ = std::fs::write(&path, format!("[build] BUILD_UNIX_TS={BUILD_TS}\n"));
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<未知: {e}>"));
+    let exe_mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "?".into());
+    let _ = std::fs::write(
+        &path,
+        format!(
+            "[build] BUILD_UNIX_TS={BUILD_TS}\n[build] EXE={exe}\n[build] EXE_MTIME_UNIX_TS={exe_mtime}\n"
+        ),
+    );
 }
 
 /// 主逻辑跑在**大栈线程**上。
@@ -281,6 +304,9 @@ fn run_app() {
         .run(move |cx| {
             // 必须在使用任何 GPUI Component 功能之前调用
             gpui_kit::init(cx);
+            // 组件库内置文案（输入框右键菜单等）的 locale 不在这里硬编码：
+            // RustTermApp::new → i18n.set_lang(config.language) 会经
+            // `sync_locale()` 按配置切（跟随语言切换，见 i18n.rs）。
 
             let _ = gpui_kit::open_window(options, cx, |_, cx| {
                 cx.new(|_| app::RustTermApp::new())

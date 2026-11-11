@@ -36,6 +36,7 @@ impl AiMessage {
 }
 
 /// 系统提示词：运维助手风格，命令放 bash 代码块。
+/// Agent 模式段照抄主工程 rustterm-tauri ai.rs L63-79（真实使用验证过）。
 pub fn system_prompt(agent_mode: bool) -> String {
     let base = "你是 RustTerm 的终端运维助手。用户会在终端里操作服务器，你需要：\n\
          1. 用简洁的中文回答用户的问题。\n\
@@ -46,10 +47,11 @@ pub fn system_prompt(agent_mode: bool) -> String {
     if agent_mode {
         base.to_string()
             + "\n【Agent 模式】\n\
-               当用户消息以 [Agent] 开头时，你进入多步任务模式：\n\
                - 每次回复只给 1-2 条命令，等用户反馈输出后再决定下一步。\n\
+               - 命令放在 ```bash 代码块里。\n\
                - 命令执行后，用户会把输出作为下一条消息发给你。\n\
                - 当你认为任务已经完成，在回复末尾加上 [DONE]。\n\
+               - 如果命令失败或输出异常，可以调整策略重试，但不要重复同一条命令超过 2 次。\n\
                - 最多 10 轮，超过就停止。\n"
     } else {
         base.to_string()
@@ -311,6 +313,217 @@ pub fn is_write_command(cmd: &str) -> bool {
 /// 判断 AI 回复是否表示任务完成。
 pub fn is_task_done(reply: &str) -> bool {
     reply.contains("[DONE]")
+}
+
+// ---------------------------------------------------------------------------
+// Agent 回复解析：**双格式兼容**（JSON 优先 + bash 块/[DONE] 降级）
+// ---------------------------------------------------------------------------
+
+/// 一轮 Agent 回复的结构化结果（两种格式解析后的统一形态）。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AgentPlan {
+    /// 模型的简短推理/说明（JSON 的 `think`；bash 协议 = 代码块外正文）。
+    pub think: String,
+    /// 本轮要执行的命令（按序；每条仍会过 is_dangerous 安全闸）。
+    pub commands: Vec<String>,
+    /// 任务是否完成。
+    pub done: bool,
+    /// 完成时的总结（done=true 时有值）。
+    pub summary: Option<String>,
+}
+
+/// 剥 ```json 围栏：返回围栏内的 JSON 文本；整条 trim 后以 { 开头也算。
+/// 没有 JSON 候选 → None。
+fn json_candidate(reply: &str) -> Option<&str> {
+    let trimmed = reply.trim();
+    // 容忍大小写与语言标记变体：找 "```json"（大小写不敏感）
+    let lower = trimmed.to_lowercase();
+    if let Some(pos) = lower.find("```json") {
+        let rest = &trimmed[pos + 7..];
+        // 闭合取 opener 之后的**第一个** ``` 行（rfind 会跨块吞掉 bash 块）
+        let end = rest.find("```").unwrap_or(rest.len());
+        return Some(rest[..end].trim());
+    }
+    if trimmed.starts_with('{') {
+        return Some(trimmed);
+    }
+    None
+}
+
+/// 行级移除 ```json ... ``` 块（opener 到第一个闭合 ``` 行，含两端）。
+/// 降级路径的 bash 提取用它，避免坏 JSON 块的残余被当成命令。
+fn remove_json_blocks(reply: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in reply.lines() {
+        let t = line.trim();
+        if !skipping && t.to_lowercase().starts_with("```json") {
+            skipping = true;
+            continue;
+        }
+        if skipping {
+            // 块内：遇到闭合围栏行就结束跳过
+            if t.starts_with("```") {
+                skipping = false;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// bash 协议的 think：代码块（``` 围栏）之外的正文，去掉 [DONE] 标记。
+fn prose_outside_blocks(reply: &str) -> String {
+    let mut out = String::new();
+    let mut in_block = false;
+    for line in reply.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_block = !in_block;
+            continue;
+        }
+        if !in_block {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.replace("[DONE]", "").trim().to_string()
+}
+
+/// 解析 Agent 模型回复（双格式兼容）：
+/// 1. **JSON 优先**：剥 ```json 围栏与前后杂文 → `{think, commands, done,
+///    summary}`，字段缺失取默认值（think=""、commands=[]、done=false）；
+/// 2. **失败降级**：bash 块 + [DONE]（tauri 约定），think = 块外正文；
+/// 3. 两者都无内容 → 空 plan（commands 空 + done=false）→ 状态机按现有
+///    降级语义终止本轮（普通文本展示）。
+///
+/// 注意：JSON 解析成功但不含协议字段（如模型恰好回了别的 JSON 对象）也
+/// 会得到空 commands + done=false → 同样走降级终止，不会误执行。
+pub fn parse_agent_reply(reply: &str) -> AgentPlan {
+    if let Some(json_text) = json_candidate(reply) {
+        if let Ok(v) = serde_json::from_str::<Value>(json_text) {
+            if v.is_object() {
+                let think = v
+                    .get("think")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let commands = v
+                    .get("commands")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let done = v.get("done").and_then(Value::as_bool).unwrap_or(false);
+                let summary = v
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return AgentPlan { think, commands, done, summary };
+            }
+        }
+    }
+    // 降级：先把 ```json 块行级移除（坏 JSON 块的残余不能被 bash 扫块
+    // 当成命令），再做 bash 块 + [DONE] 提取。
+    let sans = remove_json_blocks(reply);
+    AgentPlan {
+        think: prose_outside_blocks(&sans),
+        commands: extract_commands(&sans),
+        done: is_task_done(&sans),
+        summary: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 强模型 JSON fixture（含 ```json 围栏 + 前后杂文）。
+    const JSON_FIXTURE: &str = "让我先看看目录结构。\n```json\n{\"think\": \"先列目录再排序\", \"commands\": [\"du -a .\", \"sort -n\"], \"done\": false}\n```\n以上请执行。";
+
+    /// 弱模型 bash fixture（降级路径：无 JSON，bash 块 + [DONE]）。
+    const BASH_FIXTURE: &str = "好的，依次执行：\n```bash\nls -la\n```\n完成后汇总。[DONE]";
+
+    #[test]
+    fn json_fixture_parses_structured() {
+        let plan = parse_agent_reply(JSON_FIXTURE);
+        assert_eq!(plan.think, "先列目录再排序");
+        assert_eq!(plan.commands, ["du -a .", "sort -n"]);
+        assert!(!plan.done);
+        assert_eq!(plan.summary, None);
+    }
+
+    #[test]
+    fn json_done_fixture_carries_summary() {
+        let plan = parse_agent_reply(
+            "```json\n{\"think\": \"结束\", \"done\": true, \"summary\": \"最大文件是 big.tar\"}\n```",
+        );
+        assert!(plan.done);
+        assert_eq!(plan.summary.as_deref(), Some("最大文件是 big.tar"));
+        assert!(plan.commands.is_empty());
+    }
+
+    #[test]
+    fn json_without_fence_or_prose_is_parsed() {
+        let plan = parse_agent_reply(
+            r#"{"think": "t", "commands": ["ls"], "done": false}"#,
+        );
+        assert_eq!(plan.commands, ["ls"]);
+    }
+
+    #[test]
+    fn bash_fixture_falls_back_and_extracts() {
+        let plan = parse_agent_reply(BASH_FIXTURE);
+        // 降级：bash 块命令 + [DONE] 判完成；think = 块外正文
+        assert_eq!(plan.commands, ["ls -la"]);
+        assert!(plan.done);
+        assert!(plan.think.contains("好的，依次执行："));
+        assert!(!plan.think.contains("[DONE]"));
+    }
+
+    /// 坏 JSON（缺引号/被截断）→ 降级 bash 协议；都无内容 → 空 plan。
+    #[test]
+    fn broken_json_falls_back_or_degrades() {
+        // 坏 JSON + 有 bash 块 → 降级提取成功
+        let plan = parse_agent_reply("```json\n{broken\n```\n```bash\necho hi\n```");
+        assert_eq!(plan.commands, ["echo hi"]);
+        // 坏 JSON 且无 bash 块 → 空 plan（状态机按普通文本展示并终止）
+        let plan = parse_agent_reply("```json\n{broken\n```");
+        assert!(plan.commands.is_empty());
+        assert!(!plan.done);
+    }
+
+    /// 安全闸一致性：JSON 与 bash 两种格式的 commands 走同一条
+    /// is_dangerous 闸（状态机统一派发前检查，这里验证解析产物本身）。
+    #[test]
+    fn safety_gate_sees_commands_from_both_formats() {
+        let json_plan = parse_agent_reply(
+            r#"```json
+{"think": "清理", "commands": ["rm -rf /tmp/x"], "done": false}
+```"#,
+        );
+        let bash_plan = parse_agent_reply("```bash\nrm -rf /tmp/x\n```");
+        for plan in [json_plan, bash_plan] {
+            assert_eq!(plan.commands.len(), 1);
+            assert!(is_dangerous(&plan.commands[0]), "两格式的命令都要过安全闸");
+        }
+    }
+
+    /// 杂文容忍：JSON 前后大段散文不影响解析。
+    #[test]
+    fn json_with_surrounding_prose_is_tolerated() {
+        let plan = parse_agent_reply(
+            "计划如下，请查收。\n第一行说明。\n```json\n{\"think\":\"go\",\"commands\":[\"ls\"],\"done\":false}\n```\n第二行说明。",
+        );
+        assert_eq!(plan.commands, ["ls"]);
+        assert_eq!(plan.think, "go");
+    }
 }
 
 /// 截断过长文本（保留头部）。

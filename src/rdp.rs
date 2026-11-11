@@ -1,4 +1,4 @@
-//! 远程桌面标签页：VNC / RDP / SPICE 的真实连接与渲染（GPUI 版）。
+﻿//! 远程桌面标签页：VNC / RDP / SPICE 的真实连接与渲染（GPUI 版）。
 //!
 //! - 后端：`crate::remote`（每会话一个线程 + 事件通道）
 //! - 渲染：整帧 BGRA 缓冲 + `RenderImage` 贴图（canvas 元素）
@@ -10,11 +10,14 @@ use crate::widgets::password_field;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::component_traits::Selectable as _;
+use gpui_kit::base::dock::{Panel as BasePanel, PanelEvent, PanelState};
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::dock::{Panel as SkinPanel, PanelControl};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::theme::Theme;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::sync::Arc;
@@ -158,9 +161,18 @@ impl RdpProfiles {
     }
 }
 
-/// 远程桌面画面区域（canvas prepaint 时写入，鼠标/键盘输入换算用）。
-pub struct RdArea(pub Bounds<Pixels>);
-impl Global for RdArea {}
+
+/// 各远程面板自己的画面绘制矩形（canvas prepaint 写入，鼠标换算按实体 id 取）。
+///
+/// 最早是单值全局（`RdArea`）：同屏两个远程格时后绘制的覆盖前者，前一个格子
+/// 的鼠标坐标整体错位。改成按实体 id 分开记。
+///
+/// **写入必须走全局，不能在绘制阶段 `Entity::update`**：gpui 对同一实体的
+/// 重复租用会 panic（`double_lease_panic`），整帧渲染中断——实测表现为
+/// 终端和远程桌面全部白屏（17:38:59 版）。`set_global` 是生产验证过的
+/// 绘制期安全写法（同 `BrowserArea`）。
+pub struct RdAreas(pub std::collections::HashMap<EntityId, Bounds<Pixels>>);
+impl Global for RdAreas {}
 
 /// 画面在窗口里的实际绘制矩形：等比缩放（fit）或固定倍率（zoom）后居中。
 ///
@@ -260,6 +272,9 @@ pub struct RemoteDesktopTab {
     last_pointer: Option<(u16, u16)>,
     frames: u32,
     fps_t: std::time::Instant,
+    /// 最近一次收到画面帧的时刻（None = 本会话还没收到过帧）。
+    /// 工具条用它区分「空闲」与「0 fps 异常」。
+    last_frame: Option<std::time::Instant>,
     /// VNC：最近一次对远端生效的本地 CapsLock 状态（keysym 切换检测用）。
     ///
     /// gpui 不投递 CapsLock 按键，只能靠每次普通按键时对比本地状态：发现
@@ -267,8 +282,13 @@ pub struct RemoteDesktopTab {
     caps_sent: bool,
     /// 后端最初报上来的尺寸（重连时沿用）
     desired: (u16, u16),
-    /// 键盘焦点（首次渲染时创建）
-    pub focus: Option<FocusHandle>,
+    /// 键盘焦点（首次需要时创建）。
+    ///
+    /// 面板化后 `Focusable::focus_handle` 与 `render_panel` 必须拿到**同一个**
+    /// 句柄（`track_focus` 追踪的就是它），所以用 `OnceCell` 惰性建一次、
+    /// 两边共用；否则 dock 在首帧前问一次焦点、渲染时又建一个新的，
+    /// 键盘事件会全部落空。
+    pub focus: std::cell::OnceCell<FocusHandle>,
     /// 连接表单输入
     pub form: Option<RdFormInputs>,
     /// 远端光标位图（RGBA8）+ 热点。
@@ -288,6 +308,17 @@ pub struct RemoteDesktopTab {
     clip_check_t: std::time::Instant,
     /// 剪贴板文件传输的最近一条状态（进度 / 结果），显示在工具条右侧。
     transfer: Option<TransferUi>,
+    /// 面板本地的临时提示（文案 + 出现时刻）：显示在工具条上，8 秒后自动消失。
+    ///
+    /// 面板化前这类提示走 app 的 toast；现在面板自己是 `Context<Self>`，
+    /// 拿不到 app 实体，就在自己的工具条上显示，文案与消失时机保持一致。
+    hint: Option<(String, std::time::Instant)>,
+    /// 面板改过「会话级」设置（共享目录 / 旧版兼容），需要 app 写回 sessions.json。
+    ///
+    /// 面板不碰 `SessionStore`（会和 app 内存里的那份互相覆盖），只置标志；
+    /// app 渲染本面板时用 [`RemoteDesktopTab::take_settings_dirty`] 取走，
+    /// 再按本面板自己的 `profile` 写盘。
+    settings_dirty: bool,
 }
 
 /// 剪贴板传文件的状态条内容。
@@ -337,7 +368,8 @@ impl RemoteDesktopTab {
             last_pointer: None,
             frames: 0,
             fps_t: std::time::Instant::now(),
-            focus: None,
+            last_frame: None,
+            focus: std::cell::OnceCell::new(),
             form: None,
             cursor: None,
             cursor_pos: (0, 0),
@@ -346,7 +378,17 @@ impl RemoteDesktopTab {
             last_clip_write: None,
             clip_check_t: std::time::Instant::now(),
             transfer: None,
+            hint: None,
+            settings_dirty: false,
         }
+    }
+
+    /// 取走「会话设置已改」标志（读并清零）。
+    ///
+    /// app 渲染本面板时调用；返回 true 就按本面板的 `profile.session_id /
+    /// share_dir / legacy_compat` 写回 sessions.json。
+    pub fn take_settings_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.settings_dirty)
     }
 
     pub fn title(&self) -> String {
@@ -421,6 +463,7 @@ impl RemoteDesktopTab {
         self.buttons = 0;
         self.last_pointer = None;
         self.fps_t = std::time::Instant::now();
+        self.last_frame = None;
         self.frames = 0;
         // 重连时清掉上一条会话残留的光标状态
         self.cursor = None;
@@ -567,6 +610,7 @@ impl RemoteDesktopTab {
                     return false;
                 }
                 self.frames += 1;
+                self.last_frame = Some(std::time::Instant::now());
                 got_frame = true;
             }
             RdEvent::Cursor {
@@ -974,12 +1018,11 @@ impl RemoteDesktopTab {
     // 渲染
     // ------------------------------------------------------------------
 
-    /// 渲染整个标签页内容（工具条 + 画面/连接表单）。
-    pub fn render(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<crate::app::RustTermApp>,
-    ) -> AnyElement {
+    /// 渲染整个面板内容（工具条 + 画面/连接表单）。
+    ///
+    /// 面板自己的上下文（`Context<Self>`）：所有交互都直接落在本面板状态上，
+    /// 不再经由 app 的「当前活动远程桌面标签」间接层。
+    pub fn render_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.poll(cx);
 
         // 传文件的结果提示留一会儿就撤，避免工具条一直挂着一行旧状态
@@ -990,10 +1033,17 @@ impl RemoteDesktopTab {
         {
             self.transfer = None;
         }
-
-        if self.focus.is_none() {
-            self.focus = Some(cx.focus_handle());
+        // 本地提示同样只挂 8 秒（原来是 app 的 toast，语义一致）
+        if self
+            .hint
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed().as_secs() >= 8)
+        {
+            self.hint = None;
         }
+
+        // 焦点句柄只建一次：`Focusable` 与本函数必须共用同一个
+        self.focus.get_or_init(|| cx.focus_handle());
 
         let theme = Theme::global(cx).clone();
         let dim = theme.colors.muted_foreground;
@@ -1008,7 +1058,7 @@ impl RemoteDesktopTab {
                         .label("连接")
                         .compact()
                         .on_click(cx.listener(|this, _, _, _| {
-                            this.active_rd(|t| t.connect());
+                            this.connect();
                         })),
                 );
             }
@@ -1026,7 +1076,7 @@ impl RemoteDesktopTab {
                             .label("取消")
                             .compact()
                             .on_click(cx.listener(|this, _, _, _| {
-                                this.active_rd(|t| t.disconnect());
+                                this.disconnect();
                             })),
                     );
             }
@@ -1037,7 +1087,7 @@ impl RemoteDesktopTab {
                         .label("断开")
                         .compact()
                         .on_click(cx.listener(|this, _, _, _| {
-                            this.active_rd(|t| t.disconnect());
+                            this.disconnect();
                         })),
                 );
             }
@@ -1048,7 +1098,7 @@ impl RemoteDesktopTab {
                     .label("自适应")
                     .checked(self.fit)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        this.active_rd(|t| t.fit = *checked);
+                        this.fit = *checked;
                         cx.notify();
                     })),
             )
@@ -1057,7 +1107,7 @@ impl RemoteDesktopTab {
                     .label("捕获键盘")
                     .checked(self.capture_keys)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                        this.active_rd(|t| t.capture_keys = *checked);
+                        this.capture_keys = *checked;
                         cx.notify();
                     })),
             )
@@ -1067,15 +1117,18 @@ impl RemoteDesktopTab {
                     .checked(self.clipboard_sync)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
                         // 会话中切换：通道是建连时协商的，提示重连生效
-                        let was_active =
-                            this.active_rd_ref().map(|t| t.is_active()).unwrap_or(false);
-                        this.active_rd(|t| t.clipboard_sync = *checked);
+                        let was_active = this.is_active();
+                        this.clipboard_sync = *checked;
                         if was_active {
-                            this.set_toast(if *checked {
-                                "剪贴板同步将在下次连接时生效"
-                            } else {
-                                "已关闭剪贴板同步（重新连接后完全停止）"
-                            });
+                            // 面板化前这条走 app 的 toast，现在挂在自己工具条上
+                            this.hint = Some((
+                                if *checked {
+                                    "剪贴板同步将在下次连接时生效".to_string()
+                                } else {
+                                    "已关闭剪贴板同步（重新连接后完全停止）".to_string()
+                                },
+                                std::time::Instant::now(),
+                            ));
                         }
                         cx.notify();
                     })),
@@ -1085,10 +1138,21 @@ impl RemoteDesktopTab {
                     div()
                         .text_size(px(10.0))
                         .text_color(dim)
-                        .child(format!(
-                            "{}×{}  {:.0} fps",
-                            self.fb.width, self.fb.height, self.fps
-                        )),
+                        .child({
+                            // 3 秒没帧 = 空闲：显示状态而不是误导性的「0 fps」
+                            //（远端画面静止时服务器本来就不送帧，不是异常）
+                            let idle = self
+                                .last_frame
+                                .map_or(true, |t| t.elapsed().as_secs_f32() >= 3.0);
+                            if idle {
+                                format!(
+                                    "{}×{}  已连接（空闲）",
+                                    self.fb.width, self.fb.height
+                                )
+                            } else {
+                                format!("{}×{}  {:.0} fps", self.fb.width, self.fb.height, self.fps)
+                            }
+                        }),
                 )
             });
 
@@ -1101,6 +1165,18 @@ impl RemoteDesktopTab {
                     .min_w_0()
                     .text_ellipsis()
                     .child(t.text.clone()),
+            );
+        }
+
+        // 面板本地提示（例如刚切了剪贴板开关）：8 秒后自动消失
+        if let Some((text, _)) = &self.hint {
+            toolbar = toolbar.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(dim)
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(text.clone()),
             );
         }
 
@@ -1129,7 +1205,7 @@ impl RemoteDesktopTab {
                             .label("连接")
                             .compact()
                             .on_click(cx.listener(|this, _, _, _| {
-                                this.active_rd(|t| t.connect());
+                                this.connect();
                             })),
                     )
                     .into_any_element()
@@ -1140,10 +1216,13 @@ impl RemoteDesktopTab {
             self.screen_area(cx)
         };
 
+        // NyaTerm: 根元素必须 `.size_full()`（与 TerminalView 同款）——dock 的
+        // 面板容器不是定高 flex，`.flex_1()` 在里面高度塌缩成 0，表现为
+        // 「canvas=408x0，画面区白屏」（诊断日志实锤）。宽度不受影响（交叉轴
+        // 自动拉伸），所以之前只有高度消失。
         div()
             .v_flex()
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .child(
                 div()
                     .h_flex()
@@ -1157,9 +1236,9 @@ impl RemoteDesktopTab {
     }
 
     /// 画面区域（canvas 贴图 + 输入监听）。
-    fn screen_area(&mut self, cx: &mut Context<crate::app::RustTermApp>) -> AnyElement {
+    fn screen_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let image = self.image.clone();
-        let focus = self.focus.clone();
+        let focus = self.focus.get().cloned();
 
         let mut area = div()
             .id("rd-area")
@@ -1173,50 +1252,72 @@ impl RemoteDesktopTab {
             .overflow_hidden()
             .bg(hsla(0.0, 0.0, 0.08, 1.0))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_move(ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_move(ev.position, area);
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_down(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_down(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_down(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_down(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_down(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_down(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_up(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_up(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Middle, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_up(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_up(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_mouse_up(MouseButton::Right, cx.listener(|this, ev: &MouseUpEvent, _, cx| {
-                let area = cx.global::<RdArea>().0;
-                this.active_rd(|t| t.on_mouse_up(ev.button, ev.position, area));
+                let area = cx
+                .try_global::<RdAreas>()
+                .and_then(|g| g.0.get(&cx.entity_id()).copied())
+                .unwrap_or_default();
+                this.on_mouse_up(ev.button, ev.position, area);
                 cx.notify();
             }))
             .on_scroll(cx.listener(|this, ev: &ScrollEvent, _, cx| {
-                this.active_rd(|t| t.on_wheel(ev.delta));
+                this.on_wheel(ev.delta);
                 cx.notify();
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                this.active_rd(|t| t.on_key_down(&ev.keystroke));
+                // 按键编码逻辑本身没动，只是从 app 间接层换成面板自身
+                this.on_key_down(&ev.keystroke);
                 cx.notify();
             }))
             .on_key_up(cx.listener(|this, ev: &KeyUpEvent, _, cx| {
-                this.active_rd(|t| t.on_key_up(&ev.keystroke));
+                this.on_key_up(&ev.keystroke);
                 cx.notify();
             }));
 
@@ -1225,7 +1326,7 @@ impl RemoteDesktopTab {
                 .track_focus(&f)
                 .key_context("RemoteDesktop")
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    if let Some(f) = this.active_rd_ref().and_then(|t| t.focus.clone()) {
+                    if let Some(f) = this.focus.get().cloned() {
                         window.focus(&f, cx);
                     }
                 }));
@@ -1248,11 +1349,49 @@ impl RemoteDesktopTab {
         let cursor_size = self.cursor.as_ref().map(|c| (c.width, c.height)).unwrap_or((0, 0));
         let cursor_visible = !self.cursor_hidden && cursor_img.is_some();
 
+        // 每帧把**自己**的绘制矩形写进全局映射（按实体 id 分键）。
+        // 绘制阶段只能动全局——`Entity::update` 在这里会 double-lease panic。
+        let me_id = cx.entity_id();
         area = area.child(canvas(
             move |bounds, _window, cx| {
-                cx.set_global(RdArea(bounds));
+                let mut map = cx
+                    .try_global::<RdAreas>()
+                    .map(|g| g.0.clone())
+                    .unwrap_or_default();
+                map.insert(me_id, bounds);
+                cx.set_global(RdAreas(map));
             },
             move |bounds, (), window, _cx| {
+                // 白屏排查：限频（≥1s）记录画布尺寸与图像状态。
+                // 「w/h 为 0」= 布局塌缩；「image=None」= 帧没到；都正常还白
+                // = 帧缓冲内容本身是白的（远端/会话问题，不是绘制问题）。
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+                    let now_ms = {
+                        use std::sync::OnceLock;
+                        static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+                        EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+                    };
+                    let last = LAST_LOG_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 1000 && LAST_LOG_MS.compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+                    {
+                        let has_img = image.is_some();
+                        let iw = image.as_ref().map(|i| {
+                            let s = i.size(0);
+                            format!("{}x{}", s.width.0, s.height.0)
+                        }).unwrap_or_else(|| "-".into());
+                        crate::xsrv::log_line(format_args!(
+                            "[rd-paint] canvas={}x{} image={} img_size={} fit={} zoom={}",
+                            bounds.size.width.as_f32() as i32,
+                            bounds.size.height.as_f32() as i32,
+                            if has_img { "some" } else { "none" },
+                            iw,
+                            fit,
+                            zoom,
+                        ));
+                    }
+                }
                 if let Some(img) = &image {
                     let area = bounds;
                     let sz = img.size(0);
@@ -1322,11 +1461,7 @@ impl RemoteDesktopTab {
     }
 
     /// 连接表单。
-    fn connect_form(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<crate::app::RustTermApp>,
-    ) -> AnyElement {
+    fn connect_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::global(cx).clone();
         let dim = theme.colors.muted_foreground;
 
@@ -1407,14 +1542,12 @@ impl RemoteDesktopTab {
                     .compact()
                     .selected(self.profile.protocol == p)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active_rd(|t| {
-                            t.profile.protocol = p;
-                            const OLD: [u16; 3] = [5900, 3389, 5930];
-                            if OLD.contains(&t.profile.port) {
-                                t.profile.port = p.default_port();
-                            }
-                            t.form = None; // 重建表单以更新端口占位
-                        });
+                        this.profile.protocol = p;
+                        const OLD: [u16; 3] = [5900, 3389, 5930];
+                        if OLD.contains(&this.profile.port) {
+                            this.profile.port = p.default_port();
+                        }
+                        this.form = None; // 重建表单以更新端口占位
                         cx.notify();
                     })),
             );
@@ -1434,22 +1567,29 @@ impl RemoteDesktopTab {
                         .label("浏览…")
                         .compact()
                         .on_click(cx.listener(|_, _, window, cx| {
-                            crate::app::RustTermApp::pick_folder_async(
-                                cx,
-                                window,
-                                |this, window, cx, path| {
-                                    this.active_rd(|t| {
-                                        t.profile.share_dir = path.clone();
-                                        if let Some(f) = &t.form {
-                                            let input = f.share.clone();
-                                            input.update(cx, |s, cx| {
-                                                s.set_value(path.clone(), window, cx)
-                                            });
-                                        }
-                                    });
+                            // 面板自己的上下文里复刻 app 的 `pick_folder_async`：
+                            // 原生目录对话框跑在后台线程（UI 不卡），选中后回填
+                            // profile + 表单输入框；用户取消则什么都不改。
+                            cx.spawn_in(window, async move |this, cx| {
+                                let picked = cx
+                                    .background_executor()
+                                    .spawn(async { rfd::FileDialog::new().pick_folder() })
+                                    .await;
+                                let Some(dir) = picked else { return };
+                                let path = dir.display().to_string();
+                                this.update_in(cx, |this, window, cx| {
+                                    this.profile.share_dir = path.clone();
+                                    if let Some(f) = &this.form {
+                                        let input = f.share.clone();
+                                        input.update(cx, |s, cx| {
+                                            s.set_value(path.clone(), window, cx)
+                                        });
+                                    }
                                     cx.notify();
-                                },
-                            );
+                                })
+                                .ok();
+                            })
+                            .detach();
                         })),
                 );
             content = content
@@ -1462,9 +1602,10 @@ impl RemoteDesktopTab {
                         .label("旧版服务器兼容（Server 2008：禁用 NLA，仅用 TLS）")
                         .checked(self.profile.legacy_compat)
                         .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                            this.active_rd(|t| t.profile.legacy_compat = *checked);
-                            // 勾选状态也属于会话设置：下次从侧栏连同一个会话要保留
-                            this.persist_rd_settings();
+                            this.profile.legacy_compat = *checked;
+                            // 勾选状态也属于会话设置：下次从侧栏连同一个会话要保留。
+                            // 面板不写盘，只置标志；app 取走后按本面板的 profile 写回。
+                            this.settings_dirty = true;
                             cx.notify();
                         })),
                 );
@@ -1504,12 +1645,10 @@ impl RemoteDesktopTab {
                     .icon(ic(IconName::Plug))
                     .label("连接")
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.active_rd(|t| {
-                            t.connect_from_form(cx);
-                        });
+                        this.connect_from_form(cx);
                         // 表单里可能刚改过共享目录/兼容开关：写回它来源的会话，
                         // 否则下次从侧栏连同一个会话，盘符或兼容设置又没了。
-                        this.persist_rd_settings();
+                        this.settings_dirty = true;
                     })),
             );
         }
@@ -1527,7 +1666,8 @@ impl RemoteDesktopTab {
                     .child(
                         div()
                             .text_size(px(16.0))
-                            .child(format!("🖥 {}", self.title())),
+                            // 显式路径：本 trait 也有 `title(window, cx)`，直接 self.title() 会歧义
+                            .child(format!("🖥 {}", RemoteDesktopTab::title(self))),
                     )
                     .child(
                         div()
@@ -1544,28 +1684,100 @@ impl RemoteDesktopTab {
     }
 }
 
-/// 读取 app 的活动远程桌面标签。
-trait ActiveRd {
-    fn active_rd(&mut self, f: impl FnOnce(&mut RemoteDesktopTab));
-    fn active_rd_ref(&self) -> Option<&RemoteDesktopTab>;
-}
-
-impl ActiveRd for crate::app::RustTermApp {
-    fn active_rd(&mut self, f: impl FnOnce(&mut RemoteDesktopTab)) {
-        let idx = self.active.min(self.tabs.len().saturating_sub(1));
-        if let Some(TabContent::RemoteDesktop(tab)) = self.tabs.get_mut(idx) {
-            f(tab);
-        }
-    }
-    fn active_rd_ref(&self) -> Option<&RemoteDesktopTab> {
-        match self.tabs.get(self.active) {
-            Some(TabContent::RemoteDesktop(tab)) => Some(tab),
-            _ => None,
-        }
+impl Focusable for RemoteDesktopTab {
+    /// dock 要的焦点句柄：必须与 `render_panel` 里 `track_focus` 用的是同一个
+    /// （`OnceCell` 惰性建一次），否则键盘事件会落到另一个句柄上 —— 表现为
+    /// 「点进画面按键没反应」。
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.focus.get_or_init(|| cx.focus_handle()).clone()
     }
 }
 
-use crate::tabs::TabContent;
+impl Render for RemoteDesktopTab {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_panel(window, cx)
+    }
+}
+
+impl EventEmitter<PanelEvent> for RemoteDesktopTab {}
+
+/// 远程桌面面板被 dock 选中为活动面板（见 `BasePanel::set_active`）。
+///
+/// app 订阅它来记住「当前活动的远程面板」，用于「关闭当前窗格」等动作。
+pub struct RdActivated;
+
+impl EventEmitter<RdActivated> for RemoteDesktopTab {}
+
+impl BasePanel for RemoteDesktopTab {
+    fn panel_name(&self) -> &'static str {
+        "RemoteDesktop"
+    }
+
+    fn closable(&self, _: &App) -> bool {
+        true
+    }
+
+    fn zoomable(&self, _: &App) -> bool {
+        true
+    }
+
+    /// 面板被 dock 选为活动面板：通知 app「现在前台是这个远程面板」。
+    ///
+    /// app 订阅 [`RdActivated`] 并记住它，用于「关闭当前窗格」这类需要知道
+    /// 操作对象的动作（dock 没有暴露「当前选中面板」的查询接口）。
+    /// 面板本身没有活动/非活动的呈现差异，这里只补一次 notify。
+    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            cx.emit(RdActivated);
+        }
+        cx.notify();
+    }
+
+    fn set_zoomed(&mut self, _: bool, _: &mut Window, cx: &mut Context<Self>) {
+        cx.notify();
+    }
+
+    /// 面板离开 dock（关闭标签）：断开后端会话，线程与 socket 随之释放。
+    fn on_removed(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.disconnect();
+        cx.notify();
+    }
+
+    /// 持久化：只记面板名（同 TerminalView，`load` 时不重建会话）。
+    fn dump(&self, _: &App) -> PanelState {
+        PanelState::new(self.panel_name())
+    }
+}
+
+impl SkinPanel for RemoteDesktopTab {
+    fn tab_name(&self, _: &App) -> Option<SharedString> {
+        // 显式路径：方法名与本 trait 的 `title` 撞名，直接 `self.title()` 会解析歧义
+        Some(SharedString::from(RemoteDesktopTab::title(self)))
+    }
+
+    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .child(ic(IconName::Monitor).xsmall())
+            .child(SharedString::from(RemoteDesktopTab::title(self)))
+    }
+
+    /// 画面要贴边铺满，标签组不要给它加内边距。
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
+
+    /// 保留标题栏（拖拽标签、缩放按钮都在上面）。
+    fn title_bar(&self, _: &App) -> bool {
+        true
+    }
+
+    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
+        Some(PanelControl::Both)
+    }
+}
 
 impl RemoteDesktopTab {
     /// 从连接表单回填参数并连接。需要读输入实体值，由 app 层提供 cx。

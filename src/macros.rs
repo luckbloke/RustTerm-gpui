@@ -547,8 +547,8 @@ impl MacroPanel {
                             .icon(ic(IconName::Download))
                             .label("导入")
                             .compact()
-                            .on_click(cx.listener(|this, _, _, _| {
-                                this.macros.import_macros();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.macros.import_macros(window, cx);
                             })),
                     )
                     .child(
@@ -556,8 +556,8 @@ impl MacroPanel {
                             .icon(ic(IconName::Upload))
                             .label("导出")
                             .compact()
-                            .on_click(cx.listener(|this, _, _, _| {
-                                this.macros.export_macros();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.macros.export_macros(window, cx);
                             })),
                     ),
             )
@@ -940,30 +940,55 @@ impl MacroPanel {
         (!out.is_empty()).then_some(out)
     }
 
-    fn import_macros(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                if let Ok(imported) = serde_json::from_str::<Vec<KeyMacro>>(&content) {
-                    self.macros.extend(imported);
-                }
-            }
-        }
+    /// 导入宏：后台线程弹文件框 → 读文件 → 反序列化，成功后回投合并进列表。
+    ///
+    /// 原生对话框与同步文件 IO 都不能留在 UI 线程（Windows 上会崩）。
+    /// 用户取消、读文件失败或 JSON 不合法 → 什么都不发生（保持原语义）。
+    fn import_macros(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<crate::app::RustTermApp>,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let imported = cx
+                .background_executor()
+                .spawn(async {
+                    let path = rfd::FileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .pick_file()?;
+                    let content = std::fs::read_to_string(path).ok()?;
+                    serde_json::from_str::<Vec<KeyMacro>>(&content).ok()
+                })
+                .await;
+            // 取消 / 失败：什么都不做
+            let Some(imported) = imported else { return };
+            this.update_in(cx, |this, _window, cx| {
+                this.macros.macros.extend(imported);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn export_macros(&self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .set_file_name("macros.json")
-            .save_file()
-        {
-            let _ = std::fs::write(
-                path,
-                serde_json::to_string_pretty(&self.macros).unwrap_or_default(),
-            );
-        }
+    /// 导出宏：先在 UI 侧序列化（数据量小），再在后台弹保存框并写盘。
+    fn export_macros(&self, window: &mut Window, cx: &mut Context<crate::app::RustTermApp>) {
+        let json = serde_json::to_string_pretty(&self.macros).unwrap_or_default();
+        cx.spawn_in(window, async move |_this, cx| {
+            cx.background_executor()
+                .spawn(async move {
+                    let Some(path) = rfd::FileDialog::new()
+                        .add_filter("JSON", &["json"])
+                        .set_file_name("macros.json")
+                        .save_file()
+                    else {
+                        return;
+                    };
+                    let _ = std::fs::write(path, json);
+                })
+                .await;
+        })
+        .detach();
     }
 
     /// 按快捷键查找宏，返回其在列表中的下标。

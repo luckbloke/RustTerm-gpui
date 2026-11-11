@@ -158,6 +158,37 @@ impl HostServer {
         if events.len() > MAX_INPUT_BATCH {
             return Err(format!("输入批次超过 {MAX_INPUT_BATCH} 个事件"));
         }
+        // NyaTerm（task-14）：批内 Motion 合并——连续的位置事件只保留最新一个。
+        // 位置型事件天然可合并（中间位置没有意义），而 GDK3 XI2 模式每收到一个
+        // 事件就同步调 XIQueryPointer：事件越少，查询风暴越小，应答延迟越低。
+        // 按键/滚轮与位置事件的相对顺序必须保留（点击位置对账），所以只在
+        // 「相邻都是位置事件」时合并。
+        let mut coalesced = 0usize;
+        let mut merged: Vec<XInputEvent> = Vec::with_capacity(events.len());
+        for event in events {
+            let is_move =
+                matches!(event, XInputEvent::Pointer { .. } | XInputEvent::PointerWithButtons { .. });
+            if is_move {
+                if let Some(last @ (XInputEvent::Pointer { .. } | XInputEvent::PointerWithButtons { .. })) =
+                    merged.last_mut()
+                {
+                    *last = event.clone();
+                    coalesced += 1;
+                    continue;
+                }
+            }
+            merged.push(event.clone());
+        }
+        if coalesced >= 8 {
+            // 只在风暴级合并时留痕（批量每 16ms 到一次，逐批打日志会刷屏）
+            crate::xsrv::log_line(format_args!(
+                "[xi-q] 输入批 Motion 合并：{} → {}（合并 {}）",
+                events.len(),
+                merged.len(),
+                coalesced
+            ));
+        }
+        let events = &merged[..];
         let mut state = self.shared.state();
         for event in events {
             match *event {

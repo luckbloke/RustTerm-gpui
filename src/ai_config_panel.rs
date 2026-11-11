@@ -13,7 +13,6 @@ use gpui_kit::component::button::Button;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::theme::Theme;
-use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 /// AI 配置面板输入实体（关闭时整体丢弃）。
@@ -56,7 +55,8 @@ impl AiConfigPanel {
                 e
             };
             let ai = &config.ai;
-            self.inputs = Some(AiConfigInputs {
+            // mk 闭包借用了 cx/window：先把 8 个输入框都建好，再结束借用去设置掩码
+            let inputs = AiConfigInputs {
                 api_key: mk(ai.api_key.clone(), "sk-..."),
                 base_url: mk(ai.base_url.clone(), ai.provider().default_base_url()),
                 model: mk(ai.model.clone(), ai.provider().default_model()),
@@ -65,7 +65,16 @@ impl AiConfigPanel {
                 max_history: mk(format!("{}", ai.max_history), "20"),
                 context_lines: mk(format!("{}", ai.context_lines), "50"),
                 context_max_line_len: mk(format!("{}", ai.context_max_line_len), "500"),
-            });
+            };
+            drop(mk);
+            // API Key 默认掩码显示：这是凭据，不该在屏幕上一览无余
+            //（旁边的「明文」按钮可以按需展开）。
+            if !self.show_key {
+                inputs
+                    .api_key
+                    .update(cx, |s, cx| s.set_masked(true, window, cx));
+            }
+            self.inputs = Some(inputs);
         }
         let inputs = self.inputs.clone().unwrap();
         let ai = &config.ai;
@@ -122,14 +131,6 @@ impl AiConfigPanel {
             .overflow_y_scrollbar()
             .child(provider_row)
             .child(field("API Key", &inputs.api_key))
-            .when(self.show_key, |d| {
-                d.child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(dim)
-                        .child(ai.api_key.clone()),
-                )
-            })
             .child(
                 div()
                     .h_flex()
@@ -138,8 +139,16 @@ impl AiConfigPanel {
                         Button::new("ai-key-show")
                             .label(if self.show_key { "隐藏" } else { "明文" })
                             .compact()
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.ai_config_panel.show_key = !this.ai_config_panel.show_key;
+                                // 之前这个按钮只切换下面那行提示文本，输入框本身
+                                // 一直是明文——等于凭据永远暴露在屏幕上。
+                                let masked = !this.ai_config_panel.show_key;
+                                if let Some(inputs) = &this.ai_config_panel.inputs {
+                                    inputs
+                                        .api_key
+                                        .update(cx, |s, cx| s.set_masked(masked, window, cx));
+                                }
                                 cx.notify();
                             })),
                     )
@@ -245,39 +254,66 @@ impl crate::app::RustTermApp {
                 .map(|i| pick(i).read(cx).value().to_string())
                 .unwrap_or_default()
         }
+        /// 数字字段解析：非法输入不能静默保留旧值（用户以为改了，其实没生效）。
+        fn number<T: std::str::FromStr>(
+            raw: &str,
+            field: &str,
+            clamp: impl Fn(T) -> T,
+        ) -> Result<T, String> {
+            raw.trim()
+                .parse::<T>()
+                .map(&clamp)
+                .map_err(|_| format!("「{field}」不是合法数字：{}", raw.trim()))
+        }
+
         let panel = &self.ai_config_panel;
-        self.config.ai.api_key = get(panel, &|i| &i.api_key, cx);
-        self.config.ai.base_url = get(panel, &|i| &i.base_url, cx);
-        self.config.ai.model = get(panel, &|i| &i.model, cx);
-        self.config.ai.max_tokens = get(panel, &|i| &i.max_tokens, cx)
-            .trim()
-            .parse::<f64>()
-            .map(|v| v.clamp(1.0, 1_000_000.0) as u32)
-            .unwrap_or(self.config.ai.max_tokens);
-        self.config.ai.temperature = get(panel, &|i| &i.temperature, cx)
-            .trim()
-            .parse()
-            .map(|v: f32| v.clamp(0.0, 2.0))
-            .unwrap_or(self.config.ai.temperature);
-        self.config.ai.max_history = get(panel, &|i| &i.max_history, cx)
-            .trim()
-            .parse::<f64>()
-            .map(|v| v.clamp(1.0, 1000.0) as usize)
-            .unwrap_or(self.config.ai.max_history);
-        self.config.ai.context_lines = get(panel, &|i| &i.context_lines, cx)
-            .trim()
-            .parse::<f64>()
-            .map(|v| v.clamp(0.0, 5000.0) as usize)
-            .unwrap_or(self.config.ai.context_lines);
-        self.config.ai.context_max_line_len = get(panel, &|i| &i.context_max_line_len, cx)
-            .trim()
-            .parse::<f64>()
-            .map(|v| v.clamp(1.0, 100_000.0) as usize)
-            .unwrap_or(self.config.ai.context_max_line_len);
+        // 文本字段一律 trim：Key / URL 末尾多一个空格或换行会让请求直接失败，
+        // 而界面上完全看不出来。
+        let api_key = get(panel, &|i| &i.api_key, cx).trim().to_string();
+        let base_url = get(panel, &|i| &i.base_url, cx).trim().to_string();
+        let model = get(panel, &|i| &i.model, cx).trim().to_string();
+        let max_tokens = get(panel, &|i| &i.max_tokens, cx);
+        let temperature = get(panel, &|i| &i.temperature, cx);
+        let max_history = get(panel, &|i| &i.max_history, cx);
+        let context_lines = get(panel, &|i| &i.context_lines, cx);
+        let context_max_line_len = get(panel, &|i| &i.context_max_line_len, cx);
+
+        let parsed = (|| -> Result<(), String> {
+            let max_tokens: f64 = number(&max_tokens, "aiMaxTokens", |v: f64| v.clamp(1.0, 1_000_000.0))?;
+            let temperature: f32 = number(&temperature, "aiTemperature", |v: f32| v.clamp(0.0, 2.0))?;
+            let max_history: f64 = number(&max_history, "对话历史条数", |v: f64| v.clamp(1.0, 1000.0))?;
+            let context_lines: f64 = number(&context_lines, "终端上下文行数", |v: f64| v.clamp(0.0, 5000.0))?;
+            let line_len: f64 =
+                number(&context_max_line_len, "单行最大字符数", |v: f64| v.clamp(1.0, 100_000.0))?;
+            self.config.ai.api_key = api_key.clone();
+            self.config.ai.base_url = base_url.clone();
+            self.config.ai.model = model.clone();
+            self.config.ai.max_tokens = max_tokens as u32;
+            self.config.ai.temperature = temperature;
+            self.config.ai.max_history = max_history as usize;
+            self.config.ai.context_lines = context_lines as usize;
+            self.config.ai.context_max_line_len = line_len as usize;
+            Ok(())
+        })();
+        if let Err(e) = parsed {
+            // 数字非法：**不关面板、不落盘**，让用户改完再存（原来会静默用旧值）
+            self.set_toast(format!("未保存：{e}"));
+            cx.notify();
+            return;
+        }
+
         self.ai_config_panel.open = false;
         self.ai_config_panel.inputs = None;
         match self.config.save() {
-            Ok(_) => self.set_toast("AI 配置已保存"),
+            Ok(_) => {
+                // 配置合法但明显不完整时给一句明确提示：否则用户回到面板
+                // 发消息只会看到一条错误，还得自己猜哪项没填。
+                if self.config.ai.model.is_empty() || !self.config.ai.has_endpoint() {
+                    self.set_toast("AI 配置已保存（提示：模型名 / Base URL 为空，发送前请补齐）");
+                } else {
+                    self.set_toast("AI 配置已保存");
+                }
+            }
             Err(e) => self.set_toast(e),
         }
         cx.notify();

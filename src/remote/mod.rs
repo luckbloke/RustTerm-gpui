@@ -508,3 +508,33 @@ pub fn printable_keysym(key: &str, shift: bool) -> Option<u32> {
 // 「连一个没人监听的端口」，要求：必须收到 Error 事件、必须收到
 // Disconnected、进程不能挂。
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    /// 「无脏数据不上传图像」的离线证据（task-10 的验收项之一）。
+    ///
+    /// 空闲 CPU 的大头就是这 4MB：1280×800 的 RGBA→BGRA 转换 + 整张纹理上传。
+    /// UI 侧每次 poll 都会问一次 `take_texture()`，没有变化必须是 `None`——
+    /// 否则每个空帧都在做一次全屏转换与上传（`[rd-paint] img_size=1280x800`
+    /// 就是这么来的）。
+    #[test]
+    fn clean_framebuffer_never_uploads_again() {
+        let mut fb = crate::framebuf::FrameBuffer::new();
+        assert!(fb.resize(1280, 800), "首次 resize 应建立缓冲");
+
+        // resize 之后第一帧是全脏的（首帧必须上屏一次）
+        assert!(fb.take_texture().is_some());
+        // 没有新内容：不得再次转换/上传
+        assert!(fb.take_texture().is_none(), "干净帧缓冲不得重复产出纹理");
+        assert!(fb.take_texture().is_none());
+
+        // 一块脏矩形 → 恰好产出一次
+        assert!(fb.put(10, 10, 4, 4, &[0u8; 4 * 4 * 4]));
+        assert!(fb.take_texture().is_some());
+        assert!(fb.take_texture().is_none(), "取过一次后必须回到干净态");
+
+        // 越界脏区被丢弃 → 仍然干净（垃圾包不该触发一次全屏上传）
+        assert!(!fb.put(5000, 5000, 4, 4, &[0u8; 4 * 4 * 4]));
+        assert!(fb.take_texture().is_none());
+    }
+}

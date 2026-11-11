@@ -1,4 +1,4 @@
-﻿//! X11 服务端的连接循环。
+//! X11 服务端的连接循环。
 //!
 //! 一条连接的生命周期：
 //! 1. 读 setup request → 回 setup reply（编解码在 `handshake.rs`）；
@@ -227,6 +227,12 @@ where
     // 字段），归因 GTK 启动探测链——"窗口 0 从哪来"。
     const TRACE_UPTO: u16 = 80;
 
+    // task-14：查询应答积压统计（见循环体内的 [xi-q] 证据日志）
+    let mut query_backlog_ms: u64 = 0;
+    let mut draw_reqs_since: u64 = 0;
+    let mut draw_ms_since: u64 = 0;
+    let mut query_logs: u32 = 0;
+
     loop {
         let mut header = [0u8; 4];
         match reader.read_exact(&mut header).await {
@@ -317,6 +323,43 @@ where
         let bigreq_enable = matches!(request, Request::BigreqEnable(_));
         crate::xsrv::counters::REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::xsrv::counters::note_request(major_opcode, minor_opcode);
+
+        // ---- task-14 证据：查询应答被绘制流阻塞的量化 ----
+        //
+        // XI2 模式下 GDK3 每收到一个输入事件就同步调 XIQueryPointer（minor 40）；
+        // 核心模式走 QueryPointer（major 38）。两者应答都排在该连接**前面尚未
+        // 处理完的绘制请求**之后——「非查询请求的处理耗时」就是这次查询的
+        // 应答延迟的下界。窗口值 >= 20ms 才留痕（复现一次即可量化堵塞程度）。
+        let is_pointer_query = major_opcode == 38
+            || matches!(
+                extensions.get_from_major_opcode(major_opcode),
+                Some((name, _)) if name == "XInputExtension" && minor_opcode == 40
+            );
+        let is_draw_op = major_opcode == super::render::OPCODE_RENDER
+            || (62..=77).contains(&major_opcode);
+        let handle_started = std::time::Instant::now();
+        let result = shared.state().handle(client_index, sequence, &request);
+        {
+            let ms = handle_started.elapsed().as_millis() as u64;
+            if is_pointer_query {
+                if query_backlog_ms >= 20 && query_logs < 200 {
+                    query_logs += 1;
+                    crate::xsrv::log_line(format_args!(
+                        "[xi-q] c{client_index} seq{sequence} 查询应答前积压：绘制/其他请求处理 {}ms（draw_reqs=+{draw_reqs_since} draw_ms=+{draw_ms_since}）",
+                        query_backlog_ms
+                    ));
+                }
+                query_backlog_ms = 0;
+                draw_reqs_since = 0;
+                draw_ms_since = 0;
+            } else {
+                query_backlog_ms += ms;
+                if is_draw_op {
+                    draw_reqs_since += 1;
+                    draw_ms_since += ms;
+                }
+            }
+        }
         if recent.len() == 5 {
             recent.pop_front();
         }
@@ -334,11 +377,7 @@ where
                 "[x11] c{client_index} #{sequence} {name} args={words:?}"
             ));
         }
-                        let result = shared.state().handle(client_index, sequence, &request);
         if let Err(e) = result {
-            // 把请求名也打出来：只给 major opcode 的话，每接一个真实程序都得回来
-            // 翻协议表查"93 到底是哪条请求"。Debug 输出可能很长（PutImage 带像素），
-            // 取前 160 个字符够定位了。
             let what: String = format!("{request:?}").chars().take(160).collect();
             // NyaTerm: 同时写诊断日志——发给客户端的 X 错误是子进程崩溃
             // （"Channel closing"）的直接原因，stderr 在应用控制台里看不见。

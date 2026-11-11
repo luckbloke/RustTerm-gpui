@@ -111,14 +111,31 @@
       "legacy_compat": true,
       "x11": false,
       "group": "默认分组"
+    },
+    {
+      "id": "a200a491-0afe-4d02-8ca0-5c3f6cdfb3c3",
+      "name": "192.168.1.19",
+      "kind": "Vnc",
+      "host": "192.168.1.19",
+      "port": 5901,
+      "user": "",
+      "password": "12345678",
+      "auth_method": "password",
+      "key_path": "",
+      "domain": "",
+      "share_dir": "",
+      "legacy_compat": false,
+      "x11": false,
+      "group": "默认分组"
     }
   ],
   "recent": [
     "f6bd39e0-c96e-4799-ba32-03482e8858b5",
-    "f24dae5f-a1bb-4129-b43e-323cd46c08fb",
-    "926ef1e6-0ba7-4663-ad33-e5294c96d8b7",
-    "5d4fcac5-6ad1-44e3-9b1c-93d5792bacea",
     "2e73f1de-44cb-4a80-a503-bf004707aedc",
+    "926ef1e6-0ba7-4663-ad33-e5294c96d8b7",
+    "f24dae5f-a1bb-4129-b43e-323cd46c08fb",
+    "5d4fcac5-6ad1-44e3-9b1c-93d5792bacea",
+    "a200a491-0afe-4d02-8ca0-5c3f6cdfb3c3",
     "4575f31e-06d4-4852-a448-21e213eed52a",
     "106c958b-85a1-406d-9cf4-435af55d149a"
   ]

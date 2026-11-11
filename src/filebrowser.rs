@@ -183,6 +183,14 @@ impl FileBrowser {
             self.path_input = Some(input);
         }
         let path_input = self.path_input.clone().unwrap();
+        // 路径变化时同步显示值；输入框有焦点（用户正在输入）时不打扰，
+        // 失焦后下一次渲染再同步（与 SFTP 面板同款行为）。
+        let editing = path_input.read(cx).focus_handle(cx).is_focused(window);
+        let current = path_input.read(cx).value().to_string();
+        let want = self.path.to_string_lossy().to_string();
+        if current != want && !editing {
+            path_input.update(cx, |s, cx| s.set_value(want.clone(), window, cx));
+        }
 
         // ---- 工具栏 ----
         let mut bar = div()

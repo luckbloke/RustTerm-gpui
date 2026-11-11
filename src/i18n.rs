@@ -49,6 +49,7 @@ impl Default for I18n {
 impl I18n {
     pub fn set_lang(&mut self, id: &str) {
         self.lang = Lang::from_id(id);
+        self.sync_locale();
     }
 
     pub fn id(&self) -> &'static str {
@@ -57,6 +58,20 @@ impl I18n {
 
     pub fn toggle(&mut self) {
         self.lang = self.lang.toggled();
+        self.sync_locale();
+    }
+
+    /// 把当前语言同步给 gpui_kit 组件库（输入框右键菜单的剪切/复制/粘贴、
+    /// 日历、按钮等内置文案走 rust_i18n）。
+    ///
+    /// ui.yml 的键：`zh-CN` 与 `en` 都有（main.rs 曾硬编码 "zh-CN"）。
+    /// 这里集中同步，App::new 的 set_lang 与语言切换按钮都会走到。
+    fn sync_locale(&self) {
+        let locale = match self.lang {
+            Lang::Zh => "zh-CN",
+            Lang::En => "en",
+        };
+        gpui_kit::component::set_locale(locale);
     }
 
     #[allow(dead_code)]
@@ -102,6 +117,8 @@ pub fn tr(lang: Lang, key: &str) -> String {
         (En, "item.split_right") => "Split Right",
         (Zh, "item.split_down") => "向下分屏",
         (En, "item.split_down") => "Split Down",
+        (Zh, "item.move_into_split") => "把当前标签放进分屏",
+        (En, "item.move_into_split") => "Move Tab into Split",
         (Zh, "item.close_pane") => "关闭当前窗格",
         (En, "item.close_pane") => "Close Pane",
         (Zh, "item.next_pane") => "下一个窗格",
@@ -289,6 +306,116 @@ pub fn tr(lang: Lang, key: &str) -> String {
         (Zh, "common.language_switch") => "切换到 English",
         (En, "common.language_switch") => "Switch to 中文",
 
+        // ---- AI 面板（ai_assistant.rs + app.rs 的 ai_context_menu_ui）----
+        (Zh, "ai.title") => "AI 助手",
+        (En, "ai.title") => "AI Assistant",
+        (Zh, "ai.agent") => "Agent",
+        (En, "ai.agent") => "Agent",
+        (Zh, "ai.tooltip_screenshot") => "截取屏幕并附加",
+        (En, "ai.tooltip_screenshot") => "Capture screen and attach",
+        (Zh, "ai.tooltip_clear") => "清空对话",
+        (En, "ai.tooltip_clear") => "Clear conversation",
+        (Zh, "ai.tooltip_settings") => "AI 设置",
+        (En, "ai.tooltip_settings") => "AI Settings",
+        (Zh, "ai.tooltip_close") => "关闭 AI 面板",
+        (En, "ai.tooltip_close") => "Close AI panel",
+        (Zh, "ai.read_only") => "🔒 只读",
+        (En, "ai.read_only") => "🔒 Read-only",
+        (Zh, "ai.welcome_title") => "你好，我是 RustTerm AI 助手",
+        (En, "ai.welcome_title") => "Hi, I'm the RustTerm AI assistant",
+        (Zh, "ai.welcome_sub") => "可以询问运维命令、排查问题、分析日志等",
+        (En, "ai.welcome_sub") => "Ask about ops commands, troubleshooting, log analysis, and more",
+        (Zh, "ai.no_api_key") => "ℹ 当前未填 API Key，将按无鉴权方式请求（本地网关可用）",
+        (En, "ai.no_api_key") => "ℹ No API Key set — requests go out unauthenticated (local gateways work)",
+        (Zh, "ai.placeholder") => "问点什么...（Enter 发送）",
+        (En, "ai.placeholder") => "Ask something... (Enter to send)",
+        (Zh, "ai.copy_btn") => "📋 复制",
+        (En, "ai.copy_btn") => "📋 Copy",
+        (Zh, "ai.toast_copied") => "已复制消息内容",
+        (En, "ai.toast_copied") => "Message copied",
+        (Zh, "ai.task_done") => "✅ 任务已完成",
+        (En, "ai.task_done") => "✅ Task completed",
+        (Zh, "ai.readonly_blocked") => "🔒 只读模式已禁用",
+        (En, "ai.readonly_blocked") => "🔒 Disabled in read-only mode",
+        (Zh, "ai.dangerous") => "⚠ 危险",
+        (En, "ai.dangerous") => "⚠ Dangerous",
+        (Zh, "ai.send_to_terminal") => "发送到终端",
+        (En, "ai.send_to_terminal") => "Send to terminal",
+        (Zh, "ai.dangerous_disabled") => "⚠ 危险，已禁用",
+        (En, "ai.dangerous_disabled") => "⚠ Dangerous, disabled",
+        (Zh, "ai.thinking") => "思考中…",
+        (En, "ai.thinking") => "Thinking…",
+        (Zh, "ai.stop") => "停止",
+        (En, "ai.stop") => "Stop",
+        (Zh, "ai.attach_hint") => "📎 发送时自动附带：{hint} + 最近 {n} 行终端输出",
+        (En, "ai.attach_hint") => "📎 Attaches on send: {hint} + last {n} lines of terminal output",
+        (Zh, "ai.file_chip") => "📄 {name}（{size}）点击移除",
+        (En, "ai.file_chip") => "📄 {name} ({size}) — click to remove",
+        (Zh, "ai.shot_chip") => "🖼 {name}（{w}×{h}）点击移除",
+        (En, "ai.shot_chip") => "🖼 {name} ({w}×{h}) — click to remove",
+        (Zh, "ai.attach") => "附加",
+        (En, "ai.attach") => "Attach",
+        (Zh, "ai.send") => "发送",
+        (En, "ai.send") => "Send",
+        (Zh, "ai.clear_input") => "清空输入",
+        (En, "ai.clear_input") => "Clear input",
+        (Zh, "ai.history_count") => "历史 {n} 条",
+        (En, "ai.history_count") => "{n} messages in history",
+        (Zh, "ai.menu_copy_sel") => "复制选中",
+        (En, "ai.menu_copy_sel") => "Copy selected",
+        (Zh, "ai.menu_copy_whole") => "复制整条消息",
+        (En, "ai.menu_copy_whole") => "Copy whole message",
+        (Zh, "ai.menu_copy_all") => "复制全部对话",
+        (En, "ai.menu_copy_all") => "Copy whole conversation",
+        (Zh, "ai.toast_sel_copied") => "已复制选中文字",
+        (En, "ai.toast_sel_copied") => "Selected text copied",
+        (Zh, "ai.toast_no_sel_copy") => "未选中文字，已复制整条消息",
+        (En, "ai.toast_no_sel_copy") => "No selection — copied the whole message",
+        (Zh, "ai.toast_whole_copied") => "已复制整条消息",
+        (En, "ai.toast_whole_copied") => "Whole message copied",
+        (Zh, "ai.toast_all_copied") => "已复制全部对话",
+        (En, "ai.toast_all_copied") => "Whole conversation copied",
+        (Zh, "ai.err_cancelled") => "已取消本次请求。",
+        (En, "ai.err_cancelled") => "Request cancelled.",
+        (Zh, "ai.err_no_base_url") => "未配置 Base URL，请点击右上角 ⚙ 打开 AI 配置。",
+        (En, "ai.err_no_base_url") => "Base URL not set — click ⚙ in the top-right to open AI settings.",
+        (Zh, "ai.err_no_model") => "尚未配置模型名，请点击右上角 ⚙ 打开 AI 配置。",
+        (En, "ai.err_no_model") => "Model name not set — click ⚙ in the top-right to open AI settings.",
+        (Zh, "ai.hist_truncated") => "\n（历史消息过长，已截断）",
+        (En, "ai.hist_truncated") => "\n(history too long, truncated)",
+        (Zh, "ai.config_error_hint") => "\n\n（点击右上角 ⚙ 打开 AI 配置）",
+        (En, "ai.config_error_hint") => "\n\n(Click ⚙ in the top-right to open AI settings)",
+        (Zh, "ai.err_worker_died") => "AI 请求线程异常退出（没有返回结果），已恢复可发送状态。",
+        (En, "ai.err_worker_died") => "AI request thread died without a result — sending re-enabled.",
+        (Zh, "ai.err_timeout") => "等待 AI 回复超时（{n} 秒），已放弃本次请求。",
+        (En, "ai.err_timeout") => "Timed out waiting for the AI reply ({n}s) — request dropped.",
+        (Zh, "ai.err_too_many_attachments") => "附件太多（最多 {n} 个：截图 + 文件），先移除一些再试。",
+        (En, "ai.err_too_many_attachments") => "Too many attachments (max {n}: screenshots + files) — remove some first.",
+        (Zh, "ai.err_pick_thread") => "文件选择线程异常退出。",
+        (En, "ai.err_pick_thread") => "File picker thread died unexpectedly.",
+        (Zh, "ai.err_shot_max") => "最多附加 {n} 张截图，先移除一张再截。",
+        (En, "ai.err_shot_max") => "At most {n} screenshots — remove one before capturing.",
+        (Zh, "ai.err_shot_encode") => "截图编码失败: {e}",
+        (En, "ai.err_shot_encode") => "Screenshot encode failed: {e}",
+        (Zh, "ai.err_shot_capture") => "截图失败: {e}",
+        (En, "ai.err_shot_capture") => "Screenshot failed: {e}",
+        (Zh, "ai.pick_dialog_title") => "选择要附加的文件",
+        (En, "ai.pick_dialog_title") => "Select files to attach",
+        (Zh, "ai.file_size_chars") => "{n} 字",
+        (En, "ai.file_size_chars") => "{n} chars",
+        (Zh, "ai.file_size_img") => "图片 {n} KB",
+        (En, "ai.file_size_img") => "Image {n} KB",
+        (Zh, "ai.agent_confirm_title") => "⚠ 危险命令，请确认",
+        (En, "ai.agent_confirm_title") => "⚠ Dangerous command — confirm",
+        (Zh, "ai.agent_confirm_run") => "执行",
+        (En, "ai.agent_confirm_run") => "Run",
+        (Zh, "ai.agent_confirm_skip") => "跳过",
+        (En, "ai.agent_confirm_skip") => "Skip",
+        (Zh, "ai.agent_confirm_abort") => "终止本轮",
+        (En, "ai.agent_confirm_abort") => "Abort run",
+        (Zh, "ai.agent_stop") => "停止 Agent",
+        (En, "ai.agent_stop") => "Stop Agent",
+
         (_, other) => return other.to_string(),
     };
     s.to_string()
@@ -314,5 +441,48 @@ mod tests {
         assert_eq!(Lang::from_id("en-US"), Lang::En);
         assert_eq!(Lang::from_id("zh-CN"), Lang::Zh);
         assert_eq!(Lang::Zh.toggled(), Lang::En);
+    }
+
+    /// 界面里每个 `tr(lang, "键")` 用到的键都必须在**两种语言**里都有译文。
+    ///
+    /// 漏译不会报错：`tr` 会原样返回键名，界面上就直接显示
+    /// `item.move_into_split` 这种字符串。新增菜单项/文案时最容易漏这一步
+    /// （加「把当前标签放进分屏」时就是这么漏掉的），所以用测试兜住。
+    #[test]
+    fn every_referenced_key_has_both_translations() {
+        let sources = [
+            include_str!("app.rs"),
+            include_str!("rdp.rs"),
+            include_str!("terminal_view.rs"),
+            include_str!("sftp.rs"),
+            include_str!("filebrowser.rs"),
+            include_str!("ai_assistant.rs"),
+        ];
+        let marker = "tr(lang, \"";
+        let markers = ["tr(lang, \"", "tr(self.lang, \""];
+        let mut checked = 0usize;
+        let mut missing: Vec<&str> = Vec::new();
+        for src in sources {
+            for marker in markers {
+                let mut rest = src;
+                while let Some(pos) = rest.find(marker) {
+                    rest = &rest[pos + marker.len()..];
+                    let Some(end) = rest.find('"') else { break };
+                    let key = &rest[..end];
+                    rest = &rest[end..];
+                    if key.is_empty() || key.contains('{') || key.contains(' ') {
+                        continue; // 不是静态键（格式化或表达式），跳过
+                    }
+                    checked += 1;
+                    if tr(Lang::Zh, key) == key || tr(Lang::En, key) == key {
+                        missing.push(key);
+                    }
+                }
+            }
+        }
+        assert!(checked > 50, "扫描到的键太少（{checked}），扫描逻辑可能已失效");
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(missing.is_empty(), "缺少译文的键：{missing:?}");
     }
 }

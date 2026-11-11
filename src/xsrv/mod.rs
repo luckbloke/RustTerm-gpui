@@ -1,4 +1,4 @@
-﻿//! 进程内 X11 服务端（自研，纯 Rust）。
+//! 进程内 X11 服务端（自研，纯 Rust）。
 //!
 //! 设计与里程碑见 `docs/x11-server.md`。当前进度：**M2 + M5/M6 的精简版**
 //! —— M1（握手、分帧、资源与窗口语义、核心事件）之上有绘制能力（圆弧/多边形、
@@ -13,6 +13,7 @@
 pub mod draw;
 pub mod error;
 pub mod xinput;
+pub mod xkb;
 pub mod extensions;
 pub mod font;
 pub mod font_data;

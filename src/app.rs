@@ -1,4 +1,4 @@
-﻿//! 应用外壳（GPUI 版）：工具栏 + 快速连接栏 + 左侧会话栏 + 中央工作区（标签页）
+//! 应用外壳（GPUI 版）：工具栏 + 快速连接栏 + 左侧会话栏 + 中央工作区（标签页）
 //! + 右侧 SFTP / AI 助手面板 + 底部状态栏 + 各类对话框（覆盖层）。
 //!
 //! 标签页统一承载四类会话：本地 / SSH 终端、内置浏览器、远程桌面、SFTP。
@@ -15,10 +15,10 @@ use crate::config::AppConfig;
 use crate::config_panel::ConfigPanel;
 use crate::i18n::{tr, I18n};
 use crate::macros::MacroPanel;
-use crate::rdp::{RdTabProtocol, RdpConnectionProfile, RdpProfiles, RemoteDesktopTab};
+use crate::rdp::{RdActivated, RdTabProtocol, RdpConnectionProfile, RdpProfiles, RemoteDesktopTab};
 use crate::sessions::{SessionKind, SessionStore};
 use crate::sftp::SftpPanel;
-use crate::tabs::{dock_panels, PendingPane, TabContent, TerminalWorkspace};
+use crate::tabs::{dock_items, dock_panels, DockPanel, PendingPane, TabContent, TerminalWorkspace};
 use crate::term::{SpawnCfg, TermPane};
 use crate::terminal_view::TerminalView;
 use crate::ui_icons::ic;
@@ -42,6 +42,77 @@ use tokio::runtime::Runtime;
 
 /// 内置 Lucide 图标全集（`gpui-kit-assets` 提供完整目录）。
 use gpui_kit::assets::IconName;
+
+// ---------------------------------------------------------------------------
+// UI 帧调度（脏驱动重绘）
+// ---------------------------------------------------------------------------
+
+/// 帧预算（毫秒）：单帧 CPU 超过它就说明主线程已经吃紧——继续"画完立刻再画"
+/// 会把输入事件饿死（实测症状：过一会儿界面就操作不动了）。
+pub const FRAME_BUDGET_MS: u32 = 24;
+
+/// 活跃期的唤醒间隔（毫秒）。
+///
+/// 它不是帧率：唤醒只做 try_recv 级别的排空，真出帧还得有新内容。
+/// 8ms 决定的是"PTY 输出 / 远端帧多久被发现"，比原来的 60fps 轮询更跟手。
+pub const UI_WAKE_ACTIVE_MS: u64 = 8;
+
+/// 上一帧超预算时的唤醒间隔：退一步，给输入处理与合成留出空隙
+/// （避免"越忙越卡"的正反馈）。
+pub const UI_WAKE_BACKOFF_MS: u64 = 16;
+
+/// 没有任何活动内容时的兜底间隔（毫秒）。
+///
+/// 空闲时仍然要定期做几件必须轮询的事：隐藏面板事件排空、连接状态回传、
+/// ZMODEM 提示、布局标脏。200ms 对它们足够，而 CPU 占用可以忽略。
+pub const UI_WAKE_IDLE_MS: u64 = 200;
+
+/// `[hb-ui]` 汇报间隔（毫秒）。
+const UI_REPORT_MS: u128 = 5_000;
+
+/// 帧调度输入（都是"这一帧观察到的事实"）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameSignals {
+    /// 本帧处理过会改变画面的内容（PTY 输出 / 远端帧 / X11 变化 / 布局变化）
+    pub dirty: bool,
+    /// 本帧耗时（毫秒）
+    pub frame_ms: u32,
+}
+
+/// 这一帧画完后要不要**立刻**再续一帧（纯函数，可单测）。
+///
+/// 有脏内容才续帧；上一帧已经超预算就交给 UI 泵按退让节奏唤醒，不再自己
+/// 加码——"超预算还立刻续帧"就是越忙越卡的正反馈。
+pub fn wants_extra_frame(sig: FrameSignals) -> bool {
+    sig.dirty && sig.frame_ms < FRAME_BUDGET_MS
+}
+
+/// UI 泵的唤醒间隔（纯函数，可单测）。
+///
+/// - 没有活动内容 → 慢节奏兜底（空闲 CPU 目标就是靠这一条：不再 60fps 空转）；
+/// - 有活动内容 + 上帧超预算 → 退让节奏；
+/// - 有活动内容 → 快节奏（保证回显与远端画面跟手）。
+pub fn wake_interval_ms(live: bool, over_budget: bool) -> u64 {
+    if !live {
+        UI_WAKE_IDLE_MS
+    } else if over_budget {
+        UI_WAKE_BACKOFF_MS
+    } else {
+        UI_WAKE_ACTIVE_MS
+    }
+}
+
+/// 帧耗时窗口的百分位（纯函数，可单测）：返回 (p50, p95, max)。
+/// 空窗口返回 (0, 0, 0)。
+pub fn ui_frame_percentiles_of(samples: &[u32]) -> (u32, u32, u32) {
+    if samples.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let at = |q: f32| v[((v.len() - 1) as f32 * q).round() as usize];
+    (at(0.5), at(0.95), v[v.len() - 1])
+}
 
 // ---------------------------------------------------------------------------
 // 全局快捷键 action
@@ -133,6 +204,27 @@ pub struct RustTermApp {
     /// 当前聚焦的终端面板（每帧按窗口焦点刷新；焦点跑到菜单/输入框时保留上一次，
     /// 所以菜单项、右键菜单、AI 面板都还能作用于「刚才那个终端」）。
     pub focused_term: Option<WeakEntity<TerminalView>>,
+    /// 当前活动的**远程桌面面板**（dock 里有远程格时，`set_active` 会发
+    /// `RdActivated`，这里记下来）。「关闭当前窗格」要按它决定关哪一格。
+    pub focused_rd: Option<WeakEntity<RemoteDesktopTab>>,
+    /// ---- UI 帧调度（脏驱动重绘，见 `spawn_ui_pump`）----
+    /// 上一帧开始绘制的时刻
+    ui_frame_at: std::time::Instant,
+    /// 最近若干帧的耗时样本（环形缓冲，算 p50/p95 用）
+    ui_frame_ms: [u32; 64],
+    ui_frame_ms_len: usize,
+    ui_frame_ms_pos: usize,
+    /// 上一帧是否超预算（泵据此退让）
+    ui_over_budget: bool,
+    /// 上次唤醒渲染的时刻（泵据此限频）
+    ui_wake_at: std::time::Instant,
+    /// 有内容等待重绘但还没唤醒（限频时攒着，不能丢）
+    ui_paint_pending: bool,
+    /// 泵统计（`[hb-ui]` 证据：优化前后对比就看这几项）
+    ui_frames: u64,
+    ui_ticks: u64,
+    ui_wakes: u64,
+    ui_last_report: std::time::Instant,
     /// 工作区 dock 编号（生成 dock id 用）
     next_workspace_id: usize,
     /// 上次同步给面板的字号（配置里改了字号时推给所有面板）
@@ -146,6 +238,20 @@ pub struct RustTermApp {
     pub config_panel: ConfigPanel,
     pub ai_config_panel: AiConfigPanel,
     pub ai_assistant: AiAssistantPanel,
+    /// 真 Agent 执行循环（Agent 开关开启且用户下达任务时才有值）。
+    /// 驱动见 `agent_poll` / `agent_apply`；纯状态机在 `agent.rs`。
+    pub agent_loop: Option<crate::agent::AgentLoop>,
+    /// 本轮 Agent 锁定的终端窗格（Start 时锁定，中途死亡 → 终止本轮）。
+    pub agent_target: Option<Entity<TerminalView>>,
+    /// 当前命令写入终端的时刻。
+    pub agent_wait_since: Option<std::time::Instant>,
+    /// 上一次输出快照与时刻（静默检测：快照不变 ≥1.2s 即结算；
+    /// 快照变化会重置静默计时——慢命令的持续输出不会被半途截断）。
+    pub agent_last_snapshot: Option<(String, std::time::Instant)>,
+    /// Agent 模型请求的结果通道（后台线程 → UI）。
+    pub agent_rx: Option<std::sync::mpsc::Receiver<Result<String, crate::ai::AiError>>>,
+    /// Thinking 节流拍的上一帧时刻（150ms 一拍，避免等模型时 60fps 空转）。
+    pub agent_last_poll_notify: std::time::Instant,
     pub sftp: SftpPanel,
     pub macros: MacroPanel,
     pub rdp_profiles: RdpProfiles,
@@ -191,6 +297,10 @@ pub struct RustTermApp {
     pub focus_term: bool,
     /// 终端右键菜单的弹出位置（窗口坐标），None = 未打开
     pub term_menu: Option<Point<Pixels>>,
+    /// AI 面板右键菜单：窗口坐标 + 右键时所在消息的全文（复制整条用）
+    /// + **右键瞬间抓取的划选文字**（复制选中用——在右键处理里当场读
+    /// TextSelection，避免菜单弹出期间的任何交互把选区清掉）。
+    pub ai_menu: Option<(Point<Pixels>, String, String)>,
     /// 上一帧的活动标签
     pub last_active: usize,
     /// Telnet 表单
@@ -227,6 +337,16 @@ pub struct RustTermApp {
     pub pending_new_session: bool,
     /// 一次性初始化完成标记
     initialized: bool,
+    /// ZMODEM 发送：正在等用户选文件。
+    ///
+    /// 选择器必须在后台线程跑（见 `pick_folder_async` 的说明：Windows 上 rfd
+    /// 会在当前线程跑嵌套消息循环，撞上 GPUI 已持有的借用 → release 下直接
+    /// abort）；结果回前台再投递。记 EntityId 是为了把结果投回**原来那个**
+    /// 窗格——分屏/多标签时不能投错。
+    pub zmodem_pick: Option<(
+        EntityId,
+        std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>,
+    )>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -271,6 +391,53 @@ pub enum PaneAction {
     Close,
     /// 聚焦下一个面板
     Next,
+    /// 把当前标签放进另一个终端工作区的分屏（远程桌面 / 终端均可）
+    MoveTabIntoSplit,
+}
+
+/// 被拖拽的标签。
+///
+/// 松手落在中间内容区 = 把这个标签放进分屏（见
+/// [`RustTermApp::move_tab_into_split_at`]）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TabKey {
+    /// 终端工作区：用 dock 实体 id 作稳定标识
+    Dock(EntityId),
+    /// 远程桌面：用面板实体 id
+    Remote(EntityId),
+    /// 其它类型（浏览器 / 文件 / 宏 / 端口扫描）——不支持放进分屏
+    Other,
+}
+
+#[derive(Clone)]
+pub struct TabDrag {
+    /// 拖拽**开始时**的标签下标（仅用于预览提示）
+    pub index: usize,
+    /// 稳定标识：拖拽期间标签可能被重排（下标失效），落点按它重新解析
+    pub key: TabKey,
+    /// 标签文字（拖拽预览用）
+    pub label: SharedString,
+}
+
+/// 拖拽时跟随光标的预览块。
+struct TabDragPreview {
+    label: SharedString,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::global(cx).clone();
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(theme.colors.primary)
+            .bg(theme.colors.background)
+            .text_size(px(12.0))
+            .text_color(theme.colors.foreground)
+            .child(self.label.clone())
+    }
 }
 
 /// 构造一个下拉菜单项。
@@ -325,6 +492,18 @@ impl RustTermApp {
             term_focus: None,
             root_focus: None,
             focused_term: None,
+            focused_rd: None,
+            ui_frame_at: std::time::Instant::now(),
+            ui_frame_ms: [0; 64],
+            ui_frame_ms_len: 0,
+            ui_frame_ms_pos: 0,
+            ui_over_budget: false,
+            ui_wake_at: std::time::Instant::now(),
+            ui_paint_pending: false,
+            ui_frames: 0,
+            ui_ticks: 0,
+            ui_wakes: 0,
+            ui_last_report: std::time::Instant::now(),
             next_workspace_id: 1,
             pushed_font_size: 0.0,
             pending_pane_action: None,
@@ -333,6 +512,12 @@ impl RustTermApp {
             config_panel: ConfigPanel::default(),
             ai_config_panel: AiConfigPanel::default(),
             ai_assistant: AiAssistantPanel::default(),
+            agent_loop: None,
+            agent_target: None,
+            agent_wait_since: None,
+        agent_last_snapshot: None,
+            agent_rx: None,
+            agent_last_poll_notify: std::time::Instant::now(),
             sftp: SftpPanel::default(),
             macros: MacroPanel::default(),
             rdp_profiles: RdpProfiles::default(),
@@ -365,6 +550,7 @@ impl RustTermApp {
             find_focus: false,
             focus_term: false,
             term_menu: None,
+        ai_menu: None,
             last_active: 0,
             telnet_open: false,
             telnet_host: None,
@@ -388,6 +574,7 @@ impl RustTermApp {
             focus_address: false,
             pending_new_session: false,
             initialized: false,
+            zmodem_pick: None,
         }
     }
 
@@ -468,7 +655,7 @@ impl RustTermApp {
         self.push_tab(TabContent::Browser(tab));
     }
 
-    pub fn open_remote_desktop(&mut self, protocol: RdTabProtocol) {
+    pub fn open_remote_desktop(&mut self, protocol: RdTabProtocol, cx: &mut Context<Self>) {
         let profile = RdpConnectionProfile {
             name: format!("新建 {}", protocol.label()),
             protocol,
@@ -476,16 +663,18 @@ impl RustTermApp {
             port: protocol.default_port(),
             ..Default::default()
         };
-        self.push_tab(TabContent::RemoteDesktop(RemoteDesktopTab::new(profile)));
+        let tab = self.new_rd_tab(RemoteDesktopTab::new(profile), cx);
+        self.push_tab(tab);
     }
 
     /// 打开内置 X11 服务的画面标签（已存在则切过去）。
     ///
     /// X server 是进程内全局单例：SSH 会话启用 X11 转发后，远端 X 程序的
     /// 连接都灌进同一个屏幕；这个标签只是它的"取景器"。
-    pub fn open_x11_screen(&mut self) {
+    pub fn open_x11_screen(&mut self, cx: &mut Context<Self>) {
+        let app: &App = cx;
         if let Some(idx) = self.tabs.iter().position(
-            |t| matches!(t, TabContent::RemoteDesktop(tab) if tab.profile.protocol == RdTabProtocol::X11),
+            |t| matches!(t, TabContent::RemoteDesktop(tab) if tab.read(app).profile.protocol == RdTabProtocol::X11),
         ) {
             self.active = idx;
             return;
@@ -498,7 +687,8 @@ impl RustTermApp {
         };
         let mut tab = RemoteDesktopTab::new(profile);
         tab.connect();
-        self.push_tab(TabContent::RemoteDesktop(tab));
+        let tab = self.new_rd_tab(tab, cx);
+        self.push_tab(tab);
     }
 
     pub fn open_sftp(&mut self) {
@@ -626,7 +816,23 @@ impl RustTermApp {
     }
 
     /// 连接已保存的会话（listener 中传 jump 文本）。
-    pub fn connect_session(&mut self, id: &str, jump_host: &str) {
+    /// 创建一个远程桌面标签。
+    ///
+    /// 面板持有的是**实体**：这样它既能当普通标签渲染，也能被直接装进终端
+    /// 工作区的 dock 成为一个分屏格——「把远程桌面放进分屏」就靠这个。
+    fn new_rd_tab(&mut self, tab: RemoteDesktopTab, cx: &mut Context<Self>) -> TabContent {
+        let entity = cx.new(|_| tab);
+        // 记住「哪个远程面板在前台」：dock 不暴露当前选中面板的查询接口，
+        // 只能由面板在 set_active(true) 时发事件（见 rdp.rs BasePanel::set_active）。
+        cx.subscribe(&entity, |app, panel, _: &RdActivated, cx| {
+            app.focused_rd = Some(panel.downgrade());
+            cx.notify();
+        })
+        .detach();
+        TabContent::RemoteDesktop(entity)
+    }
+
+    pub fn connect_session(&mut self, id: &str, jump_host: &str, cx: &mut Context<Self>) {
         let Some(s) = self.sessions.by_id(id).cloned() else {
             return;
         };
@@ -678,7 +884,8 @@ impl RustTermApp {
                 self.rdp_profiles.ensure(profile.clone());
                 let mut tab = RemoteDesktopTab::new(profile);
                 tab.connect();
-                self.push_tab(TabContent::RemoteDesktop(tab));
+                let tab = self.new_rd_tab(tab, cx);
+                self.push_tab(tab);
             }
         }
     }
@@ -692,15 +899,17 @@ impl RustTermApp {
     ///（那是用户刚改的）。
     ///
     /// 值没变就不写盘：每次连接都刷一遍 sessions.json 没必要。
-    pub fn persist_rd_settings(&mut self) {
-        let (session_id, share_dir, legacy_compat) = match self.tabs.get(self.active) {
-            Some(TabContent::RemoteDesktop(tab)) => (
-                tab.profile.session_id.clone(),
-                tab.profile.share_dir.clone(),
-                tab.profile.legacy_compat,
-            ),
-            _ => return,
-        };
+    /// 把某个远程桌面面板的设置（共享目录 / 旧版兼容）写回它来源的会话。
+    ///
+    /// 由面板的 `settings_dirty` 标志驱动：面板自己改 `profile`，app 负责落盘。
+    /// **不依赖 `self.active`**——面板可能被放进终端工作区的 dock 分屏格，
+    /// 那时当前标签是终端而不是它。
+    pub fn persist_rd_settings_for(
+        &mut self,
+        session_id: Option<String>,
+        share_dir: String,
+        legacy_compat: bool,
+    ) {
         let Some(id) = session_id else { return };
         let Some(slot) = self.sessions.sessions.iter_mut().find(|s| s.id == id) else {
             return;
@@ -770,16 +979,19 @@ impl RustTermApp {
                 TabContent::Browser(t) => out.push(LastTab::Browser {
                     url: t.url.clone(),
                 }),
-                TabContent::RemoteDesktop(t) => out.push(LastTab::Rd {
-                    protocol: t.profile.protocol.key().to_string(),
-                    host: t.profile.host.clone(),
-                    port: t.profile.port,
-                    user: t.profile.username.clone(),
-                    domain: t.profile.domain.clone(),
-                    share_dir: t.profile.share_dir.clone(),
-                    legacy_compat: t.profile.legacy_compat,
-                    session_id: t.profile.session_id.clone(),
-                }),
+                TabContent::RemoteDesktop(t) => {
+                    let t = t.read(cx);
+                    out.push(LastTab::Rd {
+                        protocol: t.profile.protocol.key().to_string(),
+                        host: t.profile.host.clone(),
+                        port: t.profile.port,
+                        user: t.profile.username.clone(),
+                        domain: t.profile.domain.clone(),
+                        share_dir: t.profile.share_dir.clone(),
+                        legacy_compat: t.profile.legacy_compat,
+                        session_id: t.profile.session_id.clone(),
+                    })
+                }
                 TabContent::LocalFiles(_) => out.push(LastTab::Files),
                 // 连接中 / 失败 / 键宏 / 端口扫描没有恢复价值
                 TabContent::Connecting { .. }
@@ -882,6 +1094,7 @@ impl RustTermApp {
                         share_dir,
                         legacy_compat,
                         session_id,
+                        cx,
                     ) {
                         restored += 1;
                     }
@@ -954,6 +1167,7 @@ impl RustTermApp {
         share_dir: String,
         legacy_compat: bool,
         session_id: Option<String>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let Some(proto) = RdTabProtocol::from_key(protocol) else {
             return false;
@@ -993,7 +1207,8 @@ impl RustTermApp {
         if !password.is_empty() {
             tab.connect();
         }
-        self.push_tab(TabContent::RemoteDesktop(tab));
+        let tab = self.new_rd_tab(tab, cx);
+        self.push_tab(tab);
         true
     }
 
@@ -1016,9 +1231,9 @@ impl RustTermApp {
                 self.telnet_open = true;
                 self.focus_dialog = true;
             }
-            ToolAction::RdpClient => self.open_remote_desktop(RdTabProtocol::Rdp),
-            ToolAction::VncClient => self.open_remote_desktop(RdTabProtocol::Vnc),
-            ToolAction::SpiceClient => self.open_remote_desktop(RdTabProtocol::Spice),
+            ToolAction::RdpClient => self.open_remote_desktop(RdTabProtocol::Rdp, cx),
+            ToolAction::VncClient => self.open_remote_desktop(RdTabProtocol::Vnc, cx),
+            ToolAction::SpiceClient => self.open_remote_desktop(RdTabProtocol::Spice, cx),
             ToolAction::LocalFiles => self.open_local_files(),
             ToolAction::Browser => self.open_browser("about:blank"),
             ToolAction::Ping => {
@@ -1034,7 +1249,7 @@ impl RustTermApp {
             ToolAction::Tunnel => self.tunnel_open = true,
             ToolAction::Macro => self.open_macro_tab(),
             ToolAction::PortScan => self.open_port_scan_tab(),
-            ToolAction::X11Server => self.open_x11_screen(),
+            ToolAction::X11Server => self.open_x11_screen(cx),
         }
     }
 
@@ -1399,42 +1614,89 @@ impl RustTermApp {
         cx.notify();
     }
 
-    /// 关闭当前聚焦的终端面板；只剩一个面板时等价于关闭整个工作区标签。
+    /// 关闭当前聚焦的窗格；只剩一个窗格时等价于关闭整个工作区标签。
+    ///
+    /// 「当前聚焦」的判定顺序：
+    /// 1. **有终端面板在前台** → 关它（窗口焦点是最新鲜的信号）；
+    /// 2. 否则关**最后被 dock 激活的远程桌面面板**（面板 `set_active(true)`
+    ///    时发的 `RdActivated` 事件记在 `focused_rd`）。
+    ///
+    /// 注意「还剩几个窗格」必须用 `dock_items`（终端 + 远程桌面）：早先只看
+    /// 终端，dock 里放着「1 终端 + 1 远程」时会误判成「最后一格」而把整个
+    /// 标签关掉——两个会话一起没了。
     pub fn close_focused_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.focused_view(cx) else {
-            self.set_toast("没有可关闭的终端窗格");
-            return;
-        };
         let Some(dock) = self.active_workspace_dock() else {
+            // 远程桌面等非终端标签没有 dock：给个提示，别让快捷键像坏了
+            self.set_toast("当前标签没有可关闭的窗格");
+            cx.notify();
             return;
         };
-        if dock_panels(&dock, cx).len() <= 1 {
+        let pane_count = dock_items(&dock, cx).len();
+
+        // 1) 终端在前台：关这个终端窗格
+        if let Some(view) = self.focused_view(cx) {
+            if pane_count <= 1 {
+                let idx = self.active.min(self.tabs.len().saturating_sub(1));
+                self.close_tab(idx, cx);
+                window.blur(cx);
+                return;
+            }
+
+            // 关窗格等同于这段会话结束：先跑「断开时」宏（字节已进发送队列，随后销毁无影响）
+            let mut bytes: Vec<Vec<u8>> = Vec::new();
+            for i in self.macros.get_on_disconnect_macros() {
+                if let Some(b) = self.macros.send_macro_bytes(i) {
+                    bytes.push(b);
+                }
+            }
+            if !bytes.is_empty() {
+                view.update(cx, |v, _| {
+                    for b in &bytes {
+                        v.write_input(b.clone());
+                    }
+                });
+            }
+
+            dock.update(cx, |area, acx| {
+                area.remove_panel(view.clone(), window, acx);
+            });
+
+            // 焦点交给剩下的第一个终端面板
+            if let Some(next) = dock_panels(&dock, cx).first() {
+                let handle = next.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+                self.focused_term = Some(next.downgrade());
+            }
+            cx.notify();
+            return;
+        }
+
+        // 2) 没有终端在前台：关最后激活的远程桌面窗格
+        let Some(rd) = self.focused_rd.as_ref().and_then(|w| w.upgrade()) else {
+            self.set_toast("没有可关闭的窗格");
+            cx.notify();
+            return;
+        };
+        let in_this_dock = dock_items(&dock, cx)
+            .iter()
+            .any(|p| matches!(p, DockPanel::Remote(e) if *e == rd));
+        if !in_this_dock {
+            self.set_toast("没有可关闭的窗格");
+            cx.notify();
+            return;
+        }
+        if pane_count <= 1 {
             let idx = self.active.min(self.tabs.len().saturating_sub(1));
             self.close_tab(idx, cx);
             window.blur(cx);
             return;
         }
 
-        // 关窗格等同于这段会话结束：先跑「断开时」宏（字节已进发送队列，随后销毁无影响）
-        let mut bytes: Vec<Vec<u8>> = Vec::new();
-        for i in self.macros.get_on_disconnect_macros() {
-            if let Some(b) = self.macros.send_macro_bytes(i) {
-                bytes.push(b);
-            }
-        }
-        if !bytes.is_empty() {
-            view.update(cx, |v, _| {
-                for b in &bytes {
-                    v.write_input(b.clone());
-                }
-            });
-        }
-
         dock.update(cx, |area, acx| {
-            area.remove_panel(view.clone(), window, acx);
+            // 面板的 on_removed 会断开后端会话、释放线程与 socket
+            area.remove_panel(rd.clone(), window, acx);
         });
-
-        // 焦点交给剩下的第一个面板
+        self.focused_rd = None;
         if let Some(next) = dock_panels(&dock, cx).first() {
             let handle = next.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -1454,9 +1716,43 @@ impl RustTermApp {
         for view in self.all_term_views(cx) {
             if view.read(cx).focus_handle(cx) == handle {
                 self.focused_term = Some(view.downgrade());
+                // 焦点在终端上：清掉远程标记，避免「关闭当前窗格」关错
+                self.focused_rd = None;
                 return;
             }
         }
+        // 远程桌面面板同样按**窗口焦点**更新：`RdActivated` 只是「被 dock
+        // 选中」的边沿信号，同屏两个远程格时不会再触发，只靠它会把窗格关错。
+        for rd in self.all_rd_views(cx) {
+            if rd.read(cx).focus_handle(cx) == handle {
+                self.focused_rd = Some(rd.downgrade());
+                // 对称清理：焦点已从终端跳到远程格，「关闭当前窗格」必须关
+                // 远程而不是残留的 focused_term（否则分屏里会关错会话）。
+                self.focused_term = None;
+                return;
+            }
+        }
+    }
+
+    /// 所有标签里可见的远程桌面面板（标签形态 + 已放进分屏的），焦点跟踪用。
+    pub fn all_rd_views(&self, cx: &App) -> Vec<Entity<RemoteDesktopTab>> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            match tab {
+                TabContent::RemoteDesktop(e) => out.push(e.clone()),
+                TabContent::Terminal(ws) => {
+                    if let Some(dock) = ws.dock.as_ref() {
+                        for panel in dock_items(dock, cx) {
+                            if let DockPanel::Remote(e) = panel {
+                                out.push(e);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// 在同一个工作区内把焦点切到下一个终端面板（dock 切标签 + 键盘焦点）。
@@ -1486,10 +1782,161 @@ impl RustTermApp {
         self.focused_view(cx).is_some()
     }
 
+    /// 按稳定标识找回标签当前的下标（拖拽期间标签可能已重排）。
+    fn resolve_tab_key(&self, key: TabKey) -> Option<usize> {
+        if key == TabKey::Other {
+            return None;
+        }
+        self.tabs.iter().position(|tab| {
+            let cur = match tab {
+                TabContent::Terminal(ws) => ws
+                    .dock
+                    .as_ref()
+                    .map(|d| TabKey::Dock(d.entity_id()))
+                    .unwrap_or(TabKey::Other),
+                TabContent::RemoteDesktop(e) => TabKey::Remote(e.entity_id()),
+                _ => TabKey::Other,
+            };
+            cur == key
+        })
+    }
+
+    /// 把**当前标签**放进另一个终端工作区的分屏。
+    pub fn move_tab_into_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_tab_into_split_at(self.active, window, cx);
+    }
+
+    /// 把第 `index` 个标签放进另一个终端工作区的分屏。
+    ///
+    /// - 远程桌面标签（RDP/VNC/SPICE/X11）：面板实体直接装进目标 dock，
+    ///   于是它从「标签」变成终端旁边的一个分屏格（「拖标签进分屏」的实现）；
+    /// - 终端标签：它的所有终端面板并入目标 dock（两个终端工作区合并分屏）。
+    pub fn move_tab_into_split_at(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.len() < 2 {
+            self.set_toast("只有一个标签：先再开一个终端，才能把它放进分屏");
+            cx.notify();
+            return;
+        }
+        let index = index.min(self.tabs.len() - 1);
+
+        // 目标：另一个已经建好 dock 的终端工作区
+        let target = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .find_map(|(i, t)| {
+                t.workspace()
+                    .and_then(|ws| ws.dock.clone())
+                    .map(|dock| (i, dock))
+            });
+        let Some((target_idx, dock)) = target else {
+            self.set_toast("需要一个已打开的终端标签作为分屏目标");
+            cx.notify();
+            return;
+        };
+
+        // 先取出要迁移的面板实体（Clone 后移除源标签也不会销毁它们）。
+        //
+        // 必须用 dock_items（终端 **和** 远程桌面）：早先只取终端，结果把
+        // 「已经放进分屏的远程面板」连同它的后端会话一起静默丢掉——源标签
+        // 一 drop，源 dock 释放，远程实体没人引用 → 会话断开（对抗审查发现）。
+        let remote = match self.tabs.get(index) {
+            Some(TabContent::RemoteDesktop(e)) => Some(e.clone()),
+            _ => None,
+        };
+        let mut term_views: Vec<Entity<TerminalView>> = Vec::new();
+        let mut dock_remotes: Vec<Entity<RemoteDesktopTab>> = Vec::new();
+        if remote.is_none() {
+            if let Some(d) = self
+                .tabs
+                .get(index)
+                .and_then(|t| t.workspace())
+                .and_then(|ws| ws.dock.clone())
+            {
+                for panel in dock_items(&d, cx) {
+                    match panel {
+                        DockPanel::Terminal(v) => term_views.push(v),
+                        DockPanel::Remote(v) => dock_remotes.push(v),
+                    }
+                }
+            }
+        }
+        if remote.is_none() && term_views.is_empty() && dock_remotes.is_empty() {
+            self.set_toast("这个标签没有可以放进分屏的面板");
+            cx.notify();
+            return;
+        }
+
+        // 移除源标签；目标索引在移除后可能左移一位
+        self.tabs.remove(index);
+        // `tab_titles` 是与 tabs 平行的数组（标签条按下标取它）：不同步删除
+        // 会让所有自定义标签名整体错位一格。重命名/拖拽态同样作废（下标不可信）。
+        if index < self.tab_titles.len() {
+            self.tab_titles.remove(index);
+        }
+        self.tab_rename = None;
+        self.tab_rename_input = None;
+        self.tab_drag = None;
+        let target_idx = if target_idx > index { target_idx - 1 } else { target_idx };
+        self.active = target_idx.min(self.tabs.len().saturating_sub(1));
+
+        // 落位：add_panel_view 会并进目标**标签组**（新面板成为组内活动标签，
+        // 终端就被盖住了）。真正的「分屏」要再 move_panel 拆到右侧——锚点取
+        // 目标 dock 里的第一个面板。
+        let anchor = dock_items(&dock, cx)
+            .first()
+            .map(|p| match p {
+                DockPanel::Terminal(v) => PanelId::from(v.entity_id()),
+                DockPanel::Remote(v) => PanelId::from(v.entity_id()),
+            });
+        let node = anchor.and_then(|id| {
+            dock.read(cx)
+                .layout(DockPlacement::Center)
+                .and_then(|tree| tree.find_panel_node(id))
+        });
+
+        let mut moved: Vec<PanelId> = Vec::new();
+        dock.update(cx, |area, acx| {
+            for entity in remote.into_iter().chain(dock_remotes) {
+                moved.push(PanelId::from(entity.entity_id()));
+                area.add_panel_view(panel_handle(entity), DockPlacement::Center, None, window, acx);
+            }
+            for view in term_views {
+                moved.push(PanelId::from(view.entity_id()));
+                area.add_panel_view(panel_handle(view), DockPlacement::Center, None, window, acx);
+            }
+            if let Some(node) = node {
+                // 反序：每次插到锚点后一格会把先插的往后顶，正序迁移最终
+                // 视觉顺序与迁移顺序相反；反序迁让先迁的贴近锚点。
+                for id in moved.iter().rev() {
+                    let id = *id;
+                    area.move_panel(
+                        id,
+                        gpui_kit::base::dock::InsertTarget::Split {
+                            node,
+                            placement: Placement::Right,
+                            size: None,
+                        },
+                        window,
+                        acx,
+                    );
+                }
+            }
+        });
+        cx.notify();
+    }
+
     /// 当前工作区是否多于一个终端面板（「关闭当前窗格」菜单项置灰用）。
     pub fn has_multiple_panes(&self, cx: &App) -> bool {
         self.active_workspace_dock()
-            .map(|dock| dock_panels(&dock, cx).len() > 1)
+            // 远程桌面面板也算一个窗格：终端 + 远程同屏时「关闭当前窗格」应可用
+            .map(|dock| dock_items(&dock, cx).len() > 1)
             .unwrap_or(false)
     }
 
@@ -1604,10 +2051,15 @@ impl RustTermApp {
         self.tab_drag = None;
     }
 
-    pub fn poll_connecting(&mut self) {
+    /// 收「整标签级」的连接结果。返回是否有标签状态变化。
+    ///
+    /// 返回值的意义：脏驱动重绘之后，只有"有变化"才唤醒渲染；调用方
+    /// （UI 泵 / render）据此决定要不要 notify。
+    pub fn poll_connecting(&mut self) -> bool {
         // 分屏 / 新开标签的 SSH 结果都在面板自己的 `tick` 里收（见
         // `terminal_view.rs`），这里只处理「整标签级」的 Connecting：
         // 连上后开一个终端工作区，面板在首帧渲染时装进 dock。
+        let mut changed = false;
         for i in 0..self.tabs.len() {
             let mut done: Option<std::result::Result<TermPane, String>> = None;
             if let TabContent::Connecting { rx, .. } = &self.tabs[i] {
@@ -1629,8 +2081,10 @@ impl RustTermApp {
                     }
                     Err(msg) => self.tabs[i] = TabContent::Failed(msg),
                 }
+                changed = true;
             }
         }
+        changed
     }
 
     // 「连接时 / 断开时」宏的执行已内联到实际发生连接/断开的地方：
@@ -1839,6 +2293,223 @@ impl RustTermApp {
         .detach();
     }
 
+    /// ZMODEM：每帧一次的小调度。
+    ///
+    /// 两件事：
+    /// 1. 后台文件选择器的结果回投给原来那个窗格（见 `zmodem_pick` 字段说明）；
+    /// 2. 有窗格报「远端 `rz` 在等文件」就起后台线程弹 rfd 多选。
+    ///
+    /// 真正收/发文件、协议状态机都在 `term.rs` / `zmodem.rs` 里，UI 层只负责
+    /// "弹窗、取结果、显示提示"。
+    fn poll_zmodem(&mut self, cx: &mut Context<Self>) {
+        // ---- 1) 选择器结果 ----
+        let picked = match self.zmodem_pick.as_ref() {
+            Some((id, rx)) => match rx.try_recv() {
+                Ok(files) => Some((*id, files)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // 线程异常退出：当作用户取消，别让窗格一直等下去
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((*id, Vec::new())),
+            },
+            None => None,
+        };
+        if let Some((id, files)) = picked {
+            self.zmodem_pick = None;
+            if let Some(view) = self
+                .all_term_views(cx)
+                .into_iter()
+                .find(|v| v.entity_id() == id)
+            {
+                view.update(cx, |v, _| {
+                    if let Some(pane) = v.pane_mut_ref() {
+                        pane.zmodem_files_picked(files);
+                    }
+                });
+            }
+        }
+
+        // ---- 2) 提示 + 新的选择请求 ----
+        for view in self.all_term_views(cx) {
+            let (notice, wants) = view.update(cx, |v, _| match v.pane_mut_ref() {
+                Some(pane) => (pane.take_zmodem_notice(), pane.zmodem_wants_files()),
+                None => (None, false),
+            });
+            if let Some(msg) = notice {
+                self.set_toast(msg);
+            }
+            // 一次只弹一个：已有对话框在等结果时，别的窗格的请求先留着
+            if wants && self.zmodem_pick.is_none() {
+                let took = view.update(cx, |v, _| {
+                    v.pane_mut_ref()
+                        .map(|p| p.zmodem_take_file_request())
+                        .unwrap_or(false)
+                });
+                if took {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let files = rfd::FileDialog::new()
+                            .set_title("选择要通过 ZMODEM 发送的文件")
+                            .pick_files()
+                            .unwrap_or_default();
+                        let _ = tx.send(files);
+                    });
+                    self.zmodem_pick = Some((view.entity_id(), rx));
+                }
+            }
+        }
+    }
+
+    /// 状态栏：正在进行的 ZMODEM 传输（分屏时只显示一个，避免状态栏被撑爆）。
+    fn zmodem_status_text(&self, cx: &App) -> Option<String> {
+        self.all_term_views(cx)
+            .into_iter()
+            .find_map(|v| v.read(cx).pane_ref().and_then(|p| p.zmodem_status()))
+    }
+
+    // ------------------------------------------------------------------
+    // UI 帧调度（脏驱动重绘）
+    // ------------------------------------------------------------------
+
+    /// 有"活"内容（终端 / 浏览器 / 远程桌面 / 连接中 / 端口扫描）时用快节奏泵。
+    fn ui_has_live_content(&self) -> bool {
+        self.tabs.iter().any(|t| {
+            matches!(
+                t,
+                TabContent::Terminal(_)
+                    | TabContent::Browser(_)
+                    | TabContent::RemoteDesktop(_)
+                    | TabContent::Connecting { .. }
+            )
+        }) || self.port_scan.is_running()
+    }
+
+    /// 启动 UI 泵：脏驱动重绘里**唯一**的调度者。
+    ///
+    /// 为什么必须有它：GPUI 只在被 notify 时才重绘，而 PTY 输出、远端桌面帧、
+    /// 连接结果、端口扫描结果都没有后台任务会 notify。原实现因此只能无条件
+    /// 每帧 `request_animation_frame()` —— 60fps 全 UI 重绘，实测把主线程占满
+    /// （空闲 `[hb] cpu=+4s/5s`，X11 活跃时输入被饿死到 5~7fps）。
+    ///
+    /// 现在：泵按 8ms（活跃）/ 200ms（空闲）的节奏做**廉价排空**（只 try_recv
+    /// 与状态更新，不布局不绘制），只有真的排到新内容才唤醒一帧。空闲时几乎
+    /// 不画，活跃时按内容量画。
+    fn spawn_ui_pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| loop {
+            let interval = match this.update(cx, |this, _| this.ui_pump_interval()) {
+                Ok(iv) => iv,
+                // 应用已退出
+                Err(_) => break,
+            };
+            cx.background_executor().timer(interval).await;
+            if this.update(cx, |this, cx| this.ui_pump_once(cx)).is_err() {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn ui_pump_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(wake_interval_ms(
+            self.ui_has_live_content(),
+            self.ui_over_budget,
+        ))
+    }
+
+    /// 泵一拍：把所有"不需要绘制"的数据推进模型；有新内容才唤醒渲染。
+    fn ui_pump_once(&mut self, cx: &mut Context<Self>) {
+        self.ui_ticks += 1;
+        let mut dirty = crate::xsrv::counters::take_ui_dirty();
+
+        // 1) 整标签级连接结果（连上 → 换成终端工作区）
+        if self.poll_connecting() {
+            dirty = true;
+        }
+
+        // 2) 终端面板：吸 PTY 数据 / 排 PaneEvent / 收面板级连接结果。
+        //    隐藏面板同样要排——不排的话 unbounded 通道会堆积（内存 + 重新
+        //    显示时雪崩式补帧），这是历史上踩过的坑。
+        for view in self.all_term_views(cx) {
+            if view.update(cx, |v, vcx| v.pump_cheap(vcx)) {
+                // 数据已经离开通道：必须显式通知这个视图——GPUI 只重绘被
+                // notify 过的视图，dock 里的终端不会因为父容器重绘而更新
+                view.update(cx, |_, vcx| vcx.notify());
+                dirty = true;
+            }
+        }
+
+        // 3) 远程桌面（可见 + 隐藏）：排空 RdEvent。
+        //    原实现放在 render 里并节流 300ms —— 那是在渲染借用窗口里 poll 的
+        //    妥协（会放大与后台任务抢 App 借用的概率）。挪到泵里反而更安全，
+        //    也不需要节流：可见面板的帧延迟从"下一次重绘"降到 ≤8ms。
+        for rd in self.all_rd_views(cx) {
+            if rd.update(cx, |t, tcx| t.poll(tcx)) {
+                rd.update(cx, |_, tcx| tcx.notify());
+                dirty = true;
+            }
+            // dock 里的远程面板不在标签渲染路径上：会话设置落盘在这里补一次，
+            // 否则「共享目录 / 旧版兼容」改完重启就丢
+            if rd.update(cx, |t, _| t.take_settings_dirty()) {
+                let (sid, share, legacy) = {
+                    let t = rd.read(cx);
+                    (
+                        t.profile.session_id.clone(),
+                        t.profile.share_dir.clone(),
+                        t.profile.legacy_compat,
+                    )
+                };
+                self.persist_rd_settings_for(sid, share, legacy);
+            }
+        }
+
+        // 4) 端口扫描进度 / ZMODEM 提示（app 级状态）
+        if self.port_scan.poll() {
+            dirty = true;
+        }
+        self.poll_zmodem(cx);
+        // AI 面板的后台结果（聊天回复 / 文件选择）也在这里收：改成脏驱动重绘
+        // 之后面板 render 不再每帧跑，没人收的话结果要等下一次偶发重绘才出现。
+        if self.ai_assistant.poll_async() {
+            dirty = true;
+        }
+
+        // 5) 限频唤醒：没到间隔就先攒着（ui_paint_pending 跨拍保留，内容不会丢）
+        if dirty {
+            self.ui_paint_pending = true;
+        }
+        let interval = self.ui_pump_interval();
+        if self.ui_paint_pending && self.ui_wake_at.elapsed() >= interval {
+            self.ui_paint_pending = false;
+            self.ui_wake_at = std::time::Instant::now();
+            self.ui_wakes += 1;
+            cx.notify();
+        }
+    }
+
+    /// 记录一帧耗时 + 5s 一次的 `[hb-ui]` 汇报（优化前后对照的证据）。
+    fn ui_note_frame(&mut self, frame_ms: u32) {
+        self.ui_frames += 1;
+        self.ui_frame_ms[self.ui_frame_ms_pos] = frame_ms;
+        self.ui_frame_ms_pos = (self.ui_frame_ms_pos + 1) % self.ui_frame_ms.len();
+        self.ui_frame_ms_len = (self.ui_frame_ms_len + 1).min(self.ui_frame_ms.len());
+        self.ui_over_budget = frame_ms >= FRAME_BUDGET_MS;
+
+        if self.ui_last_report.elapsed().as_millis() < UI_REPORT_MS {
+            return;
+        }
+        let (p50, p95, max) = self.ui_frame_percentiles();
+        let frames = std::mem::take(&mut self.ui_frames);
+        let ticks = std::mem::take(&mut self.ui_ticks);
+        let wakes = std::mem::take(&mut self.ui_wakes);
+        crate::xsrv::log_line(format_args!(
+            "[hb-ui] frames=+{frames} ticks=+{ticks} wakes=+{wakes} build_p50={p50}ms build_p95={p95}ms build_max={max}ms live={} over_budget={}",
+            self.ui_has_live_content(),
+            self.ui_over_budget,
+        ));
+        self.ui_last_report = std::time::Instant::now();
+    }
+
+    fn ui_frame_percentiles(&self) -> (u32, u32, u32) {
+        ui_frame_percentiles_of(&self.ui_frame_ms[..self.ui_frame_ms_len])
+    }
     /// 顶部菜单栏（对应旧 egui 版的 6 个下拉菜单：终端 / 会话 / 视图 /
     /// 工具 / 设置 / 帮助）。
     ///
@@ -1967,6 +2638,15 @@ impl RustTermApp {
                 ));
                 m = m.item(menu_item(
                     &app,
+                    tr(lang, "item.move_into_split"),
+                    None,
+                    false,
+                    |this, _cx| {
+                        this.pending_pane_action = Some(PaneAction::MoveTabIntoSplit)
+                    },
+                ));
+                m = m.item(menu_item(
+                    &app,
                     tr(lang, "item.next_pane"),
                     Some(Box::new(NextPane)),
                     false,
@@ -2068,28 +2748,28 @@ impl RustTermApp {
                             "RDP",
                             Some(Box::new(ToggleRdp)),
                             false,
-                            |this, _cx| this.open_remote_desktop(RdTabProtocol::Rdp),
+                            |this, cx| this.open_remote_desktop(RdTabProtocol::Rdp, cx),
                         ));
                         m = m.item(menu_item(
                             &sub_app,
                             "VNC",
                             None,
                             false,
-                            |this, _cx| this.open_remote_desktop(RdTabProtocol::Vnc),
+                            |this, cx| this.open_remote_desktop(RdTabProtocol::Vnc, cx),
                         ));
                         m = m.item(menu_item(
                             &sub_app,
                             "SPICE",
                             None,
                             false,
-                            |this, _cx| this.open_remote_desktop(RdTabProtocol::Spice),
+                            |this, cx| this.open_remote_desktop(RdTabProtocol::Spice, cx),
                         ));
                         m = m.item(menu_item(
                             &sub_app,
                             tr(lang, "menu.x11"),
                             None,
                             false,
-                            |this, _cx| this.open_x11_screen(),
+                            |this, cx| this.open_x11_screen(cx),
                         ));
                         let _ = (window, cx);
                         m
@@ -2115,7 +2795,7 @@ impl RustTermApp {
                     tr(lang, "item.ai_assistant"),
                     Some(Box::new(ToggleAi)),
                     false,
-                    |this, _cx| this.ai_assistant.open = !this.ai_assistant.open,
+                    |this, _cx| this.ai_assistant.toggle(),
                 ));
                 m = m.separator();
                 m = m.item(menu_item(
@@ -2398,7 +3078,7 @@ impl RustTermApp {
                 IconName::Bot,
                 tr(lang, "tb.ai"),
                 ai_open,
-                |this, _win, _cx| this.ai_assistant.open = !this.ai_assistant.open,
+                |this, _win, _cx| this.ai_assistant.toggle(),
             ))
             .child(tool_button(
                 &app,
@@ -2685,7 +3365,7 @@ impl RustTermApp {
                         this.selected_session = Some(sel_id.clone());
                         if let ClickEvent::Mouse(e) = ev {
                             if e.up.click_count >= 2 {
-                                this.connect_session(&row_id, "");
+                                this.connect_session(&row_id, "", cx);
                             }
                         }
                         cx.notify();
@@ -2716,8 +3396,8 @@ impl RustTermApp {
                             .icon(ic(IconName::Plug))
                             .tooltip("连接")
                             .compact()
-                            .on_click(cx.listener(move |this, _, _, _| {
-                                this.connect_session(&conn_id, "");
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.connect_session(&conn_id, "", cx);
                             })),
                     )
                     .child(
@@ -2990,6 +3670,8 @@ impl RustTermApp {
             active: bool,
             failed: bool,
             closable: bool,
+            /// 稳定标识：拖拽落点按它重新解析下标（拖拽期间标签可能被重排）
+            key: TabKey,
         }
         let rows: Vec<Row> = self
             .tabs
@@ -3018,12 +3700,22 @@ impl RustTermApp {
                     .get(i)
                     .and_then(|t| t.clone())
                     .unwrap_or(default_label);
+                let key = match tab {
+                    TabContent::Terminal(ws) => ws
+                        .dock
+                        .as_ref()
+                        .map(|d| TabKey::Dock(d.entity_id()))
+                        .unwrap_or(TabKey::Other),
+                    TabContent::RemoteDesktop(e) => TabKey::Remote(e.entity_id()),
+                    _ => TabKey::Other,
+                };
                 Row {
                     label,
                     icon,
                     active: i == self.active,
                     failed: matches!(tab, TabContent::Failed(_)),
                     closable: true,
+                    key,
                 }
             })
             .collect();
@@ -3081,6 +3773,9 @@ impl RustTermApp {
                             if let Some(from) = from {
                                 if from != idx {
                                     this.move_tab(from, idx);
+                                    // 这只是一次「重排」，不是「放进分屏」：
+                                    // 吃掉事件，别让内容区的 on_drop 再跑一遍。
+                                    cx.stop_propagation();
                                 }
                             }
                             cx.notify();
@@ -3099,6 +3794,18 @@ impl RustTermApp {
                         this.active = idx;
                         cx.notify();
                     }))
+                    // 拖这个标签（松手落在中间内容区 = 放进分屏）
+                    .on_drag(
+                        TabDrag {
+                            index: idx,
+                            key: r.key,
+                            label: SharedString::from(r.label.clone()),
+                        },
+                        |drag: &TabDrag, _offset, _window, cx| {
+                            let label = drag.label.clone();
+                            cx.new(|_| TabDragPreview { label })
+                        },
+                    )
                     .when_some(r.icon, |d, icon| {
                         d.child(ic(icon).xsmall().text_color(if r.active {
                             theme.colors.foreground
@@ -3567,7 +4274,25 @@ impl RustTermApp {
                     )
                     .into_any_element()
             }
-            TabContent::RemoteDesktop(tab) => tab.render(window, cx),
+            TabContent::RemoteDesktop(tab) => {
+                // 先把实体克隆出来（Entity 是 Arc，克隆很便宜）：后面的
+                // persist_rd_settings_for 需要 &mut self，不能与 match 的
+                // &self.tabs 借用共存。
+                let panel = tab.clone();
+                // 面板自己改了会话设置 → 由 app 落盘（不依赖 self.active）
+                if panel.update(cx, |t, _| t.take_settings_dirty()) {
+                    let (sid, share, legacy) = {
+                        let t = panel.read(cx);
+                        (
+                            t.profile.session_id.clone(),
+                            t.profile.share_dir.clone(),
+                            t.profile.legacy_compat,
+                        )
+                    };
+                    self.persist_rd_settings_for(sid, share, legacy);
+                }
+                panel.update(cx, |t, tcx| t.render_panel(window, tcx))
+            }
             TabContent::LocalFiles(fb) => fb.render(false, window, cx),
             TabContent::Macro | TabContent::PortScan => div().into_any_element(),
         }
@@ -4097,6 +4822,147 @@ impl RustTermApp {
         )
     }
 
+    /// AI 面板右键菜单：复制选中（划选的文字）/ 复制整条消息 / 复制全部对话。
+    ///
+    /// 触发：消息气泡的右键（ai_assistant.rs 里置 `ai_menu`）。关闭：点菜单外的
+    /// 任意位置（整屏遮罩）或菜单项执行后自关。选中文本来自 GPUI 的
+    /// `TextSelection::selected_text`（SelectableText 划选的结果）。
+    fn ai_context_menu_ui(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (pos, whole, sel_at_open) = self.ai_menu.as_ref()?;
+        let pos = *pos;
+        let whole = whole.clone();
+        // 右键瞬间抓到的划选文字（可能为空 = 没划选）
+        let sel_at_open = sel_at_open.trim().to_string();
+        let lang = self.i18n.lang;
+        let theme = Theme::global(cx).clone();
+        let fg = theme.colors.foreground;
+        let dim = theme.colors.muted_foreground;
+
+        let item = |id: &'static str, label: String, enabled: bool| {
+            let color = if enabled { fg } else { dim };
+            div()
+                .id(id)
+                .h_flex()
+                .items_center()
+                .px_2()
+                .py_1()
+                .text_size(px(12.0))
+                .text_color(color)
+                .when(enabled, |d| d.cursor_pointer().hover(|d| d.bg(theme.colors.secondary_hover)))
+                .child(label)
+        };
+
+        let mut menu = div()
+            .id("ai-menu")
+            .absolute()
+            .left(pos.x)
+            .top(pos.y)
+            .min_w(px(160.0))
+            .v_flex()
+            .py_1()
+            .rounded(px(6.0))
+            .bg(theme.colors.background)
+            .border_1()
+            .border_color(theme.colors.border)
+            .shadow_md()
+            // 关键：菜单内的点击**绝不穿透**到整屏遮罩——遮罩的 on_mouse_down
+            // 会把 ai_menu 清掉，菜单在鼠标抬起前就被移除，on_click 永远不触发
+            //（症状正是「菜单弹出但点了没反应」）。左右键都拦。
+            .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_mouse_down(gpui_kit::MouseButton::Right, |_, _, cx| {
+                cx.stop_propagation();
+            });
+
+        // 复制选中：划选的文字（SelectableText 的结果）。没选中就复制整条，
+        // toast 如实说明——不弹空的「无选择」挫败感。
+        let whole_sel = whole.clone();
+        menu = menu.child(
+            item(
+                "ai-menu-copy-sel",
+                tr(lang, "ai.menu_copy_sel"),
+                true,
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let sel = sel_at_open.clone();
+                if sel.is_empty() {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(whole_sel.clone()));
+                    this.set_toast(tr(lang, "ai.toast_no_sel_copy"));
+                } else {
+                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(sel));
+                    this.set_toast(tr(lang, "ai.toast_sel_copied"));
+                }
+                this.ai_menu = None;
+                cx.notify();
+            })),
+        );
+        // 复制整条消息
+        let whole_for_btn = whole.clone();
+        menu = menu.child(
+            item(
+                "ai-menu-copy-whole",
+                tr(lang, "ai.menu_copy_whole"),
+                true,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(whole_for_btn.clone()));
+                this.set_toast(tr(lang, "ai.toast_whole_copied"));
+                this.ai_menu = None;
+                cx.notify();
+            })),
+        );
+        // 分隔线
+        menu = menu.child(
+            div()
+                .h(px(1.0))
+                .my_1()
+                .mx_2()
+                .bg(theme.colors.border)
+                .into_any_element(),
+        );
+        // 复制全部对话（排查问题时把上下文整个贴出去用）
+        menu = menu.child(
+            item(
+                "ai-menu-copy-all",
+                tr(lang, "ai.menu_copy_all"),
+                true,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let all = this
+                    .ai_assistant
+                    .messages
+                    .iter()
+                    .map(|m| format!("[{}] {}", m.time, m.content))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(all));
+                this.set_toast(tr(lang, "ai.toast_all_copied"));
+                this.ai_menu = None;
+                cx.notify();
+            })),
+        );
+
+        // 整屏遮罩：点任意处关闭（左右键都关）。
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_mouse_down(gpui_kit::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.ai_menu = None;
+                    cx.notify();
+                }))
+                .on_mouse_down(gpui_kit::MouseButton::Right, cx.listener(|this, _, _, cx| {
+                    this.ai_menu = None;
+                    cx.notify();
+                }))
+                .child(menu)
+                .into_any_element(),
+        )
+    }
+
     // 终端的列/行换算与全部鼠标处理都在 `terminal_view.rs`：
     // 每个面板自己收自己的鼠标事件，不再需要「命中判定 → 投递给某一格」这一层。
 
@@ -4140,6 +5006,7 @@ impl RustTermApp {
                 TabContent::Failed(_) => (format!("● {}", tr(lang, "status.failed")), theme.colors.danger),
                 TabContent::Browser(_) => (format!("● {}", tr(lang, "status.browser")), theme.colors.info),
                 TabContent::RemoteDesktop(t) => {
+                    let t = t.read(cx);
                     if t.is_active() {
                         (format!("● {}", tr(lang, "status.remote_active")), theme.colors.success)
                     } else if t.is_connecting() {
@@ -4192,6 +5059,17 @@ impl RustTermApp {
             .flex_none()
             .text_size(px(10.0));
 
+        // ZMODEM（rz/sz）传输进行中：状态栏右侧显示进度
+        // （会话状态挂在窗格上，这里只取一个在传的；具体实现见 term.rs/zmodem.rs）
+        if let Some(text) = self.zmodem_status_text(cx) {
+            right = right.child(
+                div()
+                    .text_color(theme.colors.info)
+                    .text_size(px(10.0))
+                    .child(text),
+            );
+        }
+
         // 尺寸 / 光标行列为**聚焦终端**的数据；分屏时额外标一个格数
         if let Some(view) = self.focused_view(cx) {
             let v = view.read(cx);
@@ -4204,7 +5082,7 @@ impl RustTermApp {
             );
             let panes = self
                 .active_workspace_dock()
-                .map(|d| dock_panels(&d, cx).len())
+                .map(|d| dock_items(&d, cx).len())
                 .unwrap_or(1);
             if panes > 1 {
                 right = right.child(
@@ -4313,12 +5191,273 @@ impl RustTermApp {
             .into_any_element()
     }
 
+    // ------------------------------------------------------------------
+    // 真 Agent：终端执行循环的驱动层（纯状态机在 agent.rs，这里只做 IO）
+    // ------------------------------------------------------------------
+
+    /// Agent 发送入口（Agent 开 + 只读闸通过才进入循环）。
+    /// 返回 true = 已作为 Agent 任务受理（调用方不再走单轮发送）。
+    fn agent_try_start(&mut self, task: String, cx: &mut Context<Self>) -> bool {
+        if !self.ai_assistant.agent_mode {
+            return false;
+        }
+        if self.config.ai.read_only {
+            // 只读模式：Agent 整个禁用（安全边界 2）
+            self.set_toast("只读模式下 Agent 已禁用——请先关闭只读再使用 Agent");
+            return true; // 已受理但拒绝执行：不再走单轮发送，避免绕过只读闸
+        }
+        if self.agent_loop.is_some() {
+            self.set_toast("Agent 任务进行中，请等它结束或点「停止」");
+            return true;
+        }
+        let snapshot = self.current_terminal_context(cx).unwrap_or_default();
+        let target = self
+            .focused_view(cx)
+            .or_else(|| self.all_term_views(cx).first().cloned());
+        let Some(target) = target else {
+            self.set_toast("没有可用的终端窗格，Agent 无法启动");
+            return true;
+        };
+        let (loop_, actions) = crate::agent::AgentLoop::start(task, snapshot);
+        self.agent_loop = Some(loop_);
+        self.agent_target = Some(target);
+        self.agent_wait_since = None;
+        self.ai_assistant.agent_busy = true;
+        self.agent_apply(actions, cx);
+        true
+    }
+
+    /// 执行状态机给出的动作序列。
+    fn agent_apply(
+        &mut self,
+        actions: Vec<crate::agent::AgentAction>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::agent::AgentAction as A;
+        for action in actions {
+            match action {
+                A::Say(text) => {
+                    self.ai_assistant.push_agent_message(text);
+                    cx.notify();
+                }
+                A::RunCommand(cmd) => {
+                    let sent = self
+                        .agent_target
+                        .as_ref()
+                        .map(|view| {
+                            view.update(cx, |v, _| {
+                                if v.is_dead() {
+                                    return false;
+                                }
+                                v.write_input(format!("{cmd}\r").into_bytes());
+                                true
+                            })
+                        })
+                        .unwrap_or(false);
+                    if sent {
+                        self.agent_wait_since = Some(std::time::Instant::now());
+                    } else {
+                        // 锁定的窗格死亡 → 终止本轮（安全边界 6）
+                        let actions = self
+                            .agent_loop
+                            .as_mut()
+                            .map(|l| l.next(crate::agent::AgentEvent::TargetDied));
+                        if let Some(actions) = actions {
+                            self.agent_apply(actions, cx);
+                        }
+                        return;
+                    }
+                }
+                A::AskConfirm(cmd) => {
+                    // 危险命令：整轮暂停，弹三选一确认卡（安全边界 1）
+                    self.ai_assistant.agent_confirm_cmd = Some(cmd);
+                    cx.notify();
+                }
+                A::RequestModelTurn(_prompt) => {
+                    // 组模型历史并发起后台请求（结果由 agent_poll 消费）
+                    let Some(loop_) = self.agent_loop.as_ref() else {
+                        continue;
+                    };
+                    let history: Vec<crate::ai::AiMessage> = loop_
+                        .chat_history()
+                        .into_iter()
+                        .map(|h| match h.role.as_str() {
+                            "assistant" => crate::ai::AiMessage::assistant(h.content),
+                            _ => crate::ai::AiMessage::user(h.content),
+                        })
+                        .collect();
+                    let cfg = self.config.ai.clone();
+                    let agent_mode = true;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.agent_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let result = crate::ai::chat(&cfg, agent_mode, &history);
+                        let _ = tx.send(result);
+                    });
+                }
+                A::Finish(summary) => {
+                    self.ai_assistant.push_agent_message(summary);
+                    self.agent_cleanup();
+                    cx.notify();
+                }
+                A::Abort(reason) => {
+                    self.ai_assistant.push_error(reason);
+                    self.agent_cleanup();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Agent 收尾：清循环与面板标志（summary/错误消息已由调用方写入）。
+    fn agent_cleanup(&mut self) {
+        self.agent_loop = None;
+        self.agent_target = None;
+        self.agent_wait_since = None;
+        self.agent_rx = None;
+        self.ai_assistant.agent_busy = false;
+        self.ai_assistant.agent_status = None;
+        self.ai_assistant.agent_confirm_cmd = None;
+        self.ai_assistant.agent_confirm = None;
+        self.ai_assistant.agent_stop = false;
+    }
+
+    /// 每帧推进 Agent 循环（确认选择 / 停止 / 模型结果 / 输出静默）。
+    /// 先把循环 `take` 出来——`agent_apply` 需要 `&mut self`，不能让
+    /// `loop_` 的可变借用跨过它；每个分支在调用 `agent_apply` 前放回。
+    fn agent_poll(&mut self, cx: &mut Context<Self>) {
+        let Some(mut loop_) = self.agent_loop.take() else {
+            return;
+        };
+
+        // 1) 危险命令确认（三选一）
+        if let Some(choice) = self.ai_assistant.agent_confirm.take() {
+            self.ai_assistant.agent_confirm_cmd = None;
+            let actions = loop_.next(crate::agent::AgentEvent::Confirm {
+                run: choice == crate::ai_assistant::AgentChoice::Run,
+            });
+            self.agent_loop = Some(loop_);
+            self.agent_apply(actions, cx);
+            return;
+        }
+        // 2) 用户停止
+        if self.ai_assistant.agent_stop {
+            self.ai_assistant.agent_stop = false;
+            let actions = loop_.next(crate::agent::AgentEvent::Stop);
+            self.agent_loop = Some(loop_);
+            self.agent_apply(actions, cx);
+            return;
+        }
+        // 3) 模型回复
+        if self.agent_rx.is_some() {
+            let got = self.agent_rx.as_ref().unwrap().try_recv().ok();
+            if let Some(result) = got {
+                self.agent_rx = None;
+                match result {
+                    Ok(reply_text) => {
+                        // 双格式解析（JSON 优先，bash 块/[DONE] 降级）
+                        let plan = crate::ai::parse_agent_reply(&reply_text);
+                        let actions =
+                            loop_.next(crate::agent::AgentEvent::ModelReply { plan });
+                        self.agent_loop = Some(loop_);
+                        self.agent_apply(actions, cx);
+                    }
+                    Err(e) => {
+                        // 模型请求失败 → 终止本轮（错误消息进面板）
+                        self.ai_assistant
+                            .push_error(format!("Agent 模型请求失败：{e}"));
+                        self.agent_cleanup();
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+        }
+        // 4) 输出静默结算：固定 800ms 会把慢命令（find / 大文件操作 / yum）
+        //    的输出半途截断喂给模型。改为跟随输出活动：快照不变 ≥1.2s 且写入
+        //    ≥0.4s 才结算；20s 硬上限兜底（持续输出型命令如 tail -f 截取
+        //    部分输出，由系统提示词告知模型可能不完整）。
+        if let Some(since) = self.agent_wait_since {
+            let snapshot = self.agent_capture_output(cx);
+            let now = std::time::Instant::now();
+            let changed = self
+                .agent_last_snapshot
+                .as_ref()
+                .map_or(true, |(s, _)| *s != snapshot);
+            if changed {
+                self.agent_last_snapshot = Some((snapshot, now));
+            }
+            let since_change = self
+                .agent_last_snapshot
+                .as_ref()
+                .map(|(_, t)| now.saturating_duration_since(*t))
+                .unwrap_or(std::time::Duration::ZERO);
+            let since_write = now.saturating_duration_since(since);
+            if crate::agent::agent_should_settle(since_write, since_change) {
+                self.agent_wait_since = None;
+                self.agent_last_snapshot = None;
+                let output = self.agent_capture_output(cx);
+                let actions = loop_.next(crate::agent::AgentEvent::CmdOutput { output });
+                self.agent_loop = Some(loop_);
+                self.agent_apply(actions, cx);
+                return;
+            }
+        }
+        // 5) 状态行同步（有变化才 notify——避免无谓空转）
+        let new_status = loop_.status_line();
+        if self.ai_assistant.agent_status.as_deref() != Some(new_status.as_str()) {
+            self.ai_assistant.agent_status = Some(new_status);
+            cx.notify();
+        }
+        // Running（等终端输出，≤800ms）→ 全速结算；Thinking（等模型，可达
+        // 数十秒）→ 150ms 节流拍（只做 try_recv 级 poll，等效 ui_pump 的
+        // 慢节奏，不会复现 60fps 空转）。节流拍经 agent_poll_if_active 自续，
+        // 循环结束自动停止。
+        let now = std::time::Instant::now();
+        let due = match loop_.state {
+            // Running（等输出静默）用 100ms 节拍：静默阈值 1.2s 下，100ms
+            // 粒度的结算延迟无感，且避免等待期间 60fps 空转。
+            crate::agent::AgentState::Running { .. } => {
+                now.saturating_duration_since(self.agent_last_poll_notify)
+                    >= std::time::Duration::from_millis(100)
+            }
+            crate::agent::AgentState::Thinking { .. } => {
+                now.saturating_duration_since(self.agent_last_poll_notify)
+                    >= std::time::Duration::from_millis(150)
+            }
+            _ => false,
+        };
+        if due {
+            self.agent_last_poll_notify = now;
+            cx.notify();
+        }
+        self.agent_loop = Some(loop_);
+    }
+
+    /// 从**锁定的**终端窗格捕获最近输出（不用 focused——目标已锁定）。
+    fn agent_capture_output(&self, cx: &App) -> String {
+        let Some(target) = self.agent_target.as_ref() else {
+            return String::new();
+        };
+        target.read(cx).context_text(
+            self.config.ai.context_lines,
+            self.config.ai.context_max_line_len,
+        )
+    }
+
+    /// Agent 每帧驱动入口。
+    fn agent_poll_if_active(&mut self, cx: &mut Context<Self>) {
+        if self.agent_loop.is_some() {
+            self.agent_poll(cx);
+        }
+    }
+
     fn ai_panel_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.ai_assistant.open {
             return None;
         }
         let ai = self.config.ai.clone();
-        self.ai_assistant.render(&ai, window, cx)
+        self.ai_assistant.render(&ai, self.i18n.lang, window, cx)
     }
 
     // ------------------------------------------------------------------
@@ -5170,6 +6309,10 @@ const AI_W: f32 = 360.0;
 
 impl Render for RustTermApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 帧耗时统计的起点（[hb-ui] 报的是"状态更新 + 元素树构建"这段，
+        // 布局与绘制在 render 返回之后，由 [hb] 的 CPU 口径覆盖）
+        self.ui_frame_at = std::time::Instant::now();
+
         // ---- 一次性初始化 ----
         if !self.initialized {
             self.initialized = true;
@@ -5190,9 +6333,11 @@ impl Render for RustTermApp {
             if let Some(hwnd) = crate::win32::raw_hwnd_from_window(window) {
                 crate::win32::register_main_hwnd(hwnd);
             }
+            // 脏驱动重绘的唯一调度者（终端/远端/连接/扫描的廉价排空 + 唤醒）
+            self.spawn_ui_pump(window, cx);
         }
 
-        self.poll_connecting();
+        let _ = self.poll_connecting();
         self.pump_sync_input(cx);
         // 标签集合变化就更新「上次会话」快照（两秒节流，写在 render 里是因为
         // 开/关标签的入口太多，逐个接线容易漏；这里天然覆盖所有路径）
@@ -5206,6 +6351,7 @@ impl Render for RustTermApp {
                 PaneAction::Split(placement) => self.split_focused(placement, window, cx),
                 PaneAction::Close => self.close_focused_pane(window, cx),
                 PaneAction::Next => self.focus_next_pane(window, cx),
+                PaneAction::MoveTabIntoSplit => self.move_tab_into_split(window, cx),
             }
         }
 
@@ -5290,27 +6436,75 @@ impl Render for RustTermApp {
         // AI 面板上下文提示 + 待发送
         self.ai_assistant.attach_hint = self.active_terminal_hint(cx);
         if self.ai_assistant.take_pending_send() {
-            let context = self.current_terminal_context(cx);
-            let ai = self.config.ai.clone();
-            self.ai_assistant.send(&ai, context, window, cx);
+            if self.agent_loop.is_some() {
+                // Agent 循环进行中：输入走「追加任务/追问」语义——作为普通消息
+                // 追加进对话（不中断循环）。v1 简化：提示等当前任务完成。
+                self.set_toast("Agent 任务进行中：请等它结束或点「停止」");
+            } else if self.ai_assistant.agent_mode
+                && self.agent_try_start(self.ai_assistant.input.trim().to_string(), cx)
+            {
+                // Agent 已受理（含只读拒绝 / 无窗格拒绝的提示）。
+                // 清空输入框与内部缓冲（与单轮 send 的清空行为一致）。
+                if let Some(s) = &self.ai_assistant.input_state {
+                    s.update(cx, |s, cx| s.set_value(String::new(), window, cx));
+                }
+                self.ai_assistant.input.clear();
+                cx.notify();
+            } else if self.ai_assistant.waiting {
+                // 上一轮还没回来：不能静默吞掉这次点击，否则用户以为"发送没反应"
+                self.set_toast("AI 正在回复中：请稍候，或点面板里的「停止」取消");
+            } else {
+                let context = self.current_terminal_context(cx);
+                let ai = self.config.ai.clone();
+                self.ai_assistant.send(&ai, context, window, cx);
+            }
         }
 
         // AI 面板的「发送到终端」请求
         if let Some((cmd, dangerous)) = self.ai_assistant.command_request.take() {
+            // 诊断：发送到终端的每一次决策都落日志（用户报「第一次正常、第二次
+            // 静默失败」——静态推不出唯一分支，让日志说话）。
+            crate::xsrv::log_line(format_args!(
+                "[ai-send] taken cmd={cmd:?} dangerous={dangerous}"
+            ));
             if self.config.ai.read_only {
                 self.set_toast("只读模式：写命令已被禁用");
             } else if dangerous {
                 self.set_toast(format!("⚠ 危险命令已拦截: {cmd}"));
-            } else if let Some(view) = self.focused_view(cx) {
-                let sent = view.update(cx, |v, _| {
-                    if v.is_dead() {
-                        return false;
-                    }
-                    v.write_input(format!("{cmd}\r").into_bytes());
-                    true
+            } else {
+                // 目标选择：优先焦点所在的终端窗格；拿不到（用户正盯着远程
+                // 桌面/X11 格——此时 focused_term 已被 track_terminal_focus 清空，
+                // 或应用启动后从没点过终端）就退到**当前活动标签的第一个终端**。
+                // 之前两级都没有时是静默失败，用户视角就是"按钮没反应"。
+                let target = self.focused_view(cx).or_else(|| {
+                    // 兜底升级为**全仓任意开着的终端窗格**：之前只找当前活动
+                    // 标签——用户在 X11/远程桌面标签上看屏幕时，开着终端的
+                    // SSH 标签不在 active 里，照样找不到（用户实测：终端明明
+                    // 开着，发送还是"静默失败"）。any 终端都比失败强。
+                    let any = self.all_term_views(cx).first().cloned();
+                    crate::xsrv::log_line(format_args!(
+                        "[ai-send] focused 无 → 兜底 any 终端 = {}",
+                        any.is_some()
+                    ));
+                    any
                 });
-                if sent {
-                    self.set_toast("命令已发送到终端");
+                if let Some(view) = target {
+                    let sent = view.update(cx, |v, _| {
+                        if v.is_dead() {
+                            return false;
+                        }
+                        v.write_input(format!("{cmd}\r").into_bytes());
+                        true
+                    });
+                    crate::xsrv::log_line(format_args!("[ai-send] sent={sent}"));
+                    if sent {
+                        self.set_toast("命令已发送到终端");
+                    } else {
+                        self.set_toast("终端已断开，命令未发送");
+                    }
+                } else {
+                    crate::xsrv::log_line(format_args!("[ai-send] 无任何终端窗格"));
+                    self.set_toast("没有可用的终端窗格，命令未发送");
                 }
             }
         }
@@ -5353,12 +6547,12 @@ impl Render for RustTermApp {
             .on_action(cx.listener(|this, _: &NewBrowserTab, _, _| this.open_browser("about:blank")))
             .on_action(cx.listener(|this, _: &ToggleSftp, _, _| this.open_sftp()))
             .on_action(cx.listener(|this, _: &ToggleLocalFiles, _, _| this.open_local_files()))
-            .on_action(cx.listener(|this, _: &ToggleRdp, _, _| {
-                this.open_remote_desktop(RdTabProtocol::Rdp)
+            .on_action(cx.listener(|this, _: &ToggleRdp, _, cx| {
+                this.open_remote_desktop(RdTabProtocol::Rdp, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleBrowser, _, _| this.open_browser("about:blank")))
             .on_action(cx.listener(|this, _: &ToggleAi, _, _| {
-                this.ai_assistant.open = !this.ai_assistant.open
+                this.ai_assistant.toggle()
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 if !this.tabs.is_empty() {
@@ -5488,7 +6682,32 @@ impl Render for RustTermApp {
                             .v_flex()
                             .overflow_hidden()
                             .child(self.tab_strip_ui(window, cx))
-                            .child(self.center_content_ui(window, cx)),
+                            // **只有内容区**是拖放目标：标签条不算。否则「拖标签
+                            // 重排」松手时会被劫持成「放进分屏」（而且用的是重排
+                            // 前的旧下标，会搬错标签）。
+                            .child(
+                                // 必须是 flex 容器：center_content 的根（终端的
+                                // terminal_area / dock）用 `.flex_1()` 拿高度，
+                                // 块级父容器里 flex 属性无效 → 高度塌缩 → 整个
+                                // dock 白屏（D2 修复时引入的回归，诊断日志
+                                // canvas=425x0 实锤）。
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .min_h_0()
+                                    .v_flex()
+                                    .on_drop::<TabDrag>(cx.listener(
+                                        |this, drag: &TabDrag, window, cx| {
+                                            // 用**稳定标识**重新解析下标：拖拽期间
+                                            // 标签可能已被重排，index 早已过期。
+                                            let Some(ix) = this.resolve_tab_key(drag.key) else {
+                                                return;
+                                            };
+                                            this.move_tab_into_split_at(ix, window, cx);
+                                        },
+                                    ))
+                                    .child(self.center_content_ui(window, cx)),
+                            ),
                     )
                     .children(self.sftp.render(window, cx))
                     .children(self.ai_panel_ui(window, cx)),
@@ -5532,46 +6751,34 @@ impl Render for RustTermApp {
         if let Some(el) = self.term_context_menu_ui(cx) {
             dialogs.push(el);
         }
+        // AI 面板右键菜单：复制选中 / 复制整条消息 / 复制全部对话
+        if let Some(el) = self.ai_context_menu_ui(cx) {
+            dialogs.push(el);
+        }
         for d in dialogs {
             root = root.child(d);
         }
 
-        // 终端/浏览器/远程桌面需要持续重绘：驱动下一帧，保证 PTY 输出、光标、
-        // WebView 对齐、远程桌面帧实时刷新。没有这类活动标签时停止循环，避免空转。
-        let live = self.tabs.iter().any(|t| {
-            matches!(
-                t,
-                TabContent::Terminal(_)
-                    | TabContent::Browser(_)
-                    | TabContent::RemoteDesktop(_)
-                    | TabContent::Connecting { .. }
-            )
-        }) || self.port_scan.is_running();
-        if live {
-            // NyaTerm: dock 化之后 gpui 只重绘「被 notify 过」的视图——终端视图
-            // 藏在 dock 里，不显式通知的话 PTY 输出要等偶发事件（鼠标移动、
-            // 切标签）触发重绘才显示，打字回显就成了数秒一批的慢镜头。
-            // 这里逐帧通知当前工作区的所有终端面板，恢复"有终端标签就一直
-            // 重绘"的设计意图（帧成本有行级 shaping 缓存兜底）。
-            let idx = self.active.min(self.tabs.len().saturating_sub(1));
-            let dock = self
-                .tabs
-                .get(idx)
-                .and_then(|t| t.workspace())
-                .and_then(|ws| ws.dock.clone());
-            if let Some(dock) = dock {
-                for view in crate::tabs::dock_panels(&dock, cx) {
-                    view.update(cx, |_, vcx| vcx.notify());
-                }
-            }
-            // NyaTerm: 这里必须**每帧**续帧，不能改成"按需/降频"。
-            //
-            // 教训（实测踩过）：GPUI 只在被 notify 时才重绘，而远程画面的
-            // RdEvent 只在 render() 里被 poll() 消费——没有任何后台任务会在
-            // 新帧到达时 notify。所以一旦停掉续帧，新帧就再也唤不醒 UI，画面
-            // 卡到下一次偶发 notify（鼠标划过）才动，终端也跟着卡。
-            // CPU 优化只能做在"每帧少做无用功"上（见 terminal_view 的快照按需
-            // 重建），不能省掉续帧本身。
+        // 真 Agent 循环驱动（每帧推进：确认 / 停止 / 模型结果 / 输出静默结算）。
+        // 只在循环进行中做事；调度本身（续帧策略）在下方 task-10 的段落，未动。
+        self.agent_poll_if_active(cx);
+
+        // ---- 帧调度：脏驱动重绘 ----
+        //
+        // 旧实现：无条件 `request_animation_frame()` —— 60fps 全 UI 重绘，
+        // 空闲也把主线程占满（`[hb] cpu=+4s/5s`），X11 一忙输入就被饿死
+        // （实测 5~7fps）。现在：
+        //   · 数据由 ui_pump 任务排空（终端/远端/连接/扫描，见 spawn_ui_pump），
+        //     排到新内容才 notify —— 没有内容就没有帧；
+        //   · 本帧处理了脏内容（刚到的远端帧、布局变化…）就再补一帧把它画出来；
+        //     上一帧超预算时不补，交给泵按退让节奏唤醒，避免"越忙越卡"的正反馈。
+        //
+        // 保留 `live` 判定只是为了让没有活动标签时连这一下都省掉。
+        let live = self.ui_has_live_content();
+        let frame_ms = self.ui_frame_at.elapsed().as_millis() as u32;
+        let dirty = crate::xsrv::counters::take_ui_dirty();
+        self.ui_note_frame(frame_ms);
+        if live && wants_extra_frame(FrameSignals { dirty, frame_ms }) {
             window.request_animation_frame();
         }
 
@@ -5580,3 +6787,81 @@ impl Render for RustTermApp {
     }
 }
 
+
+/* ----------------------------------------------------------------------
+ * 测试
+ * ------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    // 显式导入，**不要** `use super::*`：本文件引入了 `gpui_kit::*` 通配，
+    // 通配里的名字会盖掉内置的 `#[test]` 属性宏，展开时递归爆掉
+    //（"recursion limit reached while expanding #[test]"）。
+    use super::{
+        ui_frame_percentiles_of, wake_interval_ms, wants_extra_frame, FrameSignals,
+        FRAME_BUDGET_MS, UI_WAKE_ACTIVE_MS, UI_WAKE_BACKOFF_MS, UI_WAKE_IDLE_MS,
+    };
+
+    /// 帧预算（编译期约束）：退让节奏必须比活跃节奏慢、但比空闲兜底快。
+    #[test]
+    fn wake_intervals_are_ordered() {
+        assert!(UI_WAKE_ACTIVE_MS < UI_WAKE_BACKOFF_MS);
+        assert!(UI_WAKE_BACKOFF_MS < UI_WAKE_IDLE_MS);
+    }
+
+    /// 空闲（没有脏内容）时不得再请求下一帧 —— 这是 CPU 从 80% 掉下来的关键。
+    #[test]
+    fn idle_never_requests_another_frame() {
+        assert!(!wants_extra_frame(FrameSignals {
+            dirty: false,
+            frame_ms: 3,
+        }));
+        // 没有活动内容 → 慢节奏兜底（只维持隐藏面板排空/连接状态）
+        assert_eq!(wake_interval_ms(false, false), UI_WAKE_IDLE_MS);
+        // 即使上一帧超预算，没有活动内容也走同样的兜底间隔
+        assert_eq!(wake_interval_ms(false, true), UI_WAKE_IDLE_MS);
+    }
+
+    /// 有脏内容 → 补一帧把内容画出来；活跃期用 8ms 节奏（回显/远端画面跟手）。
+    #[test]
+    fn dirty_content_requests_exactly_one_more_frame() {
+        assert!(wants_extra_frame(FrameSignals {
+            dirty: true,
+            frame_ms: 3,
+        }));
+        assert_eq!(wake_interval_ms(true, false), UI_WAKE_ACTIVE_MS);
+    }
+
+    /// 超预算时不再"画完立刻再画"，泵也退让 —— 避免"越忙越卡"的正反馈。
+    #[test]
+    fn over_budget_frames_back_off_instead_of_queueing() {
+        assert!(!wants_extra_frame(FrameSignals {
+            dirty: true,
+            frame_ms: FRAME_BUDGET_MS,
+        }));
+        assert!(!wants_extra_frame(FrameSignals {
+            dirty: true,
+            frame_ms: 120,
+        }));
+        assert_eq!(wake_interval_ms(true, true), UI_WAKE_BACKOFF_MS);
+        // 边界：刚好在预算内仍然续帧
+        assert!(wants_extra_frame(FrameSignals {
+            dirty: true,
+            frame_ms: FRAME_BUDGET_MS - 1,
+        }));
+    }
+
+    /// `[hb-ui]` 的百分位口径：空窗口归零、单样本三值相同、排序后取分位
+    /// （对照证据的读数函数——p95 应显著高于 p50 才说明有掉帧/超预算）。
+    #[test]
+    fn frame_percentiles_are_ordered_and_empty_is_zero() {
+        assert_eq!(ui_frame_percentiles_of(&[]), (0, 0, 0));
+        assert_eq!(ui_frame_percentiles_of(&[7]), (7, 7, 7));
+        // 乱序输入（环形缓冲里的真实顺序）也应正确排序
+        let (p50, p95, max) = ui_frame_percentiles_of(&[30, 2, 8, 16, 4, 24]);
+        // 排序后 [2,4,8,16,24,30]：p50 取下标 round(5*0.5)=3 → 16，p95 → 30
+        assert_eq!((p50, p95, max), (16, 30, 30));
+        // 典型空闲画面：全部 0ms → 三值都是 0（CPU 归零的证据形态）
+        assert_eq!(ui_frame_percentiles_of(&[0; 64]), (0, 0, 0));
+    }
+}

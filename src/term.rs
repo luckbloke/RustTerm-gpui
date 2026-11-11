@@ -28,7 +28,33 @@ use vte::ansi::Processor;
 
 use crate::backends::{self, TermIo};
 
+/// ZMODEM（rz/sz）文件收发：触发检测 + 状态机驱动 + 落盘。
+///
+/// 为什么挂在 term 模块下：本功能的唯一集成点就是 `TermPane::pump()`——
+/// 远端字节流进 vte 的唯一漏斗；放在一起看最省事。也正因为集成点这么窄，
+/// 三种后端（本地 pty / SSH / telnet）共用 `io.output_rx` / `io.input_tx`，
+/// 功能对它们自动全部可用。
+///
+/// 写入范围约定不允许改 main.rs，所以用 `#[path]` 把 `src/zmodem.rs`
+/// 挂成 term 的子模块（`crate::term::zmodem`），而不是在 crate 根声明。
+#[path = "zmodem.rs"]
+pub mod zmodem;
+
 const SCROLLBACK: usize = 10_000;
+
+/// ZMODEM 会话多久收不到远端字节就判僵死。
+///
+/// 正常传输（sz 连续发送 / rz 及时应答）不会静默这么久；没有这个上限，
+/// 对端崩溃或网络断开后，窗格会永远停在"传输中"（Ctrl+C 才能出来）。
+/// 用户正在选文件（`zm_need_files`）时不适用——那时是我们在等用户。
+const ZMODEM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 会话结束后开多久的"协议尾巴过滤窗口"。
+///
+/// 远端 `sz`/`rz` 退出前还会发最后一个应答头和 over-and-out 的 `OO`：这些是
+/// 协议字节，直接进 vte 会显示成乱码。窗口内先过 `zmodem::TailFilter`；窗口
+/// 一到（或认出了正常输出）就把还扣着的字节还回终端。窗口短，用户无感。
+const ZMODEM_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// 终端 canvas 四周留出的内边距（绘制与鼠标映射共用）。
 ///
@@ -198,6 +224,25 @@ pub struct TermPane {
     pub cell: Size<Pixels>,
     /// 绘制快照使用的字号（与 fit_to 测量保持一致，避免列对齐错位）
     pub font_size: Pixels,
+    /// 防抖：拖分屏时尺寸连续变化，每帧发 SIGWINCH 会让 bash 反复重绘提示符
+    /// （碎片化输出）。先记目标，限频 200ms 发一次，落定后补最终尺寸。
+    pending_resize: Option<(u16, u16)>,
+    /// 挂起目标第一次出现的时刻：连续变化期间不断刷新，稳定 200ms 后才发
+    pending_since: std::time::Instant,
+    /// ZMODEM 会话（None = 正常终端模式，远端字节照常进 vte）
+    zmodem: Option<zmodem::Session>,
+    /// 正常模式下扫描远端流里有没有 ZMODEM 触发头（跨 chunk 边界）
+    zm_detector: zmodem::Detector,
+    /// 远端 `rz` 已就绪、等本地选文件：由 app 层取走后在自己线程里弹 rfd
+    zm_need_files: bool,
+    /// 选择器已经弹出、在等用户操作（此时不该算"对端无响应超时"）
+    zm_picking: bool,
+    /// 一次性提示（完成 / 失败 / 取消），app 取走弹 toast
+    zm_notice: Option<String>,
+    /// 会话刚结束的冷却截止时刻（见 `ZMODEM_COOLDOWN`）
+    zm_cooldown_until: Option<std::time::Instant>,
+    /// 冷却期内的协议尾巴过滤器（把最后一个应答头 / `OO` 挡在 vte 外面）
+    zm_tail: zmodem::TailFilter,
 }
 
 /// 新窗格的启动方式（预留：分屏复制会话时按此重建）。
@@ -311,10 +356,24 @@ impl TermPane {
             mirror: None,
             cell: size(px(9.0), px(17.0)),
             font_size: px(14.0),
+            pending_resize: None,
+            pending_since: std::time::Instant::now(),
+            zmodem: None,
+            zm_detector: zmodem::Detector::new(),
+            zm_need_files: false,
+            zm_picking: false,
+            zm_notice: None,
+            zm_cooldown_until: None,
+            zm_tail: zmodem::TailFilter::default(),
         }
     }
 
-    /// 吸收后端字节流，返回 true 表示有新内容。
+    /// 吸收后端字节流，返回 true 表示**终端画面**有新内容。
+    ///
+    /// ZMODEM 只在这里加一个岔路口：正常模式下扫描触发头，命中后本窗格转入
+    /// 传输模式（字节改喂协议状态机，不再进 vte），会话结束后自动回正常模式。
+    /// 三种后端的回写通道都是 `io.input_tx`，所以状态机写出的字节不需要
+    /// 任何后端相关的代码。
     pub fn pump(&mut self) -> bool {
         let mut dirty = false;
         let mut budget = 16; // 每帧最多 16 批，避免大吞吐打满 UI
@@ -324,9 +383,10 @@ impl TermPane {
             }
             match self.io.output_rx.try_recv() {
                 Ok(data) => {
-                    self.processor.advance(&mut self.term, &data);
-                    dirty = true;
                     budget -= 1;
+                    if self.absorb(&data) {
+                        dirty = true;
+                    }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -335,7 +395,199 @@ impl TermPane {
                 }
             }
         }
+        // 检测器扣住的半截头超时还没等到后续字节 → 还回终端：
+        // 普通输出末尾恰好是 `*` 时不能一直扣着不显示。
+        if let Some(bytes) = self.zm_detector.flush_stale() {
+            self.processor.advance(&mut self.term, &bytes);
+            dirty = true;
+        }
+        // 协议尾巴过滤窗口结束：把还扣着的字节还回去（宁可显示，也不静默丢输出）
+        if let Some(until) = self.zm_cooldown_until {
+            if std::time::Instant::now() >= until {
+                self.zm_cooldown_until = None;
+                let left = self.zm_tail.finish();
+                if !left.is_empty() {
+                    self.processor.advance(&mut self.term, &left);
+                    dirty = true;
+                }
+            }
+        }
+        // 传输推进（每帧一次，单帧工作量由 zmodem 模块的解析预算限制）
+        if self.zmodem.is_some() {
+            self.drive_zmodem();
+            let done = self.zmodem.as_ref().map(|s| s.is_done()).unwrap_or(false);
+            if done {
+                self.finish_zmodem();
+            } else {
+                let idle = self
+                    .zmodem
+                    .as_ref()
+                    .map(|s| s.idle_for())
+                    .unwrap_or_default();
+                if !self.zm_need_files && !self.zm_picking && idle > ZMODEM_IDLE_TIMEOUT {
+                    let msg =
+                        format!("等待远端响应超时（{} 秒无数据）", ZMODEM_IDLE_TIMEOUT.as_secs());
+                    if let Some(session) = self.zmodem.as_mut() {
+                        session.fail(msg);
+                    }
+                }
+            }
+        }
         dirty
+    }
+
+    /// 一批远端字节的去向：传输中 → 状态机；否则 → 检测器 →（vte 或新会话）。
+    ///
+    /// 返回是否真的喂给了 vte（决定要不要重建绘制快照）。
+    fn absorb(&mut self, data: &[u8]) -> bool {
+        if let Some(session) = self.zmodem.as_mut() {
+            session.feed(data);
+            // 传输期间画面内容不变：不重建整屏快照（大文件传输时这是每帧都在省的固定开销）
+            return false;
+        }
+        if !crate::config::zmodem_enabled() {
+            self.processor.advance(&mut self.term, data);
+            return true;
+        }
+        // 触发检测永远最先跑：紧跟着上一次会话的第二次 sz/rz 不能被冷却期漏掉。
+        // 残留的协议字节都是 ZFIN/ZRINIT 这类"非开场帧"，检测器不会误命中，
+        // 它们会落到下面的 Miss 分支交给尾巴过滤器。
+        match self.zm_detector.scan(data) {
+            zmodem::Scan::Miss { bytes } => {
+                if bytes.is_empty() {
+                    return false;
+                }
+                // 会话刚结束的冷却期：远端 sz/rz 退出前还会发最后一个应答头和
+                // `OO`，先剥掉这些协议字节，剩下的（shell 提示符）才进 vte
+                if self.zm_cooldown_until.is_some() {
+                    let out = self.zm_tail.push(&bytes);
+                    if out.is_empty() {
+                        return false;
+                    }
+                    self.processor.advance(&mut self.term, &out);
+                    return true;
+                }
+                self.processor.advance(&mut self.term, &bytes);
+                true
+            }
+            zmodem::Scan::Hit {
+                trigger,
+                before,
+                head,
+            } => {
+                // 头之前的字节照常进终端：远端 `sz` 之前打印的东西不能丢
+                if !before.is_empty() {
+                    self.processor.advance(&mut self.term, &before);
+                }
+                // 新会话开始：冷却期与上一个会话的尾巴过滤全部作废
+                self.zm_tail = zmodem::TailFilter::default();
+                self.zm_cooldown_until = None;
+                self.start_zmodem(trigger, head);
+                true
+            }
+        }
+    }
+
+    /// 命中 ZMODEM 头：按帧类型选角色建会话，并把已扣下的头交给状态机。
+    fn start_zmodem(&mut self, trigger: zmodem::Trigger, head: Vec<u8>) {
+        let session = match trigger {
+            zmodem::Trigger::Receive => zmodem::Session::receive(zmodem::download_dir()),
+            zmodem::Trigger::Send => zmodem::Session::send(),
+        };
+        let Ok(mut session) = session else {
+            // 建会话失败（理论上只有内存不足）：字节还给终端，绝不吞掉输出
+            self.processor.advance(&mut self.term, &head);
+            return;
+        };
+        match session.role() {
+            zmodem::Role::Receive => log::info!("ZMODEM: 检测到 ZRQINIT，开始接收文件"),
+            zmodem::Role::Send => log::info!("ZMODEM: 检测到 ZRINIT，准备发送文件"),
+        }
+        session.feed(&head);
+        if session.role() == zmodem::Role::Send {
+            // 远端 `rz` 已经就绪：请 app 层弹文件选择器（rfd 不能在本线程调）
+            self.zm_need_files = true;
+        }
+        self.zmodem = Some(session);
+    }
+
+    /// 会话结束：把状态机没消费的尾巴还给终端（远端 rz/sz 退出后打印的
+    /// shell 提示符就在里面），记下提示，回正常模式。
+    fn finish_zmodem(&mut self) {
+        let Some(mut session) = self.zmodem.take() else {
+            return;
+        };
+        let left = session.take_leftover();
+        // 尾巴里混着协议字节（最后一个应答头 / `OO`）：过一把过滤器，
+        // 只把正常输出（shell 提示符）交给 vte
+        let show = self.zm_tail.start(&left);
+        if !show.is_empty() {
+            self.processor.advance(&mut self.term, &show);
+        }
+        self.zm_notice = Some(session.notice_text());
+        self.zm_need_files = false;
+        self.zm_picking = false;
+        self.zm_cooldown_until = Some(std::time::Instant::now() + ZMODEM_COOLDOWN);
+    }
+
+    /// 推进 ZMODEM 会话：状态机要求写出的字节直接进 `input_tx`。
+    fn drive_zmodem(&mut self) {
+        {
+            // input_tx 与 zmodem 是 self 的不同字段：分开借用，闭包只拿发送端
+            let tx = &self.io.input_tx;
+            let mut wire = |bytes: &[u8]| {
+                let _ = tx.send(bytes.to_vec());
+            };
+            if let Some(session) = self.zmodem.as_mut() {
+                session.drive(&mut wire);
+            }
+        }
+    }
+
+    /// 状态栏用：ZMODEM 传输状态文字（没有活动会话时 None）。
+    pub fn zmodem_status(&self) -> Option<String> {
+        if self.zm_need_files || self.zm_picking {
+            return Some("⬆ ZMODEM：等待选择发送文件…".to_string());
+        }
+        self.zmodem.as_ref().and_then(|s| s.status_text())
+    }
+
+    /// 当前窗格是否正处在 ZMODEM 传输模式（字节不进 vte）。
+    pub fn zmodem_active(&self) -> bool {
+        self.zmodem.is_some()
+    }
+
+    /// 取走一次性提示（完成 / 失败 / 取消），app 拿去弹 toast。
+    pub fn take_zmodem_notice(&mut self) -> Option<String> {
+        self.zm_notice.take()
+    }
+
+    /// 远端 `rz` 是否在等我们选文件。
+    pub fn zmodem_wants_files(&self) -> bool {
+        self.zm_need_files
+    }
+
+    /// 取走"要选文件"的请求（真正弹选择器之前调用，避免重复弹）。
+    pub fn zmodem_take_file_request(&mut self) -> bool {
+        let wanted = std::mem::take(&mut self.zm_need_files);
+        if wanted {
+            self.zm_picking = true;
+        }
+        wanted
+    }
+
+    /// app 层选完文件后回调；`files` 为空 = 用户取消 → 按协议中止会话，
+    /// 不能让远端 `rz` 一直等着。
+    pub fn zmodem_files_picked(&mut self, files: Vec<std::path::PathBuf>) {
+        self.zm_picking = false;
+        let Some(session) = self.zmodem.as_mut() else {
+            return;
+        };
+        if files.is_empty() || session.add_files(files) == 0 {
+            session.abort();
+            self.zm_notice = Some("已取消 ZMODEM 发送".to_string());
+        }
+        self.drive_zmodem();
     }
 
     /// 吸收 PaneEvent（标题 / OSC52），返回 (标题变化, 待写剪贴板文本)。
@@ -359,12 +611,48 @@ impl TermPane {
     /// 终端 resize（含通知后端），返回是否发生变化。
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
         if cols < 2 || rows < 2 || (self.dims.cols, self.dims.rows) == (cols, rows) {
+            self.pending_resize = None;
             return false;
         }
+        // **完全防抖**：拖分屏时尺寸连续变化，哪怕限频发 SIGWINCH，bash 在
+        // 每个新宽度下重绘提示符都会留下换行碎片（实测依旧）。所以连续变化
+        // 期间一个都不发：挂起目标不断被刷新（pending_since 也刷新），只有
+        // 尺寸稳定 200ms 后才由 `flush_pending_resize` 发最终尺寸。
+        let key = (cols, rows);
+        if self.pending_resize.as_ref() != Some(&key) {
+            self.pending_resize = Some(key);
+            self.pending_since = std::time::Instant::now();
+        }
+        false
+    }
+
+    /// 立即应用 pty 尺寸（绕过防抖，落定补发用）。
+    fn apply_resize(&mut self, cols: u16, rows: u16) -> bool {
+        self.pending_resize = None;
         self.dims = TermSize { cols, rows };
         self.term.resize(self.dims);
+        // 尺寸变化使选区坐标失效：新网格可能容不下旧选区（分屏拖动把格子
+        // 变矮后，copy_selection 沿旧坐标索引网格越界 panic——crash.log
+        // 实录）。真实终端在 resize 后也会作废/收敛选区。
+        self.selection = None;
         let _ = self.io.resize_tx.send((cols, rows));
+        // 不清屏：清屏后 shell 不知道，提示符状态丢失，用户每次按回车才
+        // 出新提示符——体感等同「敲了回车」（实测反馈）。正确机制是完全
+        // 防抖 + 落定后**只发一次 SIGWINCH**：bash 收到后原位重绘提示符，
+        // 一次、干净、不追加行。
         true
+    }
+
+    /// 每帧调用：有挂起的尺寸变化且已到限频间隔就补发（拖动结束的收尾）。
+    pub fn flush_pending_resize(&mut self) -> bool {
+        let Some((cols, rows)) = self.pending_resize else {
+            return false;
+        };
+        // 尺寸稳定（200ms 内没再变化）才发，避免拖动中碎片化重绘
+        if self.pending_since.elapsed().as_millis() < 200 {
+            return false;
+        }
+        self.apply_resize(cols, rows)
     }
 
     /// SSH 会话句柄（本地 / Telnet 窗格返回 None），供 SFTP 面板复用连接。
@@ -489,6 +777,20 @@ impl TermPane {
 
     pub fn selection_text(&self) -> Option<String> {
         let (a, b) = normalized_selection(&self.selection)?;
+        // resize（分屏拖动）后旧选区可能落在网格外：bounds_to_string 按选区
+        // 行索引网格，越界直接 panic（crash.log 实录：len=50，
+        // index=18446744073709551564——负行号 usize 回绕）。越界即作废选区。
+        let grid = self.term.grid();
+        let cols = self.dims.cols as usize;
+        let in_grid =
+            |p: &Point<Line>| -> bool {
+                p.line >= grid.topmost_line()
+                    && p.line <= grid.bottommost_line()
+                    && (p.column.0 as usize) < cols
+            };
+        if !in_grid(&a) || !in_grid(&b) {
+            return None;
+        }
         Some(self.term.bounds_to_string(a, b))
     }
 
@@ -817,6 +1119,22 @@ impl TermPane {
         let mods = &ks.modifiers;
         let ctrl = mods.control && !mods.alt;
 
+        // ---- ZMODEM 传输中的 Ctrl+C：按协议中止 ----
+        // 传输期间本窗格的字节通路被协议状态机接管，把 ^C 发出去只会被远端的
+        // sz/rz 当成数据字节；用户按 Ctrl+C 的意图是"取消这次传输"，所以这里
+        // 优先按协议发 CAN 中止序列。复制仍可用 Ctrl+Shift+C（条件带 shift）。
+        if ctrl && !mods.shift && ks.key == "c" && self.zmodem.is_some() {
+            if let Some(session) = self.zmodem.as_mut() {
+                session.abort();
+            }
+            self.zm_need_files = false;
+            self.zm_picking = false;
+            self.zm_notice = Some("正在中止 ZMODEM 传输…".to_string());
+            // 立刻把 CAN 序列送出去，不等下一帧
+            self.drive_zmodem();
+            return;
+        }
+
         // ---- 复制 ----
         // Ctrl+Shift+C / Ctrl+Insert 是终端通用复制键；
         // 另加「Ctrl+C 且有选区时复制」——Windows Terminal 的智能复制习惯，
@@ -840,7 +1158,18 @@ impl TermPane {
         if (ctrl && (ks.key == "v" || ks.key == "insert"))
             || (mods.shift && ks.key == "insert")
         {
-            self.paste_clipboard(cx);
+            // 传输期间粘贴同样不能写进远端字节流（见下面的统一拦截）
+            if self.zmodem.is_none() {
+                self.paste_clipboard(cx);
+            }
+            return;
+        }
+
+        // ---- 传输期间锁住键盘输入 ----
+        // Ctrl+C（中止，上面已处理）和复制（Ctrl+Shift+C）之外，任何按键都不能
+        // 写进远端字节流：那会插进 ZMODEM 数据里把传输搞坏。真实终端在 ZMODEM
+        // 传输时也会锁住键盘输入。
+        if self.zmodem.is_some() {
             return;
         }
 
@@ -1057,7 +1386,8 @@ pub struct TermCursor {
 
 /// 一帧终端绘制快照（坐标相对终端原点）。
 #[derive(Clone)]
-pub struct TermSnapshot {    pub cell: Size<Pixels>,
+pub struct TermSnapshot {
+    pub cell: Size<Pixels>,
     /// 与 fit_to 测量时相同的字号（保证 shape_line 推进与列宽一致）
     pub font_size: Pixels,
     pub rows: Vec<TermRow>,
@@ -1578,4 +1908,133 @@ fn resolve_color(c: vte::ansi::Color, colors: &Colors, is_fg: bool, flags: Flags
 
 pub fn bg_color() -> Hsla {
     BG
+}
+
+/* ----------------------------------------------------------------------
+ * 测试
+ * ------------------------------------------------------------------- */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::TermIo;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::mpsc;
+
+    fn test_dir(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target")
+            .join("zmodem-test-tmp")
+            .join(format!("pane-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// 造一个不连真后端的窗格：`output_rx` 是我们喂"远端字节"的入口，
+    /// `input_tx` 是协议状态机回写远端的出口。真实会话里这两个通道分别由
+    /// pty / SSH / telnet 的后端线程持有，行为完全一样。
+    fn test_pane(
+        download: &std::path::Path,
+    ) -> (
+        TermPane,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (resize_tx, _resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
+        let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let io = TermIo {
+            input_tx,
+            resize_tx,
+            output_rx,
+            ssh: None,
+        };
+        let pane = TermPane::new("zmodem-test".to_string(), io, 80, 24);
+        // 接收目录走配置全局量（真实运行也是这么取的）
+        crate::config::set_zmodem(true, Some(download.display().to_string()));
+        (pane, input_rx, output_tx)
+    }
+
+    /// 集成测试：远端 `sz`（用本项目自己的发送端扮演）经过 `TermPane::pump()`
+    /// 的字节漏斗把文件送进窗格。一次覆盖四个验收点：
+    /// ① 触发头被识别、之后的字节不再进 vte；
+    /// ② 文件按消毒名落盘且字节完全一致；
+    /// ③ 会话结束自动回正常模式（状态栏/终端都恢复）；
+    /// ④ 会话前后的正常输出不受影响，协议字节不会漏进终端画面。
+    #[test]
+    fn pump_hijacks_zmodem_runs_session_and_restores_normal_mode() {
+        let dir = test_dir("recv");
+        let (mut pane, mut remote_in, remote_out) = test_pane(&dir);
+
+        // ① 会话前的正常输出原样显示，且不产生任何回写
+        remote_out.send(b"before: hello\r\n".to_vec()).unwrap();
+        assert!(pane.pump());
+        assert!(pane.context_text(30, 200).contains("before: hello"));
+        assert!(
+            remote_in.try_recv().is_err(),
+            "普通输出不该触发任何回写"
+        );
+        assert!(!pane.zmodem_active());
+
+        // ② 用本项目的发送端扮演远端 `sz`：它发出的第一段就是 ZRQINIT（`**\x18B00`）
+        let src_dir = test_dir("recv-src");
+        let payload: Vec<u8> = (0..4096u32)
+            .flat_map(|i| {
+                [0x18u8, 0x11, 0x0d]
+                    .into_iter()
+                    .chain(std::iter::once((i % 251) as u8))
+            })
+            .collect();
+        let src = src_dir.join("remote.bin");
+        std::fs::write(&src, &payload).unwrap();
+        let mut remote = zmodem::Session::send().unwrap();
+        assert_eq!(remote.add_files(vec![src]), 1);
+
+        let mut steps = 0usize;
+        while !(remote.is_done() && !pane.zmodem_active()) {
+            steps += 1;
+            assert!(steps < 200_000, "窗格集成传输没有结束（协议死锁？）");
+            {
+                let tx = remote_out.clone();
+                let mut wire = |b: &[u8]| {
+                    let _ = tx.send(b.to_vec());
+                };
+                remote.drive(&mut wire);
+            }
+            pane.pump();
+            while let Ok(bytes) = remote_in.try_recv() {
+                remote.feed(&bytes);
+            }
+        }
+
+        // ③ 文件落盘、字节一致、名字正确
+        let received = dir.join("remote.bin");
+        assert!(received.exists(), "没有落到下载目录: {}", received.display());
+        assert_eq!(
+            std::fs::read(&received).unwrap(),
+            payload,
+            "收到的字节与发端不一致"
+        );
+
+        // ④ 回正常模式：状态栏清空，新输出照常进终端，且没有协议字节漏进来
+        assert!(pane.zmodem_status().is_none());
+        remote_out.send(b"after: prompt$ ".to_vec()).unwrap();
+        assert!(pane.pump());
+        let text = pane.context_text(30, 400);
+        assert!(
+            text.contains("after: prompt$"),
+            "会话结束后正常输出没有恢复: {text:?}"
+        );
+        assert!(
+            !text.contains("**"),
+            "ZMODEM 协议字节漏进了终端画面: {text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
 }

@@ -245,7 +245,9 @@ impl SftpPanel {
                         .icon(ic(IconName::Upload))
                         .tooltip("上传")
                         .compact()
-                        .on_click(cx.listener(|this, _, _, _| this.sftp.upload_clicked())),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.sftp.upload_clicked(window, cx)
+                        })),
                 )
                 .child(
                     Button::new("sftp-mkdir")
@@ -338,9 +340,13 @@ impl SftpPanel {
             self.path_input = Some(input);
         }
         if let Some(input) = &self.path_input {
-            // 路径变化时同步到输入框
+            // 路径变化时同步到输入框；用户正在输入框里编辑（有焦点）时不打扰，
+            // 点别处失焦后下一次渲染再同步。之前条件写成了「输入框为空才同步」
+            // ——导航后输入框永远停在旧路径（用户实测：进了 congcong，
+            // 路径栏还显示 /root）。
+            let editing = input.read(cx).focus_handle(cx).is_focused(window);
             let current = input.read(cx).value().to_string();
-            if current != self.path && !self.loading && current.trim().is_empty() {
+            if current != self.path && !self.loading && !editing {
                 input.update(cx, |s, cx| {
                     s.set_value(self.path.clone(), window, cx)
                 });
@@ -454,7 +460,7 @@ impl SftpPanel {
                         .rounded(px(3.0))
                         .when(selected, |d| d.bg(theme.colors.secondary))
                         .hover(|d| d.bg(theme.colors.secondary_hover))
-                        .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                             this.sftp.selected = Some(sel_idx);
                             if let ClickEvent::Mouse(e) = ev {
                                 if e.up.click_count >= 2 {
@@ -463,7 +469,8 @@ impl SftpPanel {
                                     } else if !this.sftp.entries.is_empty() {
                                         let name = dl_name.clone();
                                         let path = dl_path.clone();
-                                        this.sftp.start_download(path, name);
+                                        // 「另存为」在后台弹；取消则什么都不做
+                                        this.sftp.download_clicked(window, cx, path, name);
                                     }
                                 }
                             }
@@ -491,9 +498,13 @@ impl SftpPanel {
                                 .tooltip("下载")
                                 .compact()
                                 .disabled(entry.is_dir)
-                                .on_click(cx.listener(move |this, _, _, _| {
-                                    this.sftp
-                                        .start_download(dl_path_btn.clone(), dl_name_btn.clone());
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.sftp.download_clicked(
+                                        window,
+                                        cx,
+                                        dl_path_btn.clone(),
+                                        dl_name_btn.clone(),
+                                    );
                                 })),
                         )
                         .child(
@@ -605,7 +616,11 @@ impl SftpPanel {
 
         // ---- 进度 + 状态 ----
         for (i, task) in self.tasks.iter().enumerate() {
-            let ratio = if task.total > 0 {
+            // total=0（远端 metadata 没给 size）时**不能**拿 sent 当分母——那会让
+            // 进度条瞬间满格卡死。此时显示不确定态：条走半程示意 + 文本「未知大小」。
+            // 已知大小：正常 sent/total。
+            let known = task.total > 0;
+            let ratio = if known {
                 (task.sent as f32 / task.total as f32).clamp(0.0, 1.0)
             } else {
                 0.0
@@ -666,7 +681,11 @@ impl SftpPanel {
                                 .child(
                                     div()
                                         .h_full()
-                                        .w(relative(ratio))
+                                        .w(relative(if known {
+                                            ratio
+                                        } else {
+                                            0.5 // 未知大小（远端 metadata 没给 size）：半程示意，别满格误导
+                                        }))
                                         .rounded(px(2.0))
                                         .bg(theme.colors.accent),
                                 ),
@@ -675,11 +694,15 @@ impl SftpPanel {
                             div()
                                 .text_size(px(9.0))
                                 .text_color(dim)
-                                .child(format!(
-                                    "{} / {}",
-                                    human_size(task.sent),
-                                    human_size(task.total)
-                                )),
+                                .child(if known {
+                                    format!(
+                                        "{} / {}",
+                                        human_size(task.sent),
+                                        human_size(task.total)
+                                    )
+                                } else {
+                                    format!("{}（未知大小）", human_size(task.sent))
+                                }),
                         ),
                 );
             let idx = i;
@@ -835,13 +858,27 @@ impl SftpPanel {
         });
     }
 
-    fn upload_clicked(&mut self) {
-        let Some(files) = rfd::FileDialog::new().pick_files() else {
-            return;
-        };
-        for p in files {
-            self.start_upload(p);
-        }
+    /// 上传：先在后台线程弹「多选文件」框，再把选中的文件逐个入队。
+    ///
+    /// 对话框不能留在 UI 线程（Windows 上同步弹 rfd 会崩），拿到路径后
+    /// 回投到本面板再启动传输；用户取消 → 什么都不发生（保持原语义）。
+    fn upload_clicked(&mut self, window: &mut Window, cx: &mut Context<crate::app::RustTermApp>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let picked = cx
+                .background_executor()
+                .spawn(async { rfd::FileDialog::new().pick_files() })
+                .await;
+            // 取消：什么都不做
+            let Some(files) = picked else { return };
+            this.update_in(cx, |this, _window, cx| {
+                for p in files {
+                    this.sftp.start_upload(p);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 把一个本地文件上传到当前远端目录（⇧ 按钮入口）。
@@ -921,12 +958,42 @@ impl SftpPanel {
         );
     }
 
-    fn start_download(&mut self, remote: String, name: String) {
+    /// 下载：先在后台线程弹「另存为」拿本地路径，再开始传输。
+    ///
+    /// 对话框不能留在 UI 线程（Windows 上同步弹 rfd 会崩）；拿到路径后
+    /// 回投到本面板再启动传输，用户取消 → 什么都不发生（保持原语义）。
+    fn download_clicked(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<crate::app::RustTermApp>,
+        remote: String,
+        name: String,
+    ) {
+        cx.spawn_in(window, async move |this, cx| {
+            let dialog_name = name.clone();
+            let picked = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_file_name(&dialog_name)
+                        .save_file()
+                })
+                .await;
+            // 取消：什么都不做
+            let Some(local) = picked else { return };
+            this.update_in(cx, |this, _window, cx| {
+                this.sftp.start_download(remote, name, local);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 开始下载到**指定的**本地路径（路径由调用方先通过「另存为」拿到）。
+    fn start_download(&mut self, remote: String, name: String, local: std::path::PathBuf) {
         let Some(client) = self.client.clone() else { return };
         let Some(rt) = self.rt.clone() else { return };
-        let Some(local) = rfd::FileDialog::new().set_file_name(&name).save_file() else {
-            return;
-        };
         self.spawn_transfer(rt, format!("下载 {name}"), false, move |cancel, tx| async move {
             client
                 .download(&remote, &local, cancel, move |sent, total| {

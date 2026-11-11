@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// AI 提供方。
 ///
@@ -189,6 +189,23 @@ pub struct AppConfig {
     /// AI 助手配置（提供方 / 模型 / 上下文策略）
     #[serde(default)]
     pub ai: AiSettings,
+    /// ZMODEM（rz/sz）自动收发：远端跑 `sz` 时自动接收、跑 `rz` 时弹文件选择器。
+    ///
+    /// 关掉后终端流里出现 ZMODEM 头也当普通输出显示（排障用：万一某个程序
+    /// 的输出里真的带 `**\x18B00`，可以一键停掉自动接管）。
+    #[serde(default = "default_true")]
+    pub zmodem_enabled: bool,
+    /// ZMODEM 接收文件的落盘目录；None / 空串表示按系统下载目录回退。
+    #[serde(default)]
+    pub zmodem_download_dir: Option<String>,
+    /// 内置 X server 的输入协议：Xi2（默认）/ Core（核心事件，兼容排障）。
+    /// 老配置无此字段时必须反序列化为 Xi2（`#[serde(default)]`）。
+    #[serde(default)]
+    pub xinput_mode: XInputMode,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -202,6 +219,9 @@ impl Default for AppConfig {
             keep_alive_interval: 30,
             enable_key_macros: true,
             ai: AiSettings::default(),
+            zmodem_enabled: true,
+            zmodem_download_dir: None,
+            xinput_mode: XInputMode::Xi2,
         }
     }
 }
@@ -237,6 +257,12 @@ impl AppConfig {
         let cfg = Self::load_inner();
         // 心跳间隔做成进程级全局量，见 `keep_alive_interval` 的说明
         set_keep_alive_interval(cfg.keep_alive_interval);
+        // ZMODEM 同理：窗格的创建入口很多（本地 / SSH / Telnet / 命令 / 分屏
+        // 复制），逐个把配置传进 TermPane 太容易漏；而且改完配置要求已经
+        // 在跑的窗格立即生效，所以也落成进程级全局量。
+        set_zmodem(cfg.zmodem_enabled, cfg.zmodem_download_dir.clone());
+        // 输入协议同理：query_extension 在任意握手线程上查表，走进程级全局量
+        set_xinput_mode(cfg.xinput_mode);
         cfg
     }
 
@@ -358,4 +384,124 @@ pub fn keep_alive_interval() -> u64 {
 /// 设置心跳间隔（配置加载 / 配置面板保存时调用）。
 pub fn set_keep_alive_interval(secs: u64) {
     KEEP_ALIVE_SECS.store(secs, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// ZMODEM（rz/sz）开关与接收目录（同样是进程级全局量）
+// ---------------------------------------------------------------------------
+
+/// ZMODEM 自动收发总开关（默认开）。
+static ZMODEM_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// ZMODEM 接收目录的配置覆盖（None / 空串 = 走系统下载目录回退链）。
+///
+/// 为什么不用 `OnceLock`：配置面板保存后会反复写入新值，`Mutex<Option<_>>`
+/// 的 `const new` 让它在 static 里直接可用，读侧也只多一次无竞争的锁。
+static ZMODEM_DIR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// ZMODEM 自动收发是否开启。
+pub fn zmodem_enabled() -> bool {
+    ZMODEM_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 配置里指定的 ZMODEM 接收目录（空白视为未配置）。
+pub fn zmodem_download_dir() -> Option<PathBuf> {
+    let g = ZMODEM_DIR.lock().ok()?;
+    g.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 设置 ZMODEM 开关与接收目录（配置加载 / 保存时调用）。
+pub fn set_zmodem(enabled: bool, dir: Option<String>) {
+    ZMODEM_ENABLED.store(enabled, Ordering::Relaxed);
+    if let Ok(mut g) = ZMODEM_DIR.lock() {
+        *g = dir;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 老配置（无 xinput_mode 字段）必须反序列化为默认 Xi2——不能因缺字段丢配置。
+    #[test]
+    fn missing_xinput_mode_field_defaults_to_xi2() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"font_size":14,"font_family":"m","theme":"dark","language":"zh-CN","show_status_bar":true,"keep_alive_interval":30,"enable_key_macros":true}"#)
+                .expect("无新字段的老配置必须能解析");
+        assert_eq!(cfg.xinput_mode, XInputMode::Xi2);
+        assert!(xinput_enabled());
+    }
+
+    /// 字段名小写（lowercase）；Core 值往返保真，且缺省构造也是 Xi2。
+    #[test]
+    fn xinput_mode_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&XInputMode::Xi2).unwrap(),
+            r#""xi2""#
+        );
+        assert_eq!(
+            serde_json::to_string(&XInputMode::Core).unwrap(),
+            r#""core""#
+        );
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"xinput_mode":"core","font_size":14,"font_family":"m","theme":"dark","language":"zh-CN","show_status_bar":true,"keep_alive_interval":30,"enable_key_macros":true}"#,
+        )
+        .expect("Core 模式配置必须能解析");
+        assert_eq!(cfg.xinput_mode, XInputMode::Core);
+        assert_eq!(AppConfig::default().xinput_mode, XInputMode::Xi2);
+    }
+
+    /// 进程级开关：set_xinput_mode(Core) 后 xinput_enabled()=false，恢复 Xi2 后为 true。
+    /// （顺序敏感——同一进程内的其他测试可能与它并发，断言后恢复默认。）
+    #[test]
+    fn xinput_mode_global_gate_flips() {
+        set_xinput_mode(XInputMode::Core);
+        assert!(!xinput_enabled());
+        set_xinput_mode(XInputMode::Xi2);
+        assert!(xinput_enabled());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// X server 输入协议开关（进程级全局量，与 ZMODEM 同款模式）
+// ---------------------------------------------------------------------------
+
+/// 内置 X server 的输入协议。
+///
+/// - `Xi2`（默认）：宣告 XInputExtension，GDK3 走 XI2 设备管理器 + 事件推送。
+/// - `Core`：**不宣告** XInputExtension，客户端（GDK/firefox）自动退回核心
+///   Motion/Button/Key 路径——XI2 万一再出问题时的一键排障开关。
+///
+/// 只影响**新连接**：扩展列表在连接握手时确定，已连接客户端不受影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum XInputMode {
+    #[default]
+    Xi2,
+    Core,
+}
+
+/// XInputExtension 是否宣告（Xi2=true / Core=false）。默认 true。
+static XINPUT_XI2_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 当前配置的输入协议。
+pub fn xinput_mode() -> XInputMode {
+    if XINPUT_XI2_ENABLED.load(Ordering::Relaxed) {
+        XInputMode::Xi2
+    } else {
+        XInputMode::Core
+    }
+}
+
+/// XInputExtension 是否宣告（Core 模式返回 false）。
+pub fn xinput_enabled() -> bool {
+    XINPUT_XI2_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 设置输入协议（配置加载 / 设置面板保存时调用）。
+pub fn set_xinput_mode(mode: XInputMode) {
+    XINPUT_XI2_ENABLED.store(mode == XInputMode::Xi2, Ordering::Relaxed);
 }

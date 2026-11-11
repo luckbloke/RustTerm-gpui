@@ -54,6 +54,12 @@ pub struct TerminalView {
     active: bool,
     /// dock 告知：本组处于单格缩放状态
     zoomed: bool,
+    /// 有新数据被消费、快照需要重建。
+    ///
+    /// 脏驱动重绘后，数据由 app 的低频泵（`TerminalView::pump_cheap`）吸走，
+    /// 而快照只在 `tick`（render 期间）里重建：没有这个标记，数据被吸走了
+    /// 却没有任何一帧会把它画出来。
+    dirty: bool,
 }
 
 impl TerminalView {
@@ -71,6 +77,7 @@ impl TerminalView {
             font_size,
             active: false,
             zoomed: false,
+            dirty: true,
         }
     }
 
@@ -98,6 +105,7 @@ impl TerminalView {
             font_size,
             active: false,
             zoomed: false,
+            dirty: true,
         })
     }
 
@@ -283,33 +291,75 @@ impl TerminalView {
         (col, row)
     }
 
+    /// 只吸数据 / 排事件，不做任何绘制准备（不测字体、不建快照）。
+    ///
+    /// 为什么单独有这么一条路径：改成脏驱动重绘后，空闲时不再有每帧 render，
+    /// 而 PTY 输出、连接结果、标题事件都必须有人接住——否则打字回显要等下一次
+    /// 偶发重绘才出现（这正是历史上"打字变慢镜头"的成因）。
+    /// app 的 UI 泵按活跃度以 8ms/200ms 的节奏调用它；真正昂贵的部分（字体
+    /// 测量、快照生成、绘制）仍然只在 `tick`/`render` 里做。
+    ///
+    /// 返回 true = 有新内容，调用方负责 `cx.notify()`。
+    pub fn pump_cheap(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = self.take_connection_result();
+        let Some(pane) = &mut self.pane else {
+            return changed;
+        };
+        let (title_changed, clip) = pane.drain_pane_events();
+        if let Some(text) = clip {
+            term::copy_to_clipboard(cx, text);
+        }
+        let data_changed = pane.pump();
+        if data_changed || title_changed {
+            // 数据已经离开后端通道：标记"快照待重建"，否则这一批内容谁也画不出来
+            self.dirty = true;
+            changed = true;
+        }
+        changed
+    }
+
+    /// 收「连接中」面板的结果（连上 → 换真身；失败 → 留错误占位）。
+    /// 返回是否有状态变化。抽出来是为了让 `tick` 与 `pump_cheap` 共用。
+    fn take_connection_result(&mut self) -> bool {
+        let result = match &self.pending {
+            Some(rx) => match rx.try_recv() {
+                Ok(Ok(pane)) => Some(Ok(pane)),
+                Ok(Err(e)) => Some(Err(format!("{e:#}"))),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("连接线程异常退出".to_string()))
+                }
+            },
+            None => None,
+        };
+        let Some(result) = result else {
+            return false;
+        };
+        match result {
+            Ok(pane) => {
+                self.pending_title = pane.title.clone();
+                self.pane = Some(pane);
+                self.pending = None;
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.pending = None;
+            }
+        }
+        self.dirty = true;
+        true
+    }
+
     /// 每帧一次：收连接结果 → 吸后端数据 → 按上一帧量到的尺寸 fit → 生成快照。
     ///
-    /// 放在 `render` 里是因为这些都需要 `&mut Window`（字体测量、画布绘制）；
-    /// 帧的持续由 app 的 `request_animation_frame` 保证（有终端标签就一直重绘）。
+    /// 放在 `render` 里是因为这些都需要 `&mut Window`（字体测量、画布绘制）。
+    /// 帧什么时候来由 app 的脏驱动调度决定（见 `app.rs` 的 `spawn_ui_pump`），
+    /// 不再无条件每帧重绘。
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 1) 连接中的面板：拿到结果就换上真身（或留下错误）
-        if let Some(rx) = &self.pending {
-            match rx.try_recv() {
-                Ok(Ok(pane)) => {
-                    self.pending_title = pane.title.clone();
-                    self.pane = Some(pane);
-                    self.pending = None;
-                    self.error = None;
-                    cx.notify();
-                }
-                Ok(Err(e)) => {
-                    self.error = Some(format!("{e:#}"));
-                    self.pending = None;
-                    cx.notify();
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some("连接线程异常退出".to_string());
-                    self.pending = None;
-                    cx.notify();
-                }
-            }
+        if self.take_connection_result() {
+            cx.notify();
         }
 
         let Some(pane) = &mut self.pane else {
@@ -318,12 +368,15 @@ impl TerminalView {
             return;
         };
 
-        // 2) 事件 + 数据
+        // 2) 事件 + 数据（app 的 UI 泵通常已经吸过一遍，这里是渲染路径上的兜底）
         let (title_changed, clip) = pane.drain_pane_events();
         if let Some(text) = clip {
             term::copy_to_clipboard(cx, text);
         }
         let data_changed = pane.pump();
+        if data_changed || title_changed {
+            self.dirty = true;
+        }
 
         // 3) 尺寸：首帧还没有测量值就保持创建时的列数/行数，下一帧再对齐
         let b = self.area.get();
@@ -333,6 +386,11 @@ impl TerminalView {
                 px((b.size.height.as_f32() - term::TERM_PAD * 2.0).max(80.0)),
             );
             let _ = pane.fit_to(window, self.font_size, avail);
+        }
+        // 防抖落定：拖分屏结束后把挂起的最终尺寸补发给 pty。
+        // 尺寸真的变了 → 网格重排了，必须重画（否则画面停在旧列数上）。
+        if pane.flush_pending_resize() {
+            self.dirty = true;
         }
 
         // 4) 光标实心/空心：dock 里显示中 + 键盘焦点在本面板
@@ -347,9 +405,16 @@ impl TerminalView {
             || term_snapshot_now_ms().saturating_sub(
                 TERM_SNAPSHOT_MS.load(std::sync::atomic::Ordering::Relaxed),
             ) >= 250;
-        if self.snapshot.is_none() || data_changed || title_changed || focus_changed || due {
+        if self.snapshot.is_none()
+            || data_changed
+            || title_changed
+            || focus_changed
+            || self.dirty
+            || due
+        {
             TERM_SNAPSHOT_MS.store(term_snapshot_now_ms(), std::sync::atomic::Ordering::Relaxed);
             self.snapshot = Some(Arc::new(pane.snapshot()));
+            self.dirty = false;
         }
     }
 }
@@ -487,8 +552,21 @@ impl Render for TerminalView {
                 canvas(
                     move |bounds, _window, _cx| {
                         // 记录本面板绘制区的原始 bounds（含内边距）；
-                        // 文本网格原点 = 左上 + TERM_PAD，与绘制共用
-                        prepaint_area.set(bounds);
+                        // 文本网格原点 = 左上 + TERM_PAD，与绘制共用。
+                        //
+                        // 布局变了（窗口缩放 / 分屏拖动）→ 标脏：本帧 fit_to 用的
+                        // 还是上一帧的区尺寸，网格重排要下一帧才生效。脏驱动重绘
+                        // 之后没有无条件续帧了，不标这一下，窗口缩放后终端会停在
+                        // 旧的列数上（画面被拉伸/裁切）。
+                        let prev = prepaint_area.get();
+                        if prev.size.width != bounds.size.width
+                            || prev.size.height != bounds.size.height
+                            || prev.origin.x != bounds.origin.x
+                            || prev.origin.y != bounds.origin.y
+                        {
+                            prepaint_area.set(bounds);
+                            crate::xsrv::counters::mark_ui_dirty();
+                        }
                     },
                     move |bounds, (), window, cx| {
                         if let Some(snap) = &paint_snap {
