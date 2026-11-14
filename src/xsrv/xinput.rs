@@ -229,6 +229,42 @@ impl ServerState {
                         mode: xinput::ValuatorMode::RELATIVE,
                     }),
                 },
+                // 轴 2 = **滚动 valuator**（task-24 滚轮修复）。
+                // GDK 的 XI2 翻译器对 ButtonPress(4/5) 不理会（实测：帧合规、送达
+                // 确认，但客户端无滚动），却会对 XI_Motion 的 valuator 走
+                // `scroll_valuators_changed` → GDK_SCROLL（平滑滚动）。那条路成立
+                // 的前提是设备同时声明：一个轴号 2 的 valuator 类，以及指向它的
+                // XIScrollClass——GDK `translate_device_classes` 用
+                // `_gdk_x11_device_xi2_add_scroll_valuator` 登记，而该函数断言
+                // `n_valuator < gdk_device_get_n_axes()`，所以轴必须先存在。
+                xinput::DeviceClass {
+                    len: (6 + 36 + 3) / 4,
+                    sourceid: xinput::DeviceId::from(device_id::VCP),
+                    data: xinput::DeviceClassData::Valuator(xinput::DeviceClassDataValuator {
+                        number: 2,
+                        label: 0,
+                        min: xinput::Fp3232 { integral: -32768, frac: 0 },
+                        max: xinput::Fp3232 { integral: 32767, frac: 0 },
+                        value: xinput::Fp3232 { integral: 0, frac: 0 },
+                        resolution: 0,
+                        mode: xinput::ValuatorMode::RELATIVE,
+                    }),
+                },
+                xinput::DeviceClass {
+                    // 6（类头 4 + sourceid 2）+ 18（number/type/pad 6 + flags 4
+                    // + increment FP3232 8）= 24 字节 = 6 字
+                    len: (6 + 18) / 4,
+                    sourceid: xinput::DeviceId::from(device_id::VCP),
+                    data: xinput::DeviceClassData::Scroll(xinput::DeviceClassDataScroll {
+                        number: 2,
+                        // XIScrollTypeVertical = 1
+                        scroll_type: xinput::ScrollType::from(1u16),
+                        flags: xinput::ScrollFlags::from(0u32),
+                        // increment = 1.0：GDK 用 (value - last)/increment 换算增量，
+                        // 每次滚轮把轴值 ±1 → 每次滚动一个单位。
+                        increment: xinput::Fp3232 { integral: 1, frac: 0 },
+                    }),
+                },
             ],
         }
     }
@@ -561,6 +597,9 @@ mod tests {
     fn core_mode_guards_xinput_replies() {
         crate::config::set_xinput_mode(crate::config::XInputMode::Core);
         let mut state = fixture();
+        // 并行测试（gdk3_consumer_mock…）会把进程级开关翻成 Xi2，fixture 亦可能
+        // 重设——断言前再设一次，消除顺序竞争导致的假失败。
+        crate::config::set_xinput_mode(crate::config::XInputMode::Core);
         let err = state
             .handle(0, 1, &Request::XinputXIQueryVersion(xinput::XIQueryVersionRequest {
                 major_version: 2,
@@ -1077,7 +1116,13 @@ mod tests {
         assert_eq!(vcp.4, "Virtual core pointer");
         assert_eq!(vck.4, "Virtual core keyboard");
         // 字节恰好耗尽（residual == "extra reply data" 级错位）
-        assert_eq!(vcp.5 + vck.5, 4, "VCP 3 类（Button+2 Valuator）+ VCK 1 类（Key）");
+        // task-24：VCP 现为 5 类 = Button + 轴0/1/2 三个 Valuator + XIScrollClass
+        // （滚动 valuator，滚轮修复依赖它），VCK 仍 1 类（Key）
+        assert_eq!(
+            vcp.5 + vck.5,
+            6,
+            "VCP 5 类（Button+3 Valuator+Scroll）+ VCK 1 类（Key）"
+        );
     }
 
     /// 同上，覆盖 VCP-only / VCK-only 分支（GDK 只在构造时用 ALL，
@@ -1085,7 +1130,7 @@ mod tests {
     #[test]
     fn query_device_single_device_parses_with_libxi_rules() {
         for (deviceid, want_name, want_use, want_classes) in [
-            (device_id::VCP, "Virtual core pointer", 1u16, 3usize),
+            (device_id::VCP, "Virtual core pointer", 1u16, 5usize),
             (device_id::VCK, "Virtual core keyboard", 2u16, 1usize),
         ] {
             let mut state = fixture();
@@ -1204,6 +1249,9 @@ mod tests {
     fn gdk3_consumer_mock_never_returns_null_device() {
         use std::collections::HashMap;
 
+        // xi2 测试前提：显式开启 XI2（进程全局量，默认 Core；并发的 gate 测试
+        // 会翻转它，不能依赖别的测试先把它设回 Xi2）。
+        crate::config::set_xinput_mode(crate::config::XInputMode::Xi2);
         let mut state = ServerState::new(Default::default());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.register_client(0, tx);

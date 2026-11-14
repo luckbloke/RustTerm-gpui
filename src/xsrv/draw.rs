@@ -1,4 +1,4 @@
-﻿//! 核心绘制原语。
+//! 核心绘制原语。
 //!
 //! 所有绘制都发生在"一块像素缓冲 + 一份 GC 状态"之上，不关心这块缓冲属于窗口还是
 //! pixmap。这里负责的是**绘制语义**：
@@ -35,7 +35,10 @@ impl Bitmap<'_> {
         }
         let tx = x.rem_euclid(self.width as i32) as usize;
         let ty = y.rem_euclid(self.height as i32) as usize;
-        self.pixels[ty * self.width + tx]
+        // 用 get 而不是裸索引：辅助位图可能因为上游的借还漏配（显式归还，
+        // 没有 Drop 兜底）拿到空/短缓冲——裸索引会 panic，而这条路径上的
+        // panic 会杀死唯一的光栅化 worker（整个界面永久停更）。缺像素按 0 处理。
+        self.pixels.get(ty * self.width + tx).copied().unwrap_or(0)
     }
 }
 
@@ -72,7 +75,14 @@ impl Clip<'_> {
             if cx < 0 || cy < 0 || cx >= mask.width as i32 || cy >= mask.height as i32 {
                 return false;
             }
-            return mask.pixels[cy as usize * mask.width + cx as usize] & 1 != 0;
+            // 同 `Bitmap::sample`：短缓冲不得 panic（缺像素视为未设置）
+            return mask
+                .pixels
+                .get(cy as usize * mask.width + cx as usize)
+                .copied()
+                .unwrap_or(0)
+                & 1
+                != 0;
         }
         true
     }
@@ -617,7 +627,11 @@ pub fn get_zpixmap(
     let mut data = Vec::with_capacity(width * height * 4);
     for row in 0..height {
         for column in 0..width {
-            let pixel = pixels[(y as usize + row) * canvas_width + x as usize + column];
+            // 裸索引换成 get：缓冲区短于声明尺寸时（借还漏配）不得 panic
+            let pixel = pixels
+                .get((y as usize + row) * canvas_width + x as usize + column)
+                .copied()
+                .unwrap_or(0);
             data.extend_from_slice(&pixel.to_ne_bytes());
         }
     }
@@ -647,7 +661,11 @@ pub fn get_bitmap(
     let mut data = vec![0u8; stride_bytes * height_usize];
     for row in 0..height_usize {
         for column in 0..width_usize {
-            let pixel = pixels[(y as usize + row) * canvas_width + x as usize + column];
+            // 裸索引换成 get：缓冲区短于声明尺寸时（借还漏配）不得 panic
+            let pixel = pixels
+                .get((y as usize + row) * canvas_width + x as usize + column)
+                .copied()
+                .unwrap_or(0);
             if pixel & 1 != 0 {
                 data[row * stride_bytes + column / 8] |= 0x80 >> (column % 8);
             }

@@ -1,4 +1,4 @@
-﻿//! 键盘映射与输入注入（M5 的核心部分）。
+//! 键盘映射与输入注入（M5 的核心部分）。
 //!
 //! 输入有两条独立的路径，必须都成立才算"能操作"：
 //!
@@ -276,6 +276,9 @@ pub struct InputState {
     pub revert_to: u8,
     pub modifiers: u16,
     pub keys_down: [bool; 256],
+    /// 滚动 valuator（轴 2）的累加值：每次滚轮 ±1，随 XI_Motion 发给客户端，
+    /// GDK 用 (value - last)/increment 换算成平滑滚动增量。
+    pub scroll_axis: i32,
 }
 
 impl Default for InputState {
@@ -292,6 +295,7 @@ impl Default for InputState {
             revert_to: u8::from(InputFocus::POINTER_ROOT),
             modifiers: 0,
             keys_down: [false; 256],
+            scroll_axis: 0,
         }
     }
 }
@@ -408,23 +412,40 @@ impl ServerState {
         detail: u32,
         buttons: u16,
         state_mask: u16,
+        // task-24 输入绕行：滚轮/键盘置 true——跳过 XI2 投递，核心事件带
+        // send_event 位发出（见 deliver_input_suppressed）。
+        xi2_bypass: bool,
         build: impl Fn(Window, Window, i16, i16) -> Vec<u8>,
     ) {
         // XI2 先行：第一个有 XI2 选择的窗口收到 GenericEvent（此后核心抑制
         // 只对做了 XI2 选择的客户端生效，其余客户端仍走核心）
-        let xi2_delivered = self.deliver_xi2_input(start, evtype, detail, x, y, buttons, state_mask, 2);
+        // 绕行时跳过 XI2：GDK 的 XI2 管理器对我们发出的 GenericEvent 存在
+        // 未明的静默丢弃路径（实测滚轮/键盘全灭），而核心路径已验证可用。
+        let xi2_delivered = if xi2_bypass {
+            false
+        } else {
+            self.deliver_xi2_input(start, evtype, detail, x, y, buttons, state_mask, 2, None)
+        };
         let mut current = start;
         loop {
             let Some(window) = self.windows.get(&current) else {
                 break;
             };
             let stop = window.do_not_propagate & mask != 0;
-            // 有**非 XI2 抑制**的客户端选择该事件 → 投递并停止传播
-            let has_receiver = window.event_masks.iter().any(|(&client, &selected)| {
-                selected & mask != 0 && !self.core_suppressed(client, evtype, true)
-            });
+            // 有接收者 → 投递并停止传播。接收者两种：**非 XI2 抑制**的核心选择者，
+            // 或（绕行时）在该窗口选择了对应 XI2 事件的客户端——后者没有核心
+            // 掩码，漏算会让传播一路走到根窗口、绕行帧一个都发不出去。
+            let xi2_sel_here = self
+                .xi2_selections
+                .get(&current)
+                .map(|sel| super::xinput::xi2_any_selects(sel, evtype))
+                .unwrap_or(false);
+            let has_receiver = (xi2_bypass && xi2_sel_here)
+                || window.event_masks.iter().any(|(&client, &selected)| {
+                    selected & mask != 0 && (xi2_bypass || !self.core_suppressed(client, evtype, true))
+                });
             if has_receiver {
-                self.deliver_input_suppressed(current, mask, evtype, |event| {
+                self.deliver_input_suppressed(current, mask, evtype, xi2_bypass, |event| {
                     let child = self.child_at(event, x, y);
                     let (origin_x, origin_y) = self.window_origin(event);
                     build(
@@ -474,6 +495,8 @@ impl ServerState {
         y: i16,
         state_mask: u16,
         buttons: u16,
+        // Some(轴2值) = 在 Motion 帧尾附带滚动 valuator（滚轮的 XI2 路径）
+        scroll: Option<i32>,
     ) -> Vec<u8> {
         let opcode = super::extensions::OPCODE_XINPUT;
         let fp = |v: i16| -> [u8; 4] {
@@ -553,6 +576,19 @@ impl ServerState {
                 e.extend_from_slice(&fp(y)); // 36 root_y
                 e.extend_from_slice(&fp((x as i32 - origin_x) as i16)); // 40 event_x
                 e.extend_from_slice(&fp((y as i32 - origin_y) as i16)); // 44 event_y
+                // 尾部布局 = xXIDeviceEvent 的**权威线序**（来源：x11rb-protocol
+                // 0.13.2 `impl Serialize for KeyPressEvent`，字段依次为
+                // buttons_len → valuators_len → sourceid → pad0 → flags →
+                // mods → group → button_mask → valuator_mask）：
+                //   buttons_len(48) valuators_len(50) sourceid(52) pad0(54)
+                //   flags(56) mods(60..76) group(76..80)
+                //   button_mask(80..84) valuator_mask(84..88)
+                //
+                // 教训（勿重犯）：这里曾按"记忆中的规范"改成 sourceid@48 /
+                // buttons_len@56——**错**。libXi 按真实偏移读 52 得到 flags=0
+                // → sourceid=0 → GDK 查设备表得 NULL → `gdk_event_set_source_device:
+                // assertion 'GDK_IS_DEVICE (device)' failed` → firefox 内容进程
+                // abort。改这些偏移前必须核对上面那条权威线序，不要凭记忆。
                 e.extend_from_slice(&1u16.to_ne_bytes()); // 48 buttons_len（字数）
                 // valuators_len = 1：**必须留出这一个字**——GDK 的 translate_axes
                 // 会按设备轴数读掩码字节，valuators_len=0 时它仍可能读到帧尾之外
@@ -563,16 +599,28 @@ impl ServerState {
                 e.extend_from_slice(&0u32.to_ne_bytes()); // 56 flags
                 write_mods(&mut e); // 60..76
                 write_group(&mut e); // 76..80
-                // 80：按钮掩码（buttons_len * 4 字节）；bit (n+7) = 按钮 n
+                // 80：按钮掩码。XI2 约定是 **按钮 n ↔ bit n**（libXi 的
+                // `XIMaskIsSet(mask, n)` 取 bit n；Xorg 侧用 `XISetMask(mask, i+1)`
+                // 填 0 基下标）。bit 0 恒为 0——这一点与核心协议 state 的
+                // 按钮 1=bit8 不同，不能直接照搬核心编码（那样 GDK 的
+                // `XIMaskIsSet(buttons, 1)` 永远读不到按下 → 拖拽/滚动状态丢失）。
                 let mut bm = 0u32;
                 for b in 1..=5u16 {
                     if buttons & (1u16 << (7 + b)) != 0 {
-                        bm |= 1u32 << (b - 1 + 8);
+                        bm |= 1u32 << b;
                     }
                 }
-                e.extend_from_slice(&bm.to_ne_bytes());
-                // 84：valuators 掩码 1 字（全零）→ 共 88 字节
-                e.extend_from_slice(&[0u8; 4]);
+                e.extend_from_slice(&bm.to_ne_bytes()); // 80..84
+                match scroll {
+                    Some(value) => {
+                        // 84..88 valuator 掩码：bit 2 = 轴 2 有值
+                        e.extend_from_slice(&(1u32 << 2).to_ne_bytes());
+                        // 88..96 每个置位跟一个 FP3232（integral + frac）
+                        e.extend_from_slice(&value.to_ne_bytes());
+                        e.extend_from_slice(&0u32.to_ne_bytes());
+                    }
+                    None => e.extend_from_slice(&[0u8; 4]), // 84..88 掩码全零
+                }
             }
         }
         e
@@ -590,6 +638,7 @@ impl ServerState {
         buttons: u16,
         state_mask: u16,
         sourceid: u16,
+        scroll: Option<i32>,
     ) -> bool {
         use super::handshake::ROOT_WINDOW as ROOT;
         // deviceid 语义：指针类事件用 VCP/ALL_MASTER 的选择，键盘类用 VCK/ALL
@@ -624,7 +673,7 @@ impl ServerState {
         // 2) 事件窗口 = 投递窗口；child = 该窗口的直接子窗口中含指针者
         let child = self.child_at(win_id, x, y);
         let frame = self.build_xi2_input_event(
-            evtype, deviceid, sourceid, detail, win_id, child, x, y, state_mask, buttons,
+            evtype, deviceid, sourceid, detail, win_id, child, x, y, state_mask, buttons, scroll,
         );
         // length = 信封之后全部字节 / 4
         let len_units = ((frame.len() - 32) / 4) as u32;
@@ -632,7 +681,49 @@ impl ServerState {
         frame[4..8].copy_from_slice(&len_units.to_ne_bytes());
 
         // 3) 发给该窗口上选择了该事件的全部 XI2 客户端（按各自序列号盖写）
-        // 白屏/criticals 排查：限频（≥1s）记录每个 XI2 事件的投递要素。
+        //
+        // task-24 探针**放在发送之后**：这样日志反映的是"谁真的收到了"，
+        // 而不是"打算发给谁"。此前探针在发送前，导致 [xi2-deliver] 看起来
+        // 一切正常、实际一个字节都没出去（曾据此误判过方向）。
+        let mut sent: Vec<u32> = Vec::new();
+        let mut skipped: Vec<u32> = Vec::new();
+        if let Some(selectors) = self.xi2_selections.get(&win_id) {
+            for (&client, sel) in selectors {
+                if !self.xi2_enabled(client)
+                    || !super::xinput::xi2_client_selects(selectors, client, evtype)
+                {
+                    skipped.push(client);
+                    continue;
+                }
+                let _ = sel;
+                if let Some(handle) = self.clients.get(&client) {
+                // XI2 GenericEvent 是完整格式（自带尾部填充），**不能**过
+                // pad_event——它会无条件 resize 到 32 字节，把 88 字节的
+                // xXIDeviceEvent 截断（wire 测试 xi2_motion_generic 抓到）。
+                let mut f = frame.clone();
+                self.stamp_sequence(client, &mut f);
+                // task-23 滚轮探针：XI2 ButtonPress 已确认送达 GDK 但滚轮
+                // 仍无效——转储帧内容与真实 Xorg 的帧逐字节比对用。
+                if evtype == 4 && detail >= 4 {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static WHEEL_DUMP: AtomicU64 = AtomicU64::new(0);
+                    if WHEEL_DUMP.load(Ordering::Relaxed) < 3 {
+                        WHEEL_DUMP.fetch_add(1, Ordering::Relaxed);
+                        let hex: Vec<String> =
+                            f.iter().take(72).map(|b| format!("{b:02x}")).collect();
+                        crate::xsrv::log_line(format_args!(
+                            "[wheel-frame] button={detail} len={} hex={}",
+                            f.len(),
+                            hex.join("")
+                        ));
+                    }
+                }
+                    if handle.sender.send(f).is_ok() {
+                        sent.push(client);
+                    }
+                }
+            }
+        }
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
@@ -648,29 +739,9 @@ impl ServerState {
                     .is_ok()
             {
                 crate::xsrv::log_line(format_args!(
-                    "[xi2-deliver] evtype={} deviceid={} sourceid={} win={:#x} start={:#x} detail={} xy=({},{}) buttons={:#x} state={:#x}",
-                    evtype, deviceid, sourceid, win_id, start, detail, x, y, buttons, state_mask,
+                    "[xi2-deliver] evtype={} detail={} win={:#x} start={:#x} xy=({},{}) sent={sent:?} skipped={skipped:?} focus={:#x} pw={:?}",
+                    evtype, detail, win_id, start, x, y, self.input.focus, self.input.pointer_window,
                 ));
-            }
-        }
-        let Some(selectors) = self.xi2_selections.get(&win_id) else {
-            return true;
-        };
-        for (&client, sel) in selectors {
-            if !self.xi2_enabled(client) {
-                continue;
-            }
-            if !super::xinput::xi2_client_selects(selectors, client, evtype) {
-                continue;
-            }
-            let _ = sel;
-            if let Some(handle) = self.clients.get(&client) {
-                // XI2 GenericEvent 是完整格式（自带尾部填充），**不能**过
-                // pad_event——它会无条件 resize 到 32 字节，把 88 字节的
-                // xXIDeviceEvent 截断（wire 测试 xi2_motion_generic 抓到）。
-                let mut f = frame.clone();
-                self.stamp_sequence(client, &mut f);
-                let _ = handle.sender.send(f);
             }
         }
         true
@@ -739,7 +810,7 @@ impl ServerState {
         if previous != Some(target) {
             let state = self.input.event_state();
             if let Some(old) = previous {
-                self.deliver_input_suppressed(old, u32::from(EventMask::LEAVE_WINDOW), 8, |event| {
+                self.deliver_input_suppressed(old, u32::from(EventMask::LEAVE_WINDOW), 8, false, |event| {
                     let (origin_x, origin_y) = self.window_origin(event);
                     LeaveNotifyEvent {
                         response_type: LEAVE_NOTIFY_EVENT,
@@ -762,7 +833,7 @@ impl ServerState {
                 });
             }
             if target != ROOT_WINDOW {
-                self.deliver_input_suppressed(target, u32::from(EventMask::ENTER_WINDOW), 7, |event| {
+                self.deliver_input_suppressed(target, u32::from(EventMask::ENTER_WINDOW), 7, false, |event| {
                     let (origin_x, origin_y) = self.window_origin(event);
                     EnterNotifyEvent {
                         response_type: ENTER_NOTIFY_EVENT,
@@ -791,14 +862,28 @@ impl ServerState {
         // （X.org `SetMaskForEvent`：每次按下都会改写 MotionNotify 的过滤器），
         // 否则拖拽（选中文字、拖滚动条）收不到运动事件。
         // `button_mask` 的位就是 ButtonNMotionMask：1<<(7+n)。
-                // NyaTerm: XI2 crossing（Enter/Leave）——GDK 在 XI2 模式下只读 XI2
+        //
+        // NyaTerm: XI2 crossing（Enter/Leave）——GDK 在 XI2 模式下只读 XI2
         // 版本的 crossing 事件；核心版本对做了 XI2 选择的客户端被抑制。
-        if let Some(old) = previous {
-            self.deliver_xi2_input(old, 8 /* Leave */, 0, x, y, self.input.button_mask, state, 2);
-        }
-        if let Some(new_target) = self.input.pointer_window {
-            if new_target != ROOT_WINDOW {
-                self.deliver_xi2_input(new_target, 7 /* Enter */, 0, x, y, self.input.button_mask, state, 2);
+        //
+        // **必须只在「指针窗口真的变了」时发**。此前这段无条件地每个 Motion
+        // 都发一对 Leave+Enter：GDK3 收到 XI_Leave 就认为指针离开了窗口，
+        // 重查指针（XIQueryPointer）、重设光标（XIChangeCursor）、重走 hover
+        // 状态机——下一个 Motion 又一对 Leave+Enter……实测风暴：XIQueryPointer
+        // ×175/s、XIChangeCursor ×88/s、xi2-deliver 采样全是 evtype=8(Leave)，
+        // GDK 的窗口状态机永远不"安顿"，firefox 窗口永远不落地绘制（xi2 模式
+        // 黑屏的直接根因）。core 模式正常，正因为核心 crossing 只在跨窗时发。
+        let crossing = previous != Some(target);
+        if crossing {
+            if let Some(old) = previous {
+                // 普通 window↔window 穿越 = Nonlinear（Xorg 语义；
+                // Ancestor 只用于离开到祖先时）
+                self.deliver_xi2_input(old, 8 /* Leave */, 3, x, y, self.input.button_mask, state, 2, None);
+            }
+            if let Some(new_target) = self.input.pointer_window {
+                if new_target != ROOT_WINDOW {
+                    self.deliver_xi2_input(new_target, 7 /* Enter */, 3, x, y, self.input.button_mask, state, 2, None);
+                }
             }
         }
 let motion_mask = if self.input.button_mask == 0 {
@@ -815,6 +900,7 @@ let motion_mask = if self.input.button_mask == 0 {
             0,
             self.input.button_mask,
             state,
+            false,
             |event, child, event_x, event_y| {
                 MotionNotifyEvent {
                     response_type: MOTION_NOTIFY_EVENT,
@@ -879,6 +965,43 @@ let motion_mask = if self.input.button_mask == 0 {
             self.input.pointer_window = Some(target);
         }
 
+        // task-24：滚轮曾试过"核心 + send_event 位"绕行（GDK 源码 L1413 的后门），
+        // 实测 GDK 同样不理会（[xi2-deliver] evtype=4 归零、客户端无滚动），
+        // 故回到 XI2 单一路径——绕行机制保留但不启用，避免留双路径造成误判。
+        let wheel = false;
+        // NyaTerm 探针：XI2 滚轮投递（用户实测 xi2 模式滚轮无效）。限频采样，
+        // 用于确认服务端是否把 ButtonPress(4/5) 作为 XI2 事件送到了客户端。
+        if button >= 4 {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static WHEEL_LOGS: AtomicU64 = AtomicU64::new(0);
+            if WHEEL_LOGS.load(Ordering::Relaxed) < 40 {
+                WHEEL_LOGS.fetch_add(1, Ordering::Relaxed);
+                let xi2_selected = {
+                    let mut cur = target;
+                    let mut on_chain = self.xi2_selections.contains_key(&target);
+                    while !on_chain {
+                        match self.windows.get(&cur) {
+                            Some(w) => {
+                                cur = w.parent;
+                                if cur == ROOT_WINDOW {
+                                    on_chain = self.xi2_selections.contains_key(&cur);
+                                    break;
+                                }
+                                on_chain = self.xi2_selections.contains_key(&cur);
+                            }
+                            None => break,
+                        }
+                    }
+                    format!(
+                        "xi2链上选择={on_chain} grab={:?}",
+                        self.input.pointer_grab.as_ref().map(|g| g.window)
+                    )
+                };
+                crate::xsrv::log_line(format_args!(
+                    "[wheel] button={button} pressed={pressed} target={target:#x} xy=({x},{y}) {xi2_selected}"
+                ));
+            }
+        }
         if pressed && button <= 5 {
             let bit = 1u16 << (7 + button);
             // 第一个按下的键建立隐式抓取：之后直到全部抬起，指针事件都投给
@@ -902,6 +1025,7 @@ let motion_mask = if self.input.button_mask == 0 {
                 // 本按钮，保持 X 核心协议语义不变）
                 self.input.button_mask | bit,
                 state,
+                wheel,
                 |event, child, event_x, event_y| {
                     ButtonPressEvent {
                         response_type: BUTTON_PRESS_EVENT,
@@ -944,6 +1068,7 @@ let motion_mask = if self.input.button_mask == 0 {
                 u32::from(button),
                 self.input.button_mask,
                 state,
+                wheel,
                 |event, child, event_x, event_y| {
                     ButtonReleaseEvent {
                         response_type: BUTTON_RELEASE_EVENT,
@@ -973,9 +1098,36 @@ let motion_mask = if self.input.button_mask == 0 {
 
     /// 滚轮：X 核心协议用 4/5 号键表示上下滚动（横向用 6/7）。
     pub fn pointer_scroll(&mut self, up: bool) {
+        // 1) 按钮路径：core 客户端与老 toolkit 依赖 4/5 号键（core 模式走的就是它）
         let button = if up { 4 } else { 5 };
         self.pointer_button(button, true);
         self.pointer_button(button, false);
+
+        // 2) XI2 平滑滚动路径（GDK）：XI_Motion + 滚动 valuator（轴 2）。
+        //    GDK 的 XI2 翻译器忽略 ButtonPress(4/5)，但对 Motion 的 valuator 会走
+        //    `scroll_valuators_changed` → GDK_SCROLL，而 Motion 通道实测可用。
+        //    约定：上滚轴值 -1、下滚 +1（GDK 的 delta_y 取差值 → 上滚为负，
+        //    与 GTK 平滑滚动的符号习惯一致）。
+        let (x, y) = (self.input.pointer_x, self.input.pointer_y);
+        self.input.scroll_axis += if up { -1 } else { 1 };
+        let value = self.input.scroll_axis;
+        let target = match self.input.pointer_grab {
+            Some(grab) => grab.window,
+            None => self
+                .input
+                .implicit_grab
+                .unwrap_or_else(|| self.window_at(x, y)),
+        };
+        let state = self.input.event_state();
+        let buttons = self.input.button_mask;
+        let delivered = self.deliver_xi2_input(
+            target, 6, /* XI_Motion */ 0, x, y, buttons, state, 2, Some(value),
+        );
+        if !delivered {
+            crate::xsrv::log_line(format_args!(
+                "[wheel] XI2 滚动 valuator 未投出（窗口链上无 XI2 选择）target={target:#x} value={value}"
+            ));
+        }
     }
 
     // ---- 键盘 ----
@@ -1019,6 +1171,9 @@ let motion_mask = if self.input.button_mask == 0 {
                 u32::from(keycode),
                 0,
                 state,
+                // 键盘**不走绕行**：用户实测键盘在 xi2 模式下本来就正常，
+                // 绕行只针对滚轮（4/5 号键）——不要顺手改别的输入路径。
+                false,
                 |event, child, event_x, event_y| {
                     KeyPressEvent {
                         response_type: event_type,
@@ -1081,7 +1236,7 @@ let motion_mask = if self.input.button_mask == 0 {
             return;
         }
         if old != FOCUS_NONE && old != ROOT_WINDOW {
-            self.deliver_input_suppressed(old, u32::from(EventMask::FOCUS_CHANGE), 10, |event| {
+            self.deliver_input_suppressed(old, u32::from(EventMask::FOCUS_CHANGE), 10, false, |event| {
                 FocusOutEvent {
                     response_type: FOCUS_OUT_EVENT,
                     detail: NotifyDetail::ANCESTOR,
@@ -1093,10 +1248,10 @@ let motion_mask = if self.input.button_mask == 0 {
                 .to_vec()
             });
             // NyaTerm: XI2 版本的 FocusOut（GDK XI2 模式只读 XI2）
-            self.deliver_xi2_input(old, 10 /* FocusOut */, 0, self.input.pointer_x, self.input.pointer_y, 0, 0, 2);
+            self.deliver_xi2_input(old, 10 /* FocusOut */, 0, self.input.pointer_x, self.input.pointer_y, 0, 0, 2, None);
         }
         if new != FOCUS_NONE && new != ROOT_WINDOW {
-            self.deliver_input_suppressed(new, u32::from(EventMask::FOCUS_CHANGE), 9, |event| {
+            self.deliver_input_suppressed(new, u32::from(EventMask::FOCUS_CHANGE), 9, false, |event| {
                 FocusInEvent {
                     response_type: FOCUS_IN_EVENT,
                     detail: NotifyDetail::ANCESTOR,
@@ -1108,7 +1263,7 @@ let motion_mask = if self.input.button_mask == 0 {
                 .to_vec()
             });
             // NyaTerm: XI2 版本的 FocusIn
-            self.deliver_xi2_input(new, 9 /* FocusIn */, 0, self.input.pointer_x, self.input.pointer_y, 0, 0, 2);
+            self.deliver_xi2_input(new, 9 /* FocusIn */, 0, self.input.pointer_x, self.input.pointer_y, 0, 0, 2, None);
         }
     }
 
@@ -1134,6 +1289,9 @@ mod tests {
     use super::*;
 
     fn fixture() -> (ServerState, u32, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        // xi2 线协议测试的前提：XI2 开启。产品默认已改为 Core（进程级全局量），
+        // 测试必须显式设回——不能依赖默认值（并发的 gate 测试会翻转它）。
+        crate::config::set_xinput_mode(crate::config::XInputMode::Xi2);
         let mut state = ServerState::new(Default::default());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         state.register_client(0, sender);
@@ -1521,6 +1679,72 @@ mod tests {
             "XI2 客户端不得再收到核心 EnterNotify（双投毁悬停状态机）"
         );
     }
+
+    /// 回归（xi2 黑屏根因）：指针在**同一个窗口内**移动时，不得发 XI2
+    /// Leave/Enter。旧实现每个 Motion 都无条件发一对 Leave+Enter → GDK3 收到
+    /// XI_Leave 就重查指针/重设光标/重走 hover，下一个 Motion 又一对……
+    /// 实测风暴：XIQueryPointer ×175/s、XIChangeCursor ×88/s、deliver 采样全
+    /// 是 evtype=8(Leave)，GDK 状态机永远不安顿，firefox 不落地绘制。
+    #[test]
+    fn xi2_no_crossing_spam_while_pointer_stays_in_one_window() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win);
+
+        state
+            .handle(0, seq, &Request::XinputXIQueryVersion(xinput::XIQueryVersionRequest {
+                major_version: 2,
+                minor_version: 4,
+            }))
+            .expect("XIQueryVersion 应当成功");
+        seq += 1;
+        state
+            .handle(0, seq, &Request::XinputXISelectEvents(xinput::XISelectEventsRequest {
+                window: win,
+                masks: Cow::Owned(vec![xinput::EventMask {
+                    deviceid: xinput::DeviceId::from(device_id::ALL_MASTER),
+                    mask: vec![
+                        xinput::XIEventMask::ENTER,
+                        xinput::XIEventMask::LEAVE,
+                        xinput::XIEventMask::MOTION,
+                    ],
+                }]),
+            }))
+            .expect("XISelectEvents 应当成功");
+        seq += 1;
+
+        // 出根 → 进窗 → **窗内连续移动 3 次**
+        state.pointer_motion(400, 400);
+        state.pointer_motion(5, 5);
+        state.pointer_motion(6, 5);
+        state.pointer_motion(7, 5);
+        state.pointer_motion(8, 5);
+
+        let mut enters = 0;
+        let mut leaves = 0;
+        let mut motions = 0;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.len() >= 32 && frame[0] == 35 {
+                // XI_Motion = 6（x11rb xinput::MOTION_EVENT = 6，勿与核心
+                // MotionNotify=6 的响应类型混淆——GenericEvent 里看的是
+                // offset 8 的 evtype 字段）
+                match u16::from_ne_bytes(frame[8..10].try_into().unwrap()) {
+                    7 => enters += 1,
+                    8 => leaves += 1,
+                    6 => motions += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(enters, 1, "进窗只应收到一次 Enter");
+        assert_eq!(
+            leaves, 0,
+            "窗内移动不得产生任何 Leave（旧实现每个 Motion 发一对 Leave+Enter，\
+             GDK 指针状态机被永久打回，firefox 黑屏）"
+        );
+        assert!(motions >= 4, "窗内的每个 Motion 都应收到 XI_Motion");
+    }
     /// XI2 GenericEvent 线格式守门员：逐字段断言 xXIDeviceEvent 布局
     /// （XI2proto.h：信封 32B + root_x/root_y/event_x/event_y 各 FP1616 +
     /// sourceid/pad/flags + buttons_len/valuators_len + mods(16) + group(4)
@@ -1593,18 +1817,36 @@ mod tests {
         let root_y = i32::from_ne_bytes(frame[36..40].try_into().unwrap());
         assert_eq!((root_x / 65536, root_y / 65536), (100, 60));
 
-        // xXIDeviceEvent：buttons_len 在 48..50（valuators_len 50..52、sourceid 52..54）
+        // xXIDeviceEvent 尾部（权威线序，来源 x11rb KeyPressEvent 序列化）：
+        // buttons_len(48..50)、valuators_len(50..52)、sourceid(52..54)、
+        // pad0(54..56)、flags(56..60)、mods(60..76)、group(76..80)、
+        // button_mask(80..84)、valuator_mask(84..88)
         let buttons_len = u16::from_ne_bytes(frame[48..50].try_into().unwrap());
         assert_eq!(buttons_len, 1, "按钮掩码 1 个 u32 字（偏移 48）");
         let valuators_len = u16::from_ne_bytes(frame[50..52].try_into().unwrap());
         assert_eq!(valuators_len, 1, "valuator 掩码 1 个 u32 字（偏移 50）");
+        let sourceid = u16::from_ne_bytes(frame[52..54].try_into().unwrap());
+        assert_eq!(sourceid, device_id::VCP, "sourceid 在偏移 52（不是 16）");
+        assert_eq!(
+            u16::from_ne_bytes(frame[54..56].try_into().unwrap()),
+            0,
+            "pad0 @54"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame[56..60].try_into().unwrap()),
+            0,
+            "flags @56 = 0"
+        );
+        assert_eq!(
+            u32::from_ne_bytes(frame[80..84].try_into().unwrap()),
+            0,
+            "Motion 无按钮按下：按钮掩码 @80 = 0"
+        );
         assert_eq!(
             u32::from_ne_bytes(frame[84..88].try_into().unwrap()),
             0,
-            "valuator 掩码字本身在 84..88（全零；缺了它 GDK translate_axes 会越界读）"
+            "valuator 掩码字 @84..88（全零；缺了它 GDK translate_axes 会越界读）"
         );
-        let sourceid = u16::from_ne_bytes(frame[52..54].try_into().unwrap());
-        assert_eq!(sourceid, device_id::VCP, "sourceid 在偏移 52（不是 16）");
 
         // mods.effective（mods 起点 60：base 60..64, latched 64..68, locked
         // 68..72, effective 72..76 的低 16 位）= 无按键按下 = 0
@@ -1799,7 +2041,26 @@ mod tests {
         // X 语义：ButtonPress 的 state 不含本次按下的键
         assert_eq!(u32::from_ne_bytes(press[72..76].try_into().unwrap()), 0, "press 的 effective（mods 60..76 末字段）不含本按钮");
         let buttons = u32::from_ne_bytes(press[80..84].try_into().unwrap());
-        assert_eq!(buttons, 1 << 8, "按钮 1 按下 → 掩码 bit 8");
+        assert_eq!(buttons, 1 << 1, "按钮 1 按下 → XI2 掩码 bit 1（按钮 n = bit n）");
+
+        // **权威校验**：用 x11rb 自己的事件解析器解析我们发出的整帧。手工偏移
+        // 断言会与错误实现"同谋"（两边一起错，测试照样绿）——只有外部权威
+        // 解析器能挡住「自洽但违反 XI2 线序」的改动。真实故障：sourceid 曾被
+        // 写到 52 以外，libXi 在 52 读到 0 → GDK 设备表查空 → firefox 内容
+        // 进程 abort（`gdk_event_set_source_device` critical）。
+        {
+            use x11rb_protocol::x11_utils::TryParse as _;
+            let (parsed, rest) = xinput::ButtonPressEvent::try_parse(&press)
+                .expect("x11rb 必须能解析我们发出的 XI2 ButtonPress 帧");
+            assert!(rest.is_empty(), "整帧必须被完整消费（不多不少）");
+            assert_eq!(parsed.deviceid, device_id::VCP, "deviceid = VCP");
+            assert_eq!(parsed.sourceid, device_id::VCP, "sourceid = VCP（偏移 52）");
+            assert_eq!(parsed.detail, 1, "detail = 按钮号");
+            assert_eq!(parsed.event, win, "event = 选择 XI2 的窗口");
+            assert_eq!(parsed.button_mask, vec![1u32 << 1], "按钮掩码 bit 1");
+            assert_eq!(parsed.valuator_mask, vec![0u32], "valuator 掩码 1 字全零");
+            assert!(parsed.axisvalues.is_empty(), "掩码全零 → 无轴值");
+        }
 
         state.pointer_button(1, false);
         let (generic, core) = drain_events(&mut rx);
@@ -1808,7 +2069,7 @@ mod tests {
         assert_eq!(
             u32::from_ne_bytes(release[80..84].try_into().unwrap()),
             0,
-            "抬起后按钮掩码清零"
+            "抬起后按钮掩码清零（@80）"
         );
         assert_eq!(
             u16::from_ne_bytes(release[72..74].try_into().unwrap()),
@@ -1987,18 +2248,83 @@ mod tests {
         state.key_event(24, false, false);
 
         let (generic, core) = drain_events(&mut rx);
+        // 键盘/Motion/普通按钮都仍走 XI2——task-24 的绕行**只针对滚轮**
+        // （4/5 号键）；键盘是用户实测本来就正常的路径，不该动。
         for evtype in [2u16, 3, 4, 5, 6] {
             assert!(
                 generic.iter().any(|(t, _)| *t == evtype),
                 "evtype={evtype} 必须收到 XI2 GenericEvent"
             );
-            // 核心 response_type 与 XI2 evtype 数值相同，但已按 frame[0] 分流
             assert_eq!(
                 core.get(&(evtype as u8)),
                 None,
                 "evtype={evtype} 的核心版本必须被抑制（计数 0）"
             );
         }
+    }
+
+    /// task-24 滚轮：XI_Motion + 滚动 valuator（轴 2）的 wire 布局。
+    /// GDK 依此走 `scroll_valuators_changed` → GDK_SCROLL；用 x11rb 自己的
+    /// 事件解析器验证，避免"自洽但违反线序"。
+    #[test]
+    fn wheel_scroll_valuator_motion_wire_layout() {
+        let (mut state, client, mut rx) = fixture();
+        let win = 0x0020_0001u32;
+        let mut seq = 1;
+        make_window(&mut state, client, &mut seq, win);
+        xi2_select(
+            &mut state,
+            client,
+            &mut seq,
+            win,
+            &[xinput::XIEventMask::MOTION],
+        );
+        state.input.pointer_x = 50;
+        state.input.pointer_y = 50;
+        state.pointer_scroll(true);
+        state.pointer_scroll(false);
+
+        let (generic, _core) = drain_events(&mut rx);
+        let motions: Vec<Vec<u8>> = generic
+            .iter()
+            .filter(|(t, _)| *t == 6)
+            .map(|(_, f)| f.clone())
+            .collect();
+        assert!(
+            motions.len() >= 2,
+            "一次上滚+一次下滚至少要两条带 valuator 的 Motion，实际 {}",
+            motions.len()
+        );
+        for frame in &motions {
+            // 96 字节 = 88（xXIDeviceEvent 固定+掩码）+ 8（FP3232 轴值）
+            assert_eq!(frame.len(), 32 + 64, "Motion + 轴值 = 96 字节");
+            let len_units = u32::from_ne_bytes(frame[4..8].try_into().unwrap());
+            assert_eq!(frame.len() as u32, 32 + len_units * 4, "length 字段自洽");
+            assert_eq!(
+                u16::from_ne_bytes(frame[50..52].try_into().unwrap()),
+                1,
+                "valuators_len = 1"
+            );
+            assert_eq!(
+                u32::from_ne_bytes(frame[84..88].try_into().unwrap()),
+                1 << 2,
+                "valuator 掩码 = bit 2（轴 2 有值）"
+            );
+            // x11rb 权威解析：整帧必须被完整消费
+            use x11rb_protocol::x11_utils::TryParse as _;
+            // x11rb 未单独建模 Motion 事件，但它与 KeyPress 同属设备事件
+            // （xXIDeviceEvent）布局——用该解析器验证线序与 valuator 尾部。
+            let (parsed, rest) = xinput::KeyPressEvent::try_parse(frame)
+                .expect("x11rb 必须能解析带 valuator 的设备事件帧");
+            assert!(rest.is_empty(), "整帧必须被完整消费");
+            assert_eq!(parsed.event_type, 6, "XI_Motion");
+            assert_eq!(parsed.valuator_mask, vec![1u32 << 2], "解析出的 valuator 掩码");
+            assert_eq!(parsed.axisvalues.len(), 1, "掩码 1 位置位 → 1 个轴值");
+        }
+        // 上滚 -1、下滚 +1（差值即 GDK 的 delta_y）
+        let v0 = i32::from_ne_bytes(motions[0][88..92].try_into().unwrap());
+        let v1 = i32::from_ne_bytes(motions[1][88..92].try_into().unwrap());
+        assert_eq!((v0, v1), (-1, 0), "累加轴值：上滚 → -1，再下滚 → 0");
     }
 
     /// 多客户端：client0 选 XI2、client1 纯核心——前者收 GenericEvent、

@@ -331,6 +331,14 @@ impl TermPane {
         Ok(pane)
     }
 
+    /// task-22 多显示：本终端会话的 X 屏幕 id（启用 X11 转发时才有）。
+    pub fn x11_screen_id(&self) -> Option<String> {
+        self.io
+            .ssh
+            .as_ref()
+            .and_then(|h| h.x11_screen_id.clone())
+    }
+
     fn new(title: String, io: TermIo, cols: u16, rows: u16) -> Self {
         let dims = TermSize { cols, rows };
         let (events_tx, events_rx) = mpsc::unbounded_channel::<PaneEvent>();

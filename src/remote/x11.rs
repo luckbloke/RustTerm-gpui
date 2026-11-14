@@ -13,7 +13,9 @@
 //! 会话通道发 `x11-req`（sshd 才会把 `DISPLAY` 写进远端 shell），
 //! 并把服务器反向打开的 `x11` 通道接进 [`ensure_xserver`] 返回的宿主。
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 
@@ -23,49 +25,120 @@ use crate::xsrv::host::{HostServer, XInputEvent};
 /// 输入轮询间隔：与 RDP / VNC 后端一致的节奏。
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
-/// 全局唯一的进程内 X server。多个 SSH 会话与多个 X 客户端共享同一个屏幕。
-static XSERVER: Mutex<Option<Arc<HostServer>>> = Mutex::new(None);
+/// 按 **screen id** 注册的 X server 表。
+///
+/// task-22 多显示：每个 SSH 会话一个独立屏幕（像 MobaXterm 的多 display），
+/// 互不重叠——窗口树、display 编号、帧泵都各自独立。id 由 `backends/ssh.rs`
+/// 在启用 X11 转发时生成，经 `TermIo.ssh`（`SshHandle.x11_screen_id`）带回 UI；
+/// X 屏幕标签（`RdParams.x11_screen_id`）按同一个 id 挂到对应 server 上。
+/// （Vec 而不是 HashMap：`HashMap::new` 不是 const，无法在 static 里初始化。）
+static SCREENS: Mutex<Vec<(String, Arc<HostServer>)>> = Mutex::new(Vec::new());
 
-/// 按需启动（或返回已在运行的）进程内 X server。
-pub async fn ensure_xserver(width: u16, height: u16) -> Result<Arc<HostServer>, String> {
+/// 屏幕编号源（display 标签命名用）。
+static NEXT_SCREEN: AtomicUsize = AtomicUsize::new(1);
+
+/// 待提示的屏幕：有远端程序映射了窗口、但屏幕标签还没打开（task-22「按需
+/// 显示」）。UI 的周期 tick 消费它——`x11_auto_popup` 开（默认）自动弹出对应
+/// 屏幕，关则在状态栏提示。
+pub static POPUP_REQUESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// 取走一条待提示的屏幕 id（去重，由调用方逐条消费）。
+pub fn take_popup_request() -> Option<String> {
+    let mut guard = POPUP_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        None
+    } else {
+        Some(guard.remove(0))
+    }
+}
+
+/// 把屏幕 id 放回待提示队列（自动弹出失败 / 关闭自动弹出的提示模式用）。
+pub fn queue_popup_request(id: String) {
+    let mut guard = POPUP_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.iter().any(|req| req == &id) {
+        guard.push(id);
+    }
+}
+
+/// 清除某个屏幕的待提示项（用户打开了对应屏幕时调用）。
+pub fn clear_popup_request(id: &str) {
+    POPUP_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|req| req != id);
+}
+
+/// 获取（或创建）某个屏幕的 X server。
+pub async fn ensure_screen(id: &str, width: u16, height: u16) -> Result<Arc<HostServer>, String> {
     // 快路径：已在运行（锁不能跨 await，先查后放）
     {
-        let guard = XSERVER.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(server) = guard.as_ref() {
+        let guard = SCREENS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, server)) = guard.iter().find(|(sid, _)| sid == id) {
             return Ok(Arc::clone(server));
         }
     }
-
-    let server = Arc::new(HostServer::start(width.max(320), height.max(240)).await?);
-
-    // 双检：可能已有并发调用者先启动好了
-    let mut guard = XSERVER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = guard.as_ref() {
+    let server = Arc::new(HostServer::start_screened(id, width.max(320), height.max(240)).await?);
+    let mut guard = SCREENS.lock().unwrap_or_else(|e| e.into_inner());
+    // 双检：并发调用者可能已建好
+    if let Some((_, existing)) = guard.iter().find(|(sid, _)| sid == id) {
         return Ok(Arc::clone(existing));
     }
-    *guard = Some(Arc::clone(&server));
+    guard.push((id.to_string(), Arc::clone(&server)));
     Ok(server)
 }
 
-/// X server 是否在运行（供 UI 决定「启用 X11 转发」的默认值）。
-pub fn xserver_running() -> bool {
-    XSERVER
+/// 对某个屏幕做一次操作。没在运行返回 `None`。
+pub fn with_screen<T>(id: &str, f: impl FnOnce(&Arc<HostServer>) -> T) -> Option<T> {
+    let guard = SCREENS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.iter().find(|(sid, _)| sid == id).map(|(_, server)| f(server))
+}
+
+/// 列出当前在运行的屏幕 id（UI「X 服务」菜单用）。
+pub fn running_screens() -> Vec<String> {
+    SCREENS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .is_some()
+        .iter()
+        .map(|(sid, _)| sid.clone())
+        .collect()
 }
 
-/// 对运行中的 X server 做一次操作。没在运行返回 `None`。
-pub fn with_xserver<T>(f: impl FnOnce(&Arc<HostServer>) -> T) -> Option<T> {
-    let guard = XSERVER.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().map(f)
-}
-
-/// 停掉进程内 X server（一般不需要：它随进程退出）。
-pub fn shutdown_xserver() {
-    let guard = XSERVER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(server) = guard.as_ref() {
+/// 关闭并移除一个屏幕（SSH 会话结束 / X11 转发关闭时调用）。
+pub fn close_screen(id: &str) {
+    let server = {
+        let mut guard = SCREENS.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.iter().position(|(sid, _)| sid == id) { Some(pos) => Some(guard.remove(pos).1), None => None }
+    };
+    if let Some(server) = server {
         server.shutdown();
+        POPUP_REQUESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|req| req != id);
+        eprintln!("[xsrv] 屏幕 {id} 已关闭（display :{}）", server.display);
+    }
+}
+
+/// 兼容入口：全局唯一场景（如独立 X 屏幕标签没有绑定会话时）使用固定 id。
+pub async fn ensure_xserver(width: u16, height: u16) -> Result<Arc<HostServer>, String> {
+    ensure_screen("default", width, height).await
+}
+
+/// X server 是否在运行（供 UI 决定「启用 X11 转发」的默认值）。
+/// 是否有屏幕在运行（供 UI 决定「启用 X11 转发」的默认值）。
+pub fn xserver_running() -> bool {
+    !running_screens().is_empty()
+}
+
+/// 对运行中的屏幕做一次操作（`id` 不存在返回 `None`）。
+pub fn with_screen_by<T>(id: &str, f: impl FnOnce(&Arc<HostServer>) -> T) -> Option<T> {
+    with_screen(id, f)
+}
+
+/// 停掉全部屏幕（进程退出前调用；一般不需要）。
+pub fn shutdown_xserver() {
+    for id in running_screens() {
+        close_screen(&id);
     }
 }
 
@@ -82,7 +155,13 @@ pub async fn run(
 
     let _ = ev.send(RdEvent::State(RdState::Connecting));
 
-    let server = ensure_xserver(params.width, params.height)
+    // task-22 多显示：X 屏幕标签按 profile 带来的 screen id 绑定到对应会话的
+    // server；未指定（旧配置/独立屏幕）用 "default"。
+    let screen_id = params
+        .x11_screen_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let server = ensure_screen(&screen_id, params.width, params.height)
         .await
         .map_err(|e| anyhow!("启动内置 X server 失败：{e}"))?;
 
@@ -98,9 +177,37 @@ pub async fn run(
     let _ = ev.send(RdEvent::State(RdState::Active));
 
     // 帧转发任务：XFrame → RdEvent::Frame
+    //
+    // task-24 背压：通道无界，而 UI 消费不动时会无限堆积（3.7MB/帧 × 几千帧
+    // = 数 GB 内存 + 之后逐条处理的 CPU 死亡螺旋）。积压超过 32 条就**丢弃
+    // 积压、只留最新一条**，并让服务端作废已发基准帧——下一拍自动重发**全屏**，
+    // UI 侧短暂残影后自愈。丢带只造成瞬时花屏，不会错误渲染。
+    let server_for_invalidate = Arc::clone(&server);
     let ev_frames = ev.clone();
     let frame_task = tokio::spawn(async move {
         while let Some(frame) = frame_rx.recv().await {
+            // 排空积压（不等待）：统计丢弃数，保留最后一条
+            let mut backlog = 0usize;
+            let mut last = Some(frame);
+            while backlog < 4096 {
+                match frame_rx.try_recv() {
+                    Ok(f) => {
+                        backlog += 1;
+                        last = Some(f);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if backlog > 32 {
+                // 消费端明显跟不上：丢掉这批带，请求全屏重发自愈
+                server_for_invalidate.invalidate_sent_frame();
+                crate::xsrv::log_line(format_args!(
+                    "[x11-fwd] 帧积压 {} 条已丢弃，已请求全屏重发",
+                    backlog
+                ));
+                continue;
+            }
+            let frame = last.unwrap();
             let _ = ev_frames.send(RdEvent::Frame {
                 x: frame.rect.x as u32,
                 y: frame.rect.y as u32,

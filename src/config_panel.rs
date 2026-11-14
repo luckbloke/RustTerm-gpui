@@ -141,6 +141,17 @@ impl ConfigPanel {
                         cx.notify();
                     })),
             )
+            .child(
+                Checkbox::new("cfg-x11-auto-popup")
+                    .label("X 程序启动时自动显示 X 屏幕")
+                    .checked(config.x11_auto_popup)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.config.x11_auto_popup = *checked;
+                        crate::config::set_x11_auto_popup(*checked);
+                        let _ = this.config.save();
+                        cx.notify();
+                    })),
+            )
             // ---- 连接 ----
             .child(div().text_size(px(12.0)).text_color(dim).child("🔗 连接设置"))
             .child(field("Keep-Alive (秒)", &inputs.keep_alive_interval))
@@ -152,7 +163,7 @@ impl ConfigPanel {
                     .child(div().w(px(110.0)).text_size(px(12.0)).child("输入协议"))
                     .child(
                         Button::new("cfg-xinput-xi2")
-                            .label("XInput2（推荐）")
+                            .label("XInput2（兼容）")
                             .compact()
                             .selected(config.xinput_mode == crate::config::XInputMode::Xi2)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -163,7 +174,7 @@ impl ConfigPanel {
                     )
                     .child(
                         Button::new("cfg-xinput-core")
-                            .label("核心事件（兼容）")
+                            .label("核心事件（推荐）")
                             .compact()
                             .selected(config.xinput_mode == crate::config::XInputMode::Core)
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -177,7 +188,7 @@ impl ConfigPanel {
                 div()
                     .text_size(px(11.0))
                     .text_color(dim)
-                    .child("X11 输入协议：XInput2 为事件推送（默认）；核心事件为兼容排障模式。切换后对新连接生效——已有 X11 标签请重开。"),
+                    .child("X11 输入协议：核心事件为默认（兼容排障）；XInput2 为事件推送。切换后对新连接生效——已有 X11 标签请重开。"),
             )
             .child(
                 div()

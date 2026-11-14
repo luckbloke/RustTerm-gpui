@@ -319,6 +319,9 @@ pub enum LastTab {
         legacy_compat: bool,
         #[serde(default)]
         session_id: Option<String>,
+        /// task-22 多显示：X 屏幕标签绑定的屏幕 id（仅 X11 协议）
+        #[serde(default)]
+        x11_screen_id: Option<String>,
     },
     /// 本地文件浏览器
     Files,
@@ -442,6 +445,7 @@ mod tests {
                     share_dir: r"D:\share".to_string(),
                     legacy_compat: true,
                     session_id: None,
+                    x11_screen_id: None,
                 },
                 LastTab::Browser {
                     url: "https://example.com".to_string(),

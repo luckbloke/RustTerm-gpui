@@ -2087,7 +2087,12 @@ impl ServerState {
         }
         // 读根窗口像素前先把待合成的绘制落地（GetImage(root) 读的是合成结果）
         self.ensure_composed();
-        let (pixels, width, height, depth) = self.drawable_pixels(request.drawable)?;
+        // 用 checked 版本：GetImage 按**声明**尺寸索引像素缓冲，缓冲被上游漏配
+        // 掏空时会越界 panic（实测 draw.rs 的 get_zpixmap，panic 会杀死唯一的
+        // 光栅化 worker）。这里先把长度补回声明尺寸，读图失败降级为读背景色。
+        let (width, height, depth) = self.drawable_geometry_checked(request.drawable)?;
+        let (width, height) = (usize::from(width), usize::from(height));
+        let (pixels, _, _, _) = self.drawable_pixels(request.drawable)?;
         // 1 位深的可绘制对象（位图）按位打包返回，其余按 4 字节像素
         let data = if depth == 1 {
             draw::get_bitmap(

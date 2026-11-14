@@ -78,10 +78,22 @@ impl FramePump {
     pub fn attach(&self, sink: FrameSink) {
         *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
         self.stopped.store(false, Ordering::Release);
+        // task-22 按需显示：观众在场（map_window 的弹窗通知据此抑制）
+        self.shared
+            .viewer_attached
+            .store(true, Ordering::Release);
     }
 
     pub fn detach(&self) {
         *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.shared
+            .viewer_attached
+            .store(false, Ordering::Release);
+    }
+
+    /// task-24 背压：作废已发基准帧（写锁窗口极小）——下一拍重发全屏。
+    pub fn invalidate(&self) {
+        self.shared.state().invalidate_sent_frame();
     }
 
     pub fn stop(&self) {
@@ -118,6 +130,13 @@ impl FramePump {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(FRAME_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // task-23：帧率上限。firefox 持续重绘的页面实测 60~160 帧/s、
+            // 10~17 MB/s——UI 每帧还要重建 1280×800 纹理，主线程直接饱和
+            //（体感 = xi2 卡顿）。30fps 对远程桌面绰绰有余：跳过的 tick
+            // 不取帧（不消费版本号），下一拍把累积的变化一次发走。
+            const MIN_SNAPSHOT_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(33);
+            let mut last_snapshot: Option<std::time::Instant> = None;
 
             loop {
                 ticker.tick().await;
@@ -129,16 +148,66 @@ impl FramePump {
                     pump.shared.state().invalidate_sent_frame();
                     continue;
                 }
-
-                let Some((seq, x, y, width, height, pixels)) =
-                    pump.shared.state().take_frame_if_changed()
-                else {
-                    continue;
-                };
-                let frame = encode_frame(&pixels, usize::from(width), usize::from(height), seq, x, y);
-                if let Some(frame) = frame {
-                    pump.send(frame);
+                if let Some(last) = last_snapshot {
+                    if last.elapsed() < MIN_SNAPSHOT_INTERVAL {
+                        continue;
+                    }
                 }
+                last_snapshot = Some(std::time::Instant::now());
+
+                // task-19：整段（取帧快照 + 编码）做 panic 隔离。帧泵是**唯一**
+                // 的取帧者，一旦 panic 退出就再也没人发帧——表现是"窗口都在、
+                // 画面永久冻结"，而且日志里没有任何异常（历史 bug：合成读到被
+                // 抽空的缓冲后越界 panic）。这里把故障限制在当次 tick。
+                crate::xsrv::counters::FRAME_PHASE
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Some((_seq, bands)) = pump.shared.take_frame_snapshot() else {
+                        // 无变化：take_frame_snapshot 内部已在写锁里消费版本与提示
+                        return Vec::new();
+                    };
+                    // task-17 阶段 B：每条脏区带独立编码上传——damage 通常只占
+                    // 屏幕 20~40%，多带比单一外接矩形再省 2~4 倍字节。
+                    crate::xsrv::counters::FRAME_PHASE
+                        .store(2, std::sync::atomic::Ordering::Relaxed);
+                    let mut frames = Vec::with_capacity(bands.len());
+                    for band in bands {
+                        let frame = encode_frame(
+                            &band.pixels,
+                            band.width as usize,
+                            band.height as usize,
+                            band.x,
+                            band.y,
+                        );
+                        if let Some(frame) = frame {
+                            frames.push(frame);
+                        }
+                    }
+                    frames
+                }));
+                match tick {
+                    Ok(frames) => {
+                        crate::xsrv::counters::FRAME_PHASE
+                            .store(3, std::sync::atomic::Ordering::Relaxed);
+                        for frame in frames {
+                            pump.send(frame);
+                        }
+                    }
+                    Err(payload) => {
+                        crate::xsrv::log_line(format_args!(
+                            "[viewer] 取帧/编码 panic（帧泵继续）：{}",
+                            if let Some(s) = payload.downcast_ref::<&'static str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "非字符串 panic 载荷".to_string()
+                            }
+                        ));
+                    }
+                }
+                crate::xsrv::counters::FRAME_PHASE
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
             }
         })
     }
@@ -197,11 +266,10 @@ fn encode_frame(
     pixels: &[u32],
     width: usize,
     height: usize,
-    seq: u64,
     x: u16,
     y: u16,
 ) -> Option<XFrame> {
-    let _ = seq;
+    let _ = (x, y);
     let w = width;
     let h = height;
     if w == 0 || h == 0 || pixels.len() < w * h {
@@ -279,7 +347,7 @@ mod tests {
             })
             .collect();
 
-        let frame = encode_frame(&local, rect.2, rect.3, 1, rect.0, rect.1).expect("应该编码出一帧");
+        let frame = encode_frame(&local, rect.2, rect.3, rect.0, rect.1).expect("应该编码出一帧");
 
         assert_eq!(frame.rect, FrameRect { x: rect.0, y: rect.1, width: rect.2 as u16, height: rect.3 as u16 });
         assert_eq!(frame.rgba.len(), 4 * 2 * 4, "w*h*4 字节");

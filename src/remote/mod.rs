@@ -54,6 +54,9 @@ pub struct RdParams {
     /// 本地磁盘一样往远端拷文件；不需要在远端安装任何服务。
     /// VNC 与 SPICE 没有标准的文件通道（RFB 只有剪贴板），这里为 `None`。
     pub share_dir: Option<String>,
+    /// task-22 多显示：X 屏幕标签要绑定的屏幕 id（仅 X11 协议使用）。
+    /// `None` = 未绑定（独立屏幕，走 "default"）。
+    pub x11_screen_id: Option<String>,
     /// 旧版服务器兼容模式（Windows Server 2008 / 2008 R2 等）。
     ///
     /// 这些服务器的 CredSSP/NLA 实现与客户端 sspi 存在已知兼容问题：
@@ -80,6 +83,8 @@ impl Default for RdParams {
             clipboard: true,
             share_dir: None,
             legacy_compat: false,
+            /// task-22 多显示：X 屏幕标签要绑定的屏幕 id（仅 X11 协议使用）
+            x11_screen_id: None,
         }
     }
 }

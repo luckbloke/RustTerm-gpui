@@ -9,6 +9,47 @@
 
 // Windows 下不挂载控制台：纯 GUI 程序
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+// task-24 内存取证：全局分配器计数器。`ALLOC_CURRENT` = 当前在用字节（分配
+// 减释放）。与任务管理器 RSS 对照：
+//   - RSS 涨而 ALLOC_CURRENT 平 → 释放的内存被分配器保留（碎片/arena），不是泄漏；
+//   - ALLOC_CURRENT 跟着 RSS 一起涨 → 真有内存被持有（泄漏），按调用路径修。
+#[global_allocator]
+static ALLOC: AllocCounter = AllocCounter;
+
+pub struct AllocCounter;
+
+unsafe impl std::alloc::GlobalAlloc for AllocCounter {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = std::alloc::System.alloc(layout);
+        if !ptr.is_null() {
+            use std::sync::atomic::Ordering;
+            ALLOC_CURRENT.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOC_TOTAL.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        }
+        ptr
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        use std::sync::atomic::Ordering;
+        ALLOC_CURRENT.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+        std::alloc::System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        use std::sync::atomic::Ordering;
+        let out = std::alloc::System.realloc(ptr, layout, new_size);
+        if !out.is_null() {
+            if new_size >= layout.size() {
+                ALLOC_CURRENT.fetch_add((new_size - layout.size()) as u64, Ordering::Relaxed);
+            } else {
+                ALLOC_CURRENT.fetch_sub((layout.size() - new_size) as u64, Ordering::Relaxed);
+            }
+        }
+        out
+    }
+}
+
+pub static ALLOC_CURRENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOC_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // app.rs 体量很大，测试宏展开时容易撞到默认递归深度
 
 
@@ -255,6 +296,8 @@ fn main() {
     install_crash_log();
     install_rdpdr_log();
     spawn_heartbeat();
+    // task-24：挂死取证看门狗（独立文件 alive.txt / stall.txt，见 xsrv::spawn_watchdog）
+    crate::xsrv::spawn_watchdog();
     enable_child_window_embedding();
 
     let handle = std::thread::Builder::new()
@@ -264,7 +307,10 @@ fn main() {
         .expect("无法创建主线程");
 
     match handle.join() {
-        Ok(()) => {}
+        Ok(()) => {
+            // 正常退出留痕：区分「主动关窗退出」与「被外部结束」（后者没有这一行）
+            crate::xsrv::log_line(format_args!("[exit] run_app 正常返回，进程退出"));
+        }
         Err(e) => {
             // 线程 panic：把 payload 写进崩溃日志再退出。
             if let Some(msg) = e.downcast_ref::<&str>() {

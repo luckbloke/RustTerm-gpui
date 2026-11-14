@@ -3,7 +3,7 @@ winresource = "0.1"
 
 [package]
 name = "rustterm-gpui"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "RustTerm GPUI - 全功能终端客户端（GPUI Kit 版）"
 

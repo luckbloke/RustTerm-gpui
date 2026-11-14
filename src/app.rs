@@ -70,6 +70,10 @@ pub const UI_WAKE_IDLE_MS: u64 = 200;
 /// `[hb-ui]` 汇报间隔（毫秒）。
 const UI_REPORT_MS: u128 = 5_000;
 
+/// task-22 按需显示：底部状态栏的常驻提示（如「远端 X 程序已启动」）。
+/// `None` = 无提示。x11_auto_popup 关闭时由 ui_pump_once 写入。
+pub static STATUS_NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// 帧调度输入（都是"这一帧观察到的事实"）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameSignals {
@@ -672,17 +676,56 @@ impl RustTermApp {
     /// X server 是进程内全局单例：SSH 会话启用 X11 转发后，远端 X 程序的
     /// 连接都灌进同一个屏幕；这个标签只是它的"取景器"。
     pub fn open_x11_screen(&mut self, cx: &mut Context<Self>) {
-        let app: &App = cx;
+        // task-22 多显示：优先打开**当前活动终端会话**的独享屏幕。
+        let bound = self
+            .tabs
+            .get(self.active.min(self.tabs.len().saturating_sub(1)))
+            .and_then(|t| t.workspace())
+            .and_then(|_| self.tab_first_pane_id(self.active, cx));
+        self.open_x11_screen_for(bound, cx);
+    }
+
+    /// 活动终端标签的第一个面板的 X 屏幕 id（未启用 X11 转发 = None）。
+    fn tab_first_pane_id(&self, tab: usize, cx: &App) -> Option<String> {
+        let view = self.tab_first_view(tab, cx)?;
+        let pane = view.read(cx).pane_ref()?;
+        pane.x11_screen_id()
+    }
+
+    /// 打开（或切换到）绑定 `screen_id` 的 X 屏幕标签。
+    ///
+    /// - 已有绑定同一屏幕的标签 → 直接切过去（不重复开）；
+    /// - 没有 → 新建一个，标签名带序号；`screen_id` 写进 profile，
+    ///   后端按它挂到对应会话独享的 server 上（多显示互不重叠）。
+    /// - `screen_id = None`：独立屏幕（"default"）。
+    pub fn open_x11_screen_for(&mut self, screen_id: Option<String>, cx: &mut Context<Self>) {
+        let screen_id = screen_id.clone();
+        // 打开（或切到）屏幕即满足提示诉求：清掉状态栏提示与待弹出队列
+        *STATUS_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(id) = &screen_id {
+            crate::remote::x11::clear_popup_request(id);
+        }
         if let Some(idx) = self.tabs.iter().position(
-            |t| matches!(t, TabContent::RemoteDesktop(tab) if tab.read(app).profile.protocol == RdTabProtocol::X11),
+            |t| matches!(t, TabContent::RemoteDesktop(tab) if tab.read(cx).profile.protocol == RdTabProtocol::X11 && tab.read(cx).profile.x11_screen_id == screen_id),
         ) {
             self.active = idx;
             return;
         }
         let lang = self.i18n.lang;
+        let n = self
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, TabContent::RemoteDesktop(tab) if tab.read(cx).profile.protocol == RdTabProtocol::X11))
+            .count();
+        let label = if n == 0 {
+            crate::i18n::tr(lang, "x11.screen_name").to_string()
+        } else {
+            format!("{} #{}", crate::i18n::tr(lang, "x11.screen_name"), n + 1)
+        };
         let profile = RdpConnectionProfile {
-            name: crate::i18n::tr(lang, "x11.screen_name"),
+            name: label,
             protocol: RdTabProtocol::X11,
+            x11_screen_id: screen_id.clone(),
             ..Default::default()
         };
         let mut tab = RemoteDesktopTab::new(profile);
@@ -990,6 +1033,7 @@ impl RustTermApp {
                         share_dir: t.profile.share_dir.clone(),
                         legacy_compat: t.profile.legacy_compat,
                         session_id: t.profile.session_id.clone(),
+                        x11_screen_id: t.profile.x11_screen_id.clone(),
                     })
                 }
                 TabContent::LocalFiles(_) => out.push(LastTab::Files),
@@ -1084,6 +1128,7 @@ impl RustTermApp {
                     share_dir,
                     legacy_compat,
                     session_id,
+                    x11_screen_id,
                 } => {
                     if self.restore_remote_desktop(
                         &protocol,
@@ -1094,6 +1139,7 @@ impl RustTermApp {
                         share_dir,
                         legacy_compat,
                         session_id,
+                        x11_screen_id,
                         cx,
                     ) {
                         restored += 1;
@@ -1167,6 +1213,7 @@ impl RustTermApp {
         share_dir: String,
         legacy_compat: bool,
         session_id: Option<String>,
+        x11_screen_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(proto) = RdTabProtocol::from_key(protocol) else {
@@ -1200,6 +1247,9 @@ impl RustTermApp {
             share_dir,
             legacy_compat,
             session_id,
+            // task-22 多显示：屏幕绑定必须在 connect() **之前**进 profile——
+            // 后端建连时按它挂到会话独享的 server（连接后再改就晚了）
+            x11_screen_id,
             ..Default::default()
         };
         let mut tab = RemoteDesktopTab::new(profile);
@@ -2393,6 +2443,8 @@ impl RustTermApp {
     /// 与状态更新，不布局不绘制），只有真的排到新内容才唤醒一帧。空闲时几乎
     /// 不画，活跃时按内容量画。
     fn spawn_ui_pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // task-24：挂死取证看门狗（幂等，只有第一次调用真正起线程）
+        crate::xsrv::spawn_watchdog();
         cx.spawn_in(window, async move |this, cx| loop {
             let interval = match this.update(cx, |this, _| this.ui_pump_interval()) {
                 Ok(iv) => iv,
@@ -2417,7 +2469,30 @@ impl RustTermApp {
     /// 泵一拍：把所有"不需要绘制"的数据推进模型；有新内容才唤醒渲染。
     fn ui_pump_once(&mut self, cx: &mut Context<Self>) {
         self.ui_ticks += 1;
+        // task-24 信标：UI 泵活着/卡在哪个阶段（看门狗写 stall.txt）
+        crate::xsrv::counters::UI_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::xsrv::counters::UI_PHASE.store(1, std::sync::atomic::Ordering::Relaxed);
         let mut dirty = crate::xsrv::counters::take_ui_dirty();
+
+        // 0) task-22 按需显示：远端程序映射了窗口且屏幕标签未开。
+        //    x11_auto_popup 开 → 自动弹出对应屏幕（**消费即完成，不再回队**——
+        //    回队会让泵每拍强制把 active 拽回 X 屏幕标签，用户永远切不走）；
+        //    关 → 回队保留提示，直到用户打开对应屏幕才清除。
+        if let Some(screen_id) = crate::remote::x11::take_popup_request() {
+            let auto = crate::config::x11_auto_popup();
+            crate::xsrv::log_line(format_args!(
+                "[popup] UI 消费 screen={screen_id} 自动弹出={auto}"
+            ));
+            if auto {
+                self.open_x11_screen_for(Some(screen_id), cx);
+                dirty = true;
+            } else {
+                crate::remote::x11::queue_popup_request(screen_id.clone());
+                *STATUS_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(crate::i18n::tr(self.i18n.lang, "x11.program_started").to_string());
+                dirty = true;
+            }
+        }
 
         // 1) 整标签级连接结果（连上 → 换成终端工作区）
         if self.poll_connecting() {
@@ -2471,6 +2546,7 @@ impl RustTermApp {
             dirty = true;
         }
 
+        crate::xsrv::counters::UI_PHASE.store(3, std::sync::atomic::Ordering::Relaxed);
         // 5) 限频唤醒：没到间隔就先攒着（ui_paint_pending 跨拍保留，内容不会丢）
         if dirty {
             self.ui_paint_pending = true;
@@ -2482,6 +2558,7 @@ impl RustTermApp {
             self.ui_wakes += 1;
             cx.notify();
         }
+        crate::xsrv::counters::UI_PHASE.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 记录一帧耗时 + 5s 一次的 `[hb-ui]` 汇报（优化前后对照的证据）。
@@ -5050,6 +5127,17 @@ impl RustTermApp {
                     .flex_none()
                     .child(status_text),
             );
+
+        // task-22 按需显示：常驻提示（如「远端 X 程序已启动」）。
+        // 用户打开对应屏幕后自动清除。
+        if let Some(notice) = STATUS_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            left = left.child(
+                div()
+                    .text_color(theme.colors.warning)
+                    .flex_none()
+                    .child(format!("⚠ {notice}")),
+            );
+        }
 
         // ---- 右区：尺寸 / 光标 / 标签计数 / 会话数 ----
         let mut right = div()

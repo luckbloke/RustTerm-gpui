@@ -14,7 +14,7 @@
 //! 那条链路会把通道字节流交给同一个 `serve_stream()`。
 
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
@@ -52,19 +52,452 @@ impl Default for ServerConfig {
 /// 用一个 `Mutex` 包住全部状态：每个请求的处理都很短，且持锁期间不做 I/O
 /// （回复只是投递到各连接的发送队列），不会因为某个客户端不读数据而卡住别人。
 pub struct ServerShared {
-    state: Mutex<ServerState>,
+    /// task-18：RwLock 快照语义——UI 帧泵读帧（`state_read`）与光栅化 worker
+    /// 写帧（`state` 写锁）解耦；读读并发，读写互斥。
+    state: RwLock<ServerState>,
+    /// task-17 顺序异步光栅化：绘制类命令的**有序**队列（严格 FIFO）。
+    ///
+    /// 请求循环只做 O(1) 入队，光栅化由唯一的 worker 线程按入队顺序逐条
+    /// 执行（每条命令单独拿一次状态锁）——查询类请求在循环线程就地处理，
+    /// 最多等 worker「当前这条」命令做完，不再等整条绘制流（[xi-q] 实测
+    /// 积压 21~79ms/查询的根治）。
+    draw_queue: Mutex<std::collections::VecDeque<QueuedDraw>>,
+    draw_signal: std::sync::Condvar,
+    /// worker 停止标志：置位后队列里的剩余命令被**丢弃**（关闭语义）。
+    raster_stop: std::sync::atomic::AtomicBool,
+    /// worker 已启动标志（唯一消费者是 FIFO 顺序的前提，禁止重复启动）。
+    raster_started: std::sync::atomic::AtomicBool,
+    /// task-19 心跳：worker 已执行的命令条数。
+    raster_executed: std::sync::atomic::AtomicU64,
+    /// task-19：worker 捕获到的绘制 panic 次数。
+    ///
+    /// 旧实现里 `cmd.run(...)` 没有任何保护：一条绘制命令 panic 就会**杀死
+    /// 唯一的光栅化线程**且不留日志——队列里的命令此后再也不消费，表现是
+    /// "窗口还在，但整个界面再也不刷新"，而且进程内无法恢复（server 实例
+    /// 被全局静态量持有）。现在 panic 只废掉那一条命令。
+    raster_panics: std::sync::atomic::AtomicU64,
+    /// 每个连接"已被 worker 执行完"的最大请求顺序号（task-19 顺序判定）。
+    ///
+    /// 必要性：worker 把命令 pop 出来之后队列就"空"了，但命令还在执行中；
+    /// 若此时让本连接就地执行后续带应答请求，应答会先于那条命令发出 → 应答
+    /// 乱序 → XCB 致命中止。用"已执行完"而不是"已出队"才能堵住这个窗口。
+    raster_done: Mutex<std::collections::HashMap<u32, u64>>,
+    /// task-22 按需显示：UI 是否已挂帧接收端（FramePump attach/detach 维护）。
+    /// Arc 共享给 `ServerState.viewer_attached`（map_window 触发判断用）。
+    pub viewer_attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 本屏幕的 id（HostServer::start 填写；"" = 匿名）。
+    pub screen_id: Mutex<String>,
+    /// 有窗口映射且 UI 未挂接收端时的回调（HostServer::start 填写；由
+    /// `ServerState::notify_map_pending` 触发，去重与弹窗逻辑在回调里）。
+    pub on_map_no_viewer: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl ServerShared {
+    /// 填写屏幕 id 与「映射窗口且无观众」回调（HostServer::start 调用一次）。
+    pub fn set_map_notify(
+        &self,
+        screen_id: &str,
+        cb: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        *self.screen_id.lock().unwrap_or_else(|e| e.into_inner()) = screen_id.to_string();
+        *self.on_map_no_viewer.lock().unwrap_or_else(|e| e.into_inner()) = Some(cb);
+    }
+}
+
+/// 队列里的一个绘制命令：捕获已解析的请求 + 客户端/序列号/发送端，
+/// 由 worker 在状态锁内执行（错误按原序列号回错，GetImage 的应答也在这里发）。
+struct QueuedDraw {
+    /// 归属连接 + 该连接的请求顺序号（task-19：worker 结束后回执，供
+    /// `inline_allowed` 判断"本连接还有没有正在执行的命令"）。
+    client: u32,
+    order: u64,
+    run: Box<dyn FnOnce(&mut ServerState) + Send>,
+}
+
+impl QueuedDraw {
+    fn run(self, state: &mut ServerState) {
+        (self.run)(state);
+    }
+}
+
+/// 请求是否可以**就地直通**（不经过 FIFO 队列）。
+///
+/// 两条都必须满足：
+/// 1. **请求本身是非像素语义的**（`inline_safe`：结构/属性/atom/选择/输入/
+///    焦点/抓取/查询/键盘映射/屏保这类，不碰像素缓冲，也不改像素资源的
+///    生命周期）。**未列入的一律入队**——这是"默认安全"：漏判只会让请求
+///    走队列（顺序依然正确、只是慢一点），绝不会重排。
+/// 2. **本连接此前入队的命令都已执行完**（`raster_done_for >= last_enqueued`）。
+///    条件 2 不能省：
+///    - worker 把命令 **pop 出来之后** `pending_draws()` 就归零了，但命令还在
+///      执行中；此时就地应答会让应答**先于**那条命令的应答发出 → 应答乱序 →
+///      XCB 致命中止（firefox「Exiting due to channel error」属于这一类）；
+///    - 有排队命令在执行时（如 CreatePixmap）就地查询会看到"资源还不存在"
+///      （BadDrawable）之类的中间态。
+///
+/// 为什么不再用「绘制类请求黑名单」（旧 `is_deferred_draw`）：黑名单要求
+/// **枚举完整**，漏掉任何一个会改像素或会释放/复用像素资源的请求，排队中的
+/// 绘制就会看到被改过的状态、或引用已被销毁/已被新对象顶替的资源。实测踩到
+/// 的漏项：`ChangePicture` / `SetPictureClipRectangles` / `AddGlyphs` /
+/// `FreeGlyphs`（排队中的合成用了改后的裁剪或已被删的字形）、
+/// `ClearArea`（纯绘制）、`DestroyWindow` / `ConfigureWindow` / `FreeCursor` /
+/// `FreeColormap`（排队中的绘制引用已销毁/被重建的资源）、以及 XID 复用
+/// （cairo 释放 picture 后立刻用同一 id 新建 → 排队的 `Free` 把**新建的**
+/// 对象删掉）。其中窗口树类（4/5/12）已从白名单移除、直接入队；RENDER 与
+/// 光标/颜色表族本来就在白名单外；白名单里仍留着的窗口**状态**操作
+/// （MapWindow 等）不影响像素缓冲，靠条件 2 的屏障保证不越过本连接排队中的
+/// 绘制。
+///
+/// 之前还试过「队列非空就入队」的写法，那是**错的**：`last_enqueued` 只在
+/// 入队分支里赋值，而队列初始为空 → 判据恒真 → 谁也不入队 → 队列恒空、
+/// worker 变成死代码（绘制退回请求循环同步执行，查询被绘制流阻塞的老问题
+/// 原样回来）。默认入队（本函数）没有这个不动点。
+fn inline_allowed(shared: &ServerShared, client: u32, last_enqueued: u64, major_opcode: u8) -> bool {
+    inline_safe(major_opcode) && shared.raster_done_for(client) >= last_enqueued
+}
+
+/// 该 major opcode 的请求是否**不碰像素**（可以就地执行）。
+///
+/// 用 x11rb 的 `*_REQUEST` 常量按名字列出（此前用魔法数字区间，opcode 对照表
+/// 错过一位——OpenFont 实际是 45 不是 44，差点把字体生命周期放进白名单）。
+/// 判据：不读写 drawable 像素缓冲、不增删像素资源（pixmap/GC/字体/cursor/
+/// colormap 的创建销毁一律入队）。**未列的一律入队**——这是"默认安全"：
+/// 漏判只会让请求走队列（顺序依然正确、只是慢一点），绝不会重排。
+fn inline_safe(major_opcode: u8) -> bool {
+    use x11rb_protocol::protocol::xproto;
+    match major_opcode {
+        // 窗口树查询与状态操作（不碰像素缓冲；窗口的销毁/尺寸重建走队列）
+        xproto::GET_WINDOW_ATTRIBUTES_REQUEST
+        | xproto::CHANGE_SAVE_SET_REQUEST
+        | xproto::REPARENT_WINDOW_REQUEST
+        | xproto::MAP_WINDOW_REQUEST
+        | xproto::MAP_SUBWINDOWS_REQUEST
+        | xproto::UNMAP_WINDOW_REQUEST
+        | xproto::UNMAP_SUBWINDOWS_REQUEST
+        | xproto::CIRCULATE_WINDOW_REQUEST => true,
+        // 窗口/资源的销毁与重建：像素缓冲生命周期 → 入队
+        // （DESTROY_WINDOW=4 / DESTROY_SUBWINDOWS=5 / CONFIGURE_WINDOW=12 不在内）
+        // 几何/树/属性/atom/选择
+        xproto::GET_GEOMETRY_REQUEST
+        | xproto::QUERY_TREE_REQUEST
+        | xproto::INTERN_ATOM_REQUEST
+        | xproto::GET_ATOM_NAME_REQUEST
+        | xproto::CHANGE_PROPERTY_REQUEST
+        | xproto::DELETE_PROPERTY_REQUEST
+        | xproto::GET_PROPERTY_REQUEST
+        | xproto::LIST_PROPERTIES_REQUEST => true,
+        // 选择与事件发送
+        xproto::SET_SELECTION_OWNER_REQUEST
+        | xproto::GET_SELECTION_OWNER_REQUEST
+        | xproto::CONVERT_SELECTION_REQUEST
+        | xproto::SEND_EVENT_REQUEST => true,
+        // 抓取/指针/焦点（输入状态，不碰像素）
+        xproto::GRAB_POINTER_REQUEST
+        | xproto::UNGRAB_POINTER_REQUEST
+        | xproto::GRAB_BUTTON_REQUEST
+        | xproto::UNGRAB_BUTTON_REQUEST
+        | xproto::CHANGE_ACTIVE_POINTER_GRAB_REQUEST
+        | xproto::GRAB_KEYBOARD_REQUEST
+        | xproto::UNGRAB_KEYBOARD_REQUEST
+        | xproto::GRAB_KEY_REQUEST
+        | xproto::UNGRAB_KEY_REQUEST
+        | xproto::ALLOW_EVENTS_REQUEST
+        | xproto::GRAB_SERVER_REQUEST
+        | xproto::UNGRAB_SERVER_REQUEST => true,
+        // 指针/焦点查询（GDK core 模式的轮询热路径必须零等待）
+        xproto::QUERY_POINTER_REQUEST
+        | xproto::GET_MOTION_EVENTS_REQUEST
+        | xproto::TRANSLATE_COORDINATES_REQUEST => true,
+        xproto::SET_INPUT_FOCUS_REQUEST
+        | xproto::GET_INPUT_FOCUS_REQUEST
+        | xproto::QUERY_KEYMAP_REQUEST => true,
+        // 字体查询（OpenFont=45/CloseFont=46 是绘制资源的生命周期 → 不在内）
+        xproto::QUERY_FONT_REQUEST
+        | xproto::QUERY_TEXT_EXTENTS_REQUEST
+        | xproto::LIST_FONTS_REQUEST
+        | xproto::LIST_FONTS_WITH_INFO_REQUEST
+        | xproto::SET_FONT_PATH_REQUEST
+        | xproto::GET_FONT_PATH_REQUEST => true,
+        // 颜色表查询（Alloc 族分配的是 colormap 条目，不是像素缓冲 → 安全）
+        xproto::LIST_INSTALLED_COLORMAPS_REQUEST
+        | xproto::QUERY_COLORS_REQUEST
+        | xproto::LOOKUP_COLOR_REQUEST => true,
+        // 杂项查询
+        xproto::QUERY_BEST_SIZE_REQUEST
+        | xproto::QUERY_EXTENSION_REQUEST
+        | xproto::LIST_EXTENSIONS_REQUEST
+        | xproto::GET_KEYBOARD_MAPPING_REQUEST
+        | xproto::GET_KEYBOARD_CONTROL_REQUEST
+        | xproto::GET_POINTER_CONTROL_REQUEST => true,
+        // 扩展族：非像素语义
+        // - XInput(131)：设备/事件选择/指针查询；XTEST(129)：注入输入
+        // - XC-MISC(128)：XID 区间查询；BIG-REQUESTS(135)：长度协商
+        // - XKEYBOARD(145)：键表/开关；XFIXES(138)/SHAPE(132)/DAMAGE(143)/
+        //   Composite(139)：区域、形状、脏区、重定向
+        // （XFIXES 的 SetPictureClipRegion 性质上改绘制状态，靠屏障兜底）
+        super::extensions::OPCODE_XINPUT
+        | super::extensions::OPCODE_XTEST
+        | super::extensions::OPCODE_XC_MISC
+        | super::extensions::OPCODE_BIG_REQUESTS
+        | super::extensions::OPCODE_XKEYBOARD
+        | super::extensions::OPCODE_XFIXES
+        | super::extensions::OPCODE_SHAPE
+        | super::extensions::OPCODE_DAMAGE
+        | super::extensions::OPCODE_COMPOSITE => true,
+        // RENDER(140) 全部是像素操作；其余（含 CreateWindow 之外的全部绘制、
+        // pixmap/GC/字体/颜色表/cursor 族、KillClient=112）一律入队
+        _ => false,
+    }
+}
+
+/// panic 载荷 → 可读文本（worker 的 catch_unwind 用）。
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "非字符串 panic 载荷".to_string()
+    }
 }
 
 impl ServerShared {
     pub fn new(config: ServerConfig) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(ServerState::new(config)),
+            state: RwLock::new(ServerState::new(config)),
+            draw_queue: Mutex::new(std::collections::VecDeque::new()),
+            draw_signal: std::sync::Condvar::new(),
+            raster_stop: std::sync::atomic::AtomicBool::new(false),
+            raster_started: std::sync::atomic::AtomicBool::new(false),
+            raster_executed: std::sync::atomic::AtomicU64::new(0),
+            raster_panics: std::sync::atomic::AtomicU64::new(0),
+            raster_done: Mutex::new(std::collections::HashMap::new()),
+            viewer_attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            screen_id: Mutex::new(String::new()),
+            on_map_no_viewer: Mutex::new(None),
         })
     }
 
-    pub fn state(&self) -> MutexGuard<'_, ServerState> {
-        // 某个连接 panic 不应该让整个服务端失效：恢复内部状态继续服务
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// **写锁**：会修改状态的路径（worker 执行绘制、请求循环里的就地处理、
+    /// 帧泵的 ensure_composed/基准帧更新）。拿不准读写的路径一律走这里——
+    /// 改错比慢更糟（task-18 约定）。
+    pub fn state(&self) -> std::sync::RwLockWriteGuard<'_, ServerState> {
+        self.state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// **读锁**：纯读路径（UI 帧泵的帧 diff/抠带）。读读并发，不阻塞其他读。
+    pub fn state_read(&self) -> std::sync::RwLockReadGuard<'_, ServerState> {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// UI 帧泵专用：读帧快照（task-18 的核心拆分）。
+    ///
+    /// 三段式，写窗口压到最小：
+    /// 1. 写锁：`ensure_composed`（仅在 compose 脏时真正合成，平时瞬时的
+    ///    空检查）；
+    /// 2. **读锁**：逐行 diff + 抠带像素（数据拷出来，不在锁内做重活）；
+    /// 3. 写锁：基准帧就地更新（仅当有带被取走；带像素已拷出，只按行覆写）。
+    ///
+    /// 已知取舍：第 2、3 步之间 worker 若画了新内容，本次发的是旧像素、
+    /// 基准帧被写回旧值——下一轮 diff 会把差异再发一次，自愈不丢帧。
+    pub fn take_frame_snapshot(&self) -> Option<(u64, Vec<super::state::FrameBand>)> {
+        {
+            let mut state = self.state();
+            state.ensure_composed();
+        }
+        let diff = {
+            let state = self.state_read();
+            state.diff_frame_bands()
+        };
+        let Some(diff) = diff else {
+            // 提示区域内没变：写锁里消费版本与提示（无拷贝），避免下轮重扫
+            let mut state = self.state();
+            if state.frame_version_pending() {
+                state.consume_frame_version();
+            }
+            return None;
+        };
+        {
+            let mut state = self.state();
+            state.commit_frame_bands(&diff);
+        }
+        Some((diff.seq, diff.bands))
+    }
+
+    /// 入队一个绘制命令（O(1)；worker 未启动时命令会积压到启动为止）。
+    pub fn enqueue_draw(&self, cmd: Box<dyn FnOnce(&mut ServerState) + Send>) {
+        self.enqueue_tracked(u32::MAX, 0, cmd);
+    }
+
+    /// 带归属信息的入队：worker 执行完后记录 `(client, order)`，请求循环据此
+    /// 判断"本连接是否还有在执行中的命令"（见 `inline_allowed`）。
+    pub fn enqueue_tracked(
+        &self,
+        client: u32,
+        order: u64,
+        cmd: Box<dyn FnOnce(&mut ServerState) + Send>,
+    ) {
+        let mut queue = self.draw_queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.push_back(QueuedDraw { client, order, run: cmd });
+        self.draw_signal.notify_one();
+    }
+
+    /// 本连接已被 worker 执行完的最大顺序号（没记录过就是 0）。
+    pub fn raster_done_for(&self, client: u32) -> u64 {
+        self.raster_done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&client)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// worker 执行完一条归属某连接的命令后回执。
+    fn mark_raster_done(&self, client: u32, order: u64) {
+        if client == u32::MAX {
+            return; // 测试/匿名命令不参与顺序判定
+        }
+        let mut done = self.raster_done.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = done.entry(client).or_insert(0);
+        *slot = (*slot).max(order);
+    }
+
+    /// 队列里还有多少待执行的绘制命令（测试与诊断用）。
+    pub fn pending_draws(&self) -> usize {
+        self.draw_queue.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// 启动唯一的光栅化 worker 线程（严格 FIFO 消费；置位 stop 后丢弃剩余命令退出）。
+    ///
+    /// 每次 `ServerShared` 只应启动一个；`HostServer::start`、`serve_tcp` 与
+    /// 测试 fixture 各自调用一次。
+    pub fn start_raster_worker(self: &Arc<Self>) {
+        // 唯一消费者是 FIFO 顺序的前提：重复调用直接忽略
+        if self
+            .raster_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let shared = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("xsrv-raster".into())
+            .spawn(move || {
+                // task-19 心跳：每 5s 一行，证明 worker 活着并暴露积压/panic。
+                // 旧版本 panic 后线程静默消失，日志里看不出任何异常（画布
+                // 冻结但窗口都还在），只能靠猜——现在有这一行可对账。
+                let mut last_hb = std::time::Instant::now();
+                let mut last_exec: u64 = 0;
+                let mut last_panics: u64 = 0;
+                loop {
+                    // 取一条命令：**先查停止标志**（停止后剩余队列直接丢弃），空则等待
+                    let cmd = {
+                        let mut queue = shared
+                            .draw_queue
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if shared.raster_stop.load(std::sync::atomic::Ordering::Acquire) {
+                                // 关闭语义：丢弃队列里剩余的命令
+                                crate::xsrv::log_line(format_args!(
+                                    "[xsrv] 光栅化 worker 停止：丢弃 +{} 条未执行绘制命令",
+                                    queue.len()
+                                ));
+                                // 被丢弃的命令也要**回执**：否则请求循环那边
+                                // `raster_done < last_enqueued` 永久成立，该连接
+                                // 之后每个请求都入队而无人消费（无应答、无绘制、
+                                // 无错误——客户端挂死）。
+                                for cmd in queue.drain(..) {
+                                    shared.mark_raster_done(cmd.client, cmd.order);
+                                }
+                                break None;
+                            }
+                            if let Some(cmd) = queue.pop_front() {
+                                break Some(cmd);
+                            }
+                            let (q, _timeout) = shared
+                                .draw_signal
+                                .wait_timeout(
+                                    queue,
+                                    std::time::Duration::from_millis(100),
+                                )
+                                .unwrap_or_else(|e| e.into_inner());
+                            queue = q;
+                        }
+                    };
+                    // 心跳：空闲时靠 100ms 超时唤醒，所以这里必然会被执行到
+                    if last_hb.elapsed() >= std::time::Duration::from_secs(5) {
+                        use std::sync::atomic::Ordering;
+                        let exec = shared.raster_executed.load(Ordering::Relaxed);
+                        let panics = shared.raster_panics.load(Ordering::Relaxed);
+                        // task-24 内存账目（读锁极短）：win/pix = 窗口与 pixmap 数，
+                        // px = 服务端持有的像素 MB。进程内存暴涨时看这里就能判定
+                        // 归属：px 稳定 → 涨在 UI/渲染器侧；px 持续涨 → 我们自己的
+                        // 缓冲泄漏（例如客户端只建不释放的 pixmap）。
+                        let (nwin, npix, pxb) = {
+                            let state = shared.state_read();
+                            state.pixel_bytes()
+                        };
+                        crate::xsrv::log_line(format_args!(
+                            "[raster] alive exec=+{} panics=+{} queue={} win={nwin} pix={npix} px={}MB",
+                            exec - last_exec,
+                            panics - last_panics,
+                            shared.pending_draws(),
+                            pxb / (1024 * 1024)
+                        ));
+                        last_exec = exec;
+                        last_panics = panics;
+                        last_hb = std::time::Instant::now();
+                    }
+                    let Some(cmd) = cmd else { break };
+                    let (cmd_client, cmd_order) = (cmd.client, cmd.order);
+                    // 每条命令单独拿锁执行：查询请求最多等这一条，不等整条流。
+                    //
+                    // **panic 隔离**：一条绘制命令崩了只能废掉它自己。此前
+                    // `cmd.run(...)` 裸调用——任何 panic（例如借走的 drawable
+                    // 像素没归还导致后续采样越界）都会杀死唯一的光栅化线程，
+                    // 队列从此无人消费：窗口还在，但画面永久冻结，且进程内
+                    // 无法恢复（server 被全局静态量持有，重连也拿到同一个）。
+                    // 看门狗信标：卡住时能直接看出是不是 raster 正在跑某条命令
+                    crate::xsrv::counters::RASTER_BUSY_ORDER
+                        .store(cmd_order, std::sync::atomic::Ordering::Relaxed);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cmd.run(&mut shared.state());
+                    }));
+                    crate::xsrv::counters::RASTER_BUSY_ORDER
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    shared.mark_raster_done(cmd_client, cmd_order);
+                    match outcome {
+                        Ok(()) => {
+                            shared
+                                .raster_executed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(payload) => {
+                            shared
+                                .raster_panics
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::xsrv::log_line(format_args!(
+                                "[raster] 绘制命令 panic（worker 继续服务）：{}",
+                                panic_text(&*payload)
+                            ));
+                        }
+                    }
+                }
+                crate::xsrv::log_line(format_args!("[raster] worker 退出"));
+            })
+            .expect("启动光栅化 worker 线程失败");
+    }
+
+    /// 停止 worker（丢弃剩余队列；已有连接的请求循环不再入队即可自然结束）。
+    pub fn stop_raster_worker(&self) {
+        self.raster_stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.draw_signal.notify_all();
     }
 }
 
@@ -219,6 +652,10 @@ where
     // 的请求改用随后的 32 位长度。这是**每条连接**的状态，不是全局的。
     let mut big_requests = false;
     let extensions = Extensions::default();
+    // task-19：本连接的请求顺序号（协议无关，只用于 `inline_allowed` 判定）。
+    // `last_enqueued` = 最近一次入队的顺序号；worker 执行完会回执（raster_done）。
+    let mut req_order: u64 = 0;
+    let mut last_enqueued: u64 = 0;
 
     // 最近 5 条请求名（出错时 dump，定位"错误前的请求序列"）
     let mut recent: std::collections::VecDeque<String> = std::collections::VecDeque::new();
@@ -232,12 +669,28 @@ where
     let mut draw_reqs_since: u64 = 0;
     let mut draw_ms_since: u64 = 0;
     let mut query_logs: u32 = 0;
+    // task-21 探针：pad 字节带值的"核心"请求计数（见循环体内 [junk] 日志）
+    let mut junk_probe: u32 = 0;
+    // task-21b 原始字节环：每连接保留最近 256 字节的原始流。junk 出现时整体
+    // 转储——如果是「两条连接的字节流混进了一条通道」，环里能看到 ASCII 文本
+    // 或另一条流的帧边界；如果是客户端自己发的，环里是连贯的 X11 帧。
+    let mut raw_ring: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut junk_raw_dumped: u32 = 0;
 
     loop {
         let mut header = [0u8; 4];
         match reader.read_exact(&mut header).await {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            // EOF = 客户端主动断开（firefox 崩溃/XCB abort 也走这里，客户端
+            // 侧不会留下任何解释）。带出本连接的请求统计与最后几条请求，
+            // 给"firefox 崩了"提供现场（崩溃前它在做什么）。
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                crate::xsrv::log_line(format_args!(
+                    "[x11] c{client_index} 断开（EOF）：共 {sequence} 条请求，最后请求: {:?}",
+                    recent
+                ));
+                return Ok(());
+            }
             Err(e) => return Err(e),
         }
         let major_opcode = header[0];
@@ -296,7 +749,17 @@ where
             reader.read_exact(&mut body).await?;
             body
         };
+        // task-21b 原始字节环（junk 探针的转储源）：最近 256 字节的原始流
+        if raw_ring.len() + 4 + body.len() > 256 {
+            let drop = (raw_ring.len() + 4 + body.len()) - 256;
+            for _ in 0..drop {
+                raw_ring.pop_front();
+            }
+        }
+        raw_ring.extend(header);
+        raw_ring.extend(&body);
         sequence = sequence.wrapping_add(1);
+        req_order += 1;
 
         let header = RequestHeader {
             major_opcode,
@@ -305,7 +768,7 @@ where
             remaining_length: (body_len / 4 + big_prefix.map(|_| 1).unwrap_or(0)) as u32,
         };
         let mut fds = Vec::new();
-        let request = match Request::parse(header, &body, &mut fds, &extensions) {
+        let mut request = match Request::parse(header, &body, &mut fds, &extensions) {
             Ok(request) => request,
             Err(e) => {
                 eprintln!("[xsrv] 客户端 {client_index} 发来的请求无法解析：{e:?}");
@@ -315,14 +778,140 @@ where
                     minor_opcode,
                     major_opcode,
                 );
-                let _ = sender.send(frame);
+                // **应答顺序屏障**：本连接若还有排队中/在执行中的命令，这个错误帧
+                // 必须一起入队。它的 sequence 比那条命令更大，内联直接发就会
+                // "后发的先到" → XCB 应答乱序 → 致命中止。判据只取屏障那一半
+                //（不看 opcode）：解析都失败了，谈不上"非像素语义"。
+                if shared.raster_done_for(client_index) >= last_enqueued {
+                    let _ = sender.send(frame);
+                } else {
+                    last_enqueued = req_order;
+                    let sender = sender.clone();
+                    shared.enqueue_tracked(client_index, req_order, Box::new(move |_state| {
+                        let _ = sender.send(frame);
+                    }));
+                }
                 continue;
             }
-        };
+        }
+        .into_owned();
 
         let bigreq_enable = matches!(request, Request::BigreqEnable(_));
         crate::xsrv::counters::REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::xsrv::counters::note_request(major_opcode, minor_opcode);
+
+        // ---- 诊断：每条请求都留 trace（入队请求同样要 trace）----
+        //
+        // trace 必须放在"入队判定"**之前**：入队分支会 `continue`，放在它后面
+        // 就等于"走了队列的请求没有日志"，而日志是唯一的现场证据。
+        if sequence <= TRACE_UPTO {
+            // 请求头之后的字段就是参数（小端 u32 数组）；前 4 个足够辨认
+            // window/drawable/atom 等关键 id
+            let words: Vec<u32> = body
+                .chunks_exact(4)
+                .take(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let name = core_request_name(major_opcode);
+            crate::xsrv::log_line(format_args!(
+                "[x11] c{client_index} #{sequence} {name} args={words:?}"
+            ));
+        }
+        if recent.len() == 5 {
+            recent.pop_front();
+        }
+        recent.push_back(format!("seq{sequence} major={major_opcode} minor={minor_opcode}"));
+
+        // task-21 探针：**pad 字节带值的"核心"请求**。xi2 实测（用户日志）出现
+        // 大量形如 (37,40)/(43,1)/(43,4)/(40,2)/(2,2)/(3,246) 的请求——这些请求
+        // 的 header[1] 本应是 0（pad），却夹在正常 XI2 流量里。它们究竟是
+        // 客户端真实发送（那我们要补语义）还是流错位（那有致命 bug），必须
+        // 看到 body 才能定案。已知 byte1 是数据的请求不在探针之列。
+        const DATA_BYTE1: &[u8] = &[
+            6, 13, 25, 28, 29, 33, 34, 35, 42, 61, // ChangeSaveSet/CirculateWindow/
+            // SendEvent/GrabButton/UngrabButton/GrabKey/UngrabKey/AllowEvents/
+            // SetInputFocus/ClearArea
+        ];
+        if major_opcode < 128
+            && minor_opcode != 0
+            && !DATA_BYTE1.contains(&major_opcode)
+            && junk_probe < 60
+        {
+            junk_probe += 1;
+            let words: Vec<u32> = body
+                .chunks_exact(4)
+                .take(6)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let what = core_request_name(major_opcode);
+            crate::xsrv::log_line(format_args!(
+                "[junk] c{client_index} seq{sequence} {what}(major={major_opcode}, byte1={minor_opcode}) body={words:?}"
+            ));
+            // task-21b：转储本连接最近的原始字节（一次性），定位混流来源
+            if junk_raw_dumped < 3 {
+                junk_raw_dumped += 1;
+                let hex: String = raw_ring
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                let text: String = raw_ring
+                    .iter()
+                    .map(|b| {
+                        if b.is_ascii_graphic() || *b == b' ' {
+                            *b as char
+                        } else {
+                            '·'
+                        }
+                    })
+                    .collect();
+                let n = raw_ring.len();
+                crate::xsrv::log_line(format_args!(
+                    "[junk-raw] c{client_index} 最近{n}字节 hex={hex} text={text:?}"
+                ));
+            }
+        }
+
+        // ---- task-19 顺序：非像素请求且本连接无在飞行命令时才就地直通 ----
+        //
+        // 旧实现分两类：`is_deferred_draw` 命中 ⇒ 入队，其余就地执行（外加
+        // GetImage「先排空队列」的特例）。那套分类有两个实测故障：
+        //   1. 黑名单漏项（ChangePicture / SetPictureClipRectangles / FreeGlyphs
+        //      / XID 复用……）→ 排队中的绘制看到被改过的状态，或引用已被
+        //      销毁、已被新对象顶替的资源；
+        //   2. GetImage 的应答被 worker 延后，而它之后的**内联应答**先行发出
+        //      → 应答乱序 → XCB 致命中止（firefox「Exiting due to channel
+        //      error」）。
+        // 现在判定 = `inline_safe(opcode)`（非像素白名单；未列的一律入队）
+        // && `raster_done >= last_enqueued`（本连接每连接 FIFO 屏障：只要本
+        // 连接有命令在队列里或在执行中，后续请求无论 opcode 一律入队）。白名单
+        // 里个别改窗口状态的操作（MapWindow 等）靠屏障保证不越过本连接排队中
+        // 的绘制；跨连接顺序 X11 本就不保证。中间版曾试过"队列非空才入队"，
+        // 那是不动点（last_enqueued 只在入队分支赋值 → 队列恒空 → worker 成
+        // 死代码），已被端到端测试钉死。
+        if !inline_allowed(&shared, client_index, last_enqueued, major_opcode) {
+            last_enqueued = req_order;
+            let (client, seq, order) = (client_index, sequence, req_order);
+            let (major, minor) = (major_opcode, minor_opcode);
+            let sender = sender.clone();
+            shared.enqueue_tracked(client, order, Box::new(move |state| {
+                if let Err(e) = state.handle(client, seq, &request) {
+                    // 入队命令的错误同样要留证据：错误按原序列号回，是客户端
+                    // 子进程崩溃（"Channel closing"）的直接原因，但 worker 在
+                    // 另一个线程上，不打日志就完全看不见。
+                    let what: String = format!("{request:?}").chars().take(160).collect();
+                    crate::xsrv::log_line(format_args!(
+                        "[x11] err->c{client} seq{seq} major={major} minor={minor} {e:?} <- {what}（排队执行）"
+                    ));
+                    let frame = error::encode(e, seq, minor, major);
+                    let _ = sender.send(frame);
+                }
+            }));
+            if bigreq_enable {
+                big_requests = true;
+            }
+            continue;
+        }
 
         // ---- task-14 证据：查询应答被绘制流阻塞的量化 ----
         //
@@ -338,7 +927,21 @@ where
         let is_draw_op = major_opcode == super::render::OPCODE_RENDER
             || (62..=77).contains(&major_opcode);
         let handle_started = std::time::Instant::now();
-        let result = shared.state().handle(client_index, sequence, &request);
+        // 就地直通同样做 panic 隔离：崩一条请求只该废掉它自己，不该把整条
+        // 连接（甚至整个进程）带走。错误按原序列号回给客户端。
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared.state().handle(client_index, sequence, &request)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let what: String = format!("{request:?}").chars().take(160).collect();
+                crate::xsrv::log_line(format_args!(
+                    "[x11] 请求处理 panic（连接继续）：{} <- {what}",
+                    panic_text(&*payload)
+                ));
+                Err(super::error::XError::bad_implementation())
+            }
+        };
         {
             let ms = handle_started.elapsed().as_millis() as u64;
             if is_pointer_query {
@@ -359,23 +962,6 @@ where
                     draw_ms_since += ms;
                 }
             }
-        }
-        if recent.len() == 5 {
-            recent.pop_front();
-        }
-        recent.push_back(format!("seq{sequence} major={major_opcode} minor={minor_opcode}"));
-        if sequence <= TRACE_UPTO {
-            // 请求头之后的字段就是参数（小端 u32 数组）；前 4 个足够辨认
-            // window/drawable/atom 等关键 id
-            let words: Vec<u32> = body
-                .chunks_exact(4)
-                .take(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            let name = core_request_name(major_opcode);
-            crate::xsrv::log_line(format_args!(
-                "[x11] c{client_index} #{sequence} {name} args={words:?}"
-            ));
         }
         if let Err(e) = result {
             let what: String = format!("{request:?}").chars().take(160).collect();
@@ -404,6 +990,7 @@ pub async fn serve_tcp(
     listener: tokio::net::TcpListener,
     shared: Arc<ServerShared>,
 ) -> io::Result<()> {
+    shared.start_raster_worker();
     let mut next_client: u32 = 0;
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -1577,6 +2164,129 @@ mod tests {
         let (image, _) = GetImageReply::try_parse(&reply).expect("解析 GetImage");
         assert_eq!(image.data, 0x00ff_00ffu32.to_ne_bytes(), "大请求 PutImage 画上的像素");
     }
+
+#[test]
+fn production_loop_sends_draws_through_the_raster_queue() {
+    use std::sync::atomic::Ordering;
+
+    let (addr, _runtime, shared) = spawn_server();
+    let mut socket = connect(addr, 0);
+
+    let window = 0x0020_0001u32;
+    send_request(
+        &mut socket,
+        CreateWindowRequest {
+            depth: 0,
+            wid: window,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32,
+            border_width: 0,
+            class: WindowClass::INPUT_OUTPUT,
+            visual: 0,
+            value_list: Cow::Owned(CreateWindowAux::default().background_pixel(0x0012_3456)),
+        },
+    );
+    send_request(&mut socket, MapWindowRequest { window });
+    let gc = 0x0020_0002u32;
+    send_request(
+        &mut socket,
+        CreateGCRequest {
+            cid: gc,
+            drawable: window,
+            value_list: Cow::Owned(CreateGCAux::default().foreground(0x00ff_0000)),
+        },
+    );
+    // 一条实心填充（PolyFillRectangle，纯像素请求 → 必须入队）
+    send_request(
+        &mut socket,
+        PolyFillRectangleRequest {
+            drawable: window,
+            gc,
+            rectangles: Cow::Owned(vec![Rectangle { x: 0, y: 0, width: 8, height: 8 }]),
+        },
+    );
+
+    assert!(
+        wait_for(|| shared.raster_executed.load(Ordering::Relaxed) >= 1, 3_000),
+        "绘制请求必须经 worker 执行（raster_executed 仍为 {} —— 说明绘制没走队列，\
+         异步光栅化被绕过）",
+        shared.raster_executed.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        shared.raster_panics.load(Ordering::Relaxed),
+        0,
+        "这条路径不应有 panic"
+    );
+}
+
+/// 回归：**生产路径**里的绘制不会被"队列空"骗到就地执行。
+///
+/// 直接对比两条事实：绘制前后 `pending_draws()` 曾大于 0（说明真的排过队），
+/// 且 `raster_executed` 增加。合起来 = 绘制经过队列、由 worker 执行。
+#[test]
+fn production_draw_is_not_executed_inline_in_the_request_loop() {
+    use std::sync::atomic::Ordering;
+
+    let (addr, _runtime, shared) = spawn_server();
+    let mut socket = connect(addr, 0);
+    let before = shared.raster_executed.load(Ordering::Relaxed);
+
+    let window = 0x0020_0001u32;
+    send_request(
+        &mut socket,
+        CreateWindowRequest {
+            depth: 0,
+            wid: window,
+            parent: ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            border_width: 0,
+            class: WindowClass::INPUT_OUTPUT,
+            visual: 0,
+            value_list: Cow::Owned(CreateWindowAux::default()),
+        },
+    );
+    let gc = 0x0020_0002u32;
+    send_request(
+        &mut socket,
+        CreateGCRequest {
+            cid: gc,
+            drawable: window,
+            value_list: Cow::Owned(CreateGCAux::default()),
+        },
+    );
+    for _ in 0..3 {
+        send_request(
+            &mut socket,
+            PolyLineRequest {
+                coordinate_mode: CoordMode::ORIGIN,
+                drawable: window,
+                gc,
+                points: Cow::Owned(vec![
+                    Point { x: 0, y: 0 },
+                    Point { x: 10, y: 10 },
+                ]),
+            },
+        );
+    }
+
+    assert!(
+        wait_for(
+            // CreateGC + 3 条 PolyLine（opcode 55/65 均为像素族 → 全部入队；
+            // CreateWindow 是 opcode 1，在白名单内就地执行，不计入）
+            || shared.raster_executed.load(Ordering::Relaxed) >= before + 4,
+            3_000
+        ),
+        "CreateGC + 3 条 PolyLine 必须全部由 worker 执行（实际 {}）",
+        shared.raster_executed.load(Ordering::Relaxed) - before
+    );
+}
+
 }
 
 /// X11 核心请求的操作码名（启动追踪探针用）。
@@ -1643,4 +2353,353 @@ fn core_request_name(major: u8) -> &'static str {
         114 => "GetModifierMapping",
         _ => "ext/other",
     }
+}
+
+// ---- task-17：顺序异步光栅化管线的离线测试 ----
+
+/// 等待一个条件成立（超时返回 false）；测试里避免固定 sleep 的竞态。
+fn wait_for(mut cond: impl FnMut() -> bool, timeout_ms: u128) -> bool {
+    let start = std::time::Instant::now();
+    while !cond() {
+        if start.elapsed().as_millis() > timeout_ms {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    true
+}
+
+/// 严格 FIFO：入队顺序 == 执行顺序（free 必须排在 composite 之后）。
+#[test]
+fn draw_queue_is_strict_fifo() {
+    let shared = ServerShared::new(Default::default());
+    let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    for name in ["composite", "fill-rects", "free-pixmap", "composite-2"] {
+        let order = Arc::clone(&order);
+        shared.enqueue_draw(Box::new(move |_| {
+            order.lock().unwrap().push(name);
+        }));
+    }
+    assert_eq!(shared.pending_draws(), 4, "worker 未启动时命令应当积压");
+    shared.start_raster_worker();
+    assert!(
+        wait_for(|| order.lock().unwrap().len() == 4, 2_000),
+        "全部命令应当按序执行完"
+    );
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["composite", "fill-rects", "free-pixmap", "composite-2"],
+        "执行顺序必须与入队顺序一致（free 排在 composite 之后）"
+    );
+    shared.stop_raster_worker();
+}
+
+/// **打破"队列恒空"不动点**：像素类请求即使在空闲、本连接无在执行命令时也
+/// 必须入队，否则首个绘制请求就会被就地执行 → 队列永远为空 → worker 变成
+/// 死代码、绘制退回请求循环同步执行（查询被绘制流阻塞的老问题原样回来）。
+/// 这正是上一版"队列非空才入队"写法的错误所在（`last_enqueued` 只在入队
+/// 分支赋值，判据恒真、谁也不入队）。
+#[test]
+fn pixel_requests_are_queued_even_when_idle() {
+    use crate::xsrv::extensions::OPCODE_RENDER;
+
+    let shared = ServerShared::new(Default::default());
+    // 空闲 + 本连接无在执行命令：**纯查询**才可以直通（保住零等待）
+    for opcode in [14u8 /*GetGeometry*/, 20 /*GetProperty*/, 43 /*GetInputFocus*/,
+                   98 /*QueryExtension*/, 101 /*GetKeyboardMapping*/] {
+        assert!(inline_allowed(&shared, 7, 0, opcode), "opcode {opcode} 是纯查询，可直通");
+    }
+    // 像素语义（含资源生命周期）一律入队
+    for opcode in [
+        45u8,  // OpenFont（字体被绘制引用）
+        46,    // CloseFont
+        53,    // CreatePixmap
+        54,    // FreePixmap
+        55,    // CreateGC（XID 复用）
+        60,    // FreeGC
+        61,    // ClearArea（绘制）
+        62,    // CopyArea
+        72,    // PutImage
+        73,    // GetImage（读像素，必须看到前序绘制）
+        95,    // FreeCursor
+        112,   // KillClient（销毁目标连接的像素资源）
+        crate::xsrv::extensions::OPCODE_RENDER, // RENDER 全部
+    ] {
+        assert!(
+            !inline_allowed(&shared, 7, 0, opcode),
+            "opcode {opcode} 是像素语义，必须入队（这是 worker 有活干的前提）"
+        );
+    }
+}
+
+/// 顺序判定不再依赖"请求种类枚举是否完整"：未列入非像素白名单的一律入队，
+/// 包括旧黑名单漏掉的那几类（`DestroyWindow` 以外的 XID 复用类、RENDER 的
+/// 改属性/字形增删、ClearArea 等）。
+#[test]
+fn ordering_default_is_queue_not_inline() {
+    use x11rb_protocol::protocol::xproto;
+
+    let shared = ServerShared::new(Default::default());
+    // 旧黑名单漏项：RenderChangePicture（major 140）→ 现在必然入队
+    assert!(!inline_allowed(&shared, 7, 0, crate::xsrv::extensions::OPCODE_RENDER));
+    let _missed_by_old_blacklist = [
+        x11rb_protocol::protocol::Request::DestroyWindow(xproto::DestroyWindowRequest {
+            window: 0x2100001,
+        }),
+        x11rb_protocol::protocol::Request::RenderChangePicture(
+            x11rb_protocol::protocol::render::ChangePictureRequest {
+                picture: x11rb_protocol::protocol::render::Picture::from(0x2100002u32),
+                value_list: std::borrow::Cow::Owned(
+                    x11rb_protocol::protocol::render::ChangePictureAux::new(),
+                ),
+            },
+        ),
+        x11rb_protocol::protocol::Request::ClearArea(xproto::ClearAreaRequest {
+            exposures: false,
+            window: 0x2100001,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        }),
+    ];
+}
+
+/// 请求是否可以**就地直通**：把"非像素语义"的白名单与"本连接无在执行命令"
+/// 合起来看，两种否定都要生效。
+#[test]
+fn inline_requires_non_pixel_opcode_and_no_inflight_command() {
+    let shared = ServerShared::new(Default::default());
+    // 纯查询 + 无在飞行 ⇒ 可直通
+    assert!(inline_allowed(&shared, 7, 0, 43));
+    // 本连接已入队一条命令（order=1）且尚未执行 ⇒ 后续请求即便 opcode 安全也要入队
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&started);
+    shared.enqueue_tracked(
+        7,
+        1,
+        Box::new(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }),
+    );
+    shared.start_raster_worker();
+    assert!(wait_for(|| started.load(std::sync::atomic::Ordering::Acquire), 2_000));
+    assert!(
+        !inline_allowed(&shared, 7, 1, 43),
+        "本连接的命令还在执行中 ⇒ 即便 opcode 安全也不得直通（否则应答乱序）"
+    );
+    // 白名单里的**窗口树操作**同样不得越过本连接在飞行命令（DestroyWindow 4 /
+    // ConfigureWindow 12 会释放/重建像素缓冲；MapWindow 8 是白名单内的状态操作，
+    // 靠屏障保证顺序）
+    assert!(!inline_allowed(&shared, 7, 1, 4), "DestroyWindow 是像素生命周期操作：opcode 本身就不允许直通");
+    assert!(!inline_allowed(&shared, 7, 1, 12), "ConfigureWindow 是像素生命周期操作：opcode 本身就不允许直通");
+    assert!(!inline_allowed(&shared, 7, 1, 8), "MapWindow 在白名单内，但屏障必须拦住它");
+    assert!(inline_allowed(&shared, 8, 0, 43), "别的连接不受影响");
+    assert!(wait_for(|| inline_allowed(&shared, 7, 1, 43), 2_000), "执行完恢复直通");
+    shared.stop_raster_worker();
+}
+
+/// 空闲期查询仍是零等待（就地直通）：队列空时处理查询只需微秒级。
+#[test]
+fn query_runs_inline_when_queue_is_empty() {
+    let shared = ServerShared::new(Default::default());
+    assert!(inline_allowed(&shared, 0, 0, 43), "纯查询 ⇒ 就地直通");
+    let started = std::time::Instant::now();
+    let request = x11rb_protocol::protocol::Request::QueryPointer(
+        x11rb_protocol::protocol::xproto::QueryPointerRequest { window: 0 },
+    );
+    let mut state = shared.state();
+    let _ = state.handle(0, 1, &request);
+    drop(state);
+    assert!(
+        started.elapsed().as_millis() < 20,
+        "空闲期查询不得引入额外等待（实测 {:?}）",
+        started.elapsed()
+    );
+}
+
+/// 有积压时 GetImage 也入队：它排在前序绘制之后执行，应答由 worker 按 FIFO
+/// 发出——不再需要"先排空队列"的特例，也不可能出现应答乱序。
+#[test]
+fn get_image_is_queued_behind_prior_draws() {
+    use x11rb_protocol::protocol::xproto;
+
+    let shared = ServerShared::new(Default::default());
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    shared.state().register_client(7, sender);
+
+    // 1) 一条「慢绘制」（marker 闭包模拟）
+    let draw_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&draw_flag);
+    shared.enqueue_draw(Box::new(move |_| {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }));
+    assert!(!inline_allowed(&shared, 7, 0, 73), "GetImage 读像素 ⇒ 必须入队（旧实现是内联 + 排空队列）");
+
+    // 2) GetImage 入队：执行时必须已经跑完前序绘制
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let obs = Arc::clone(&observed);
+    let marker = Arc::clone(&draw_flag);
+    shared.enqueue_draw(Box::new(move |state| {
+        obs.store(
+            marker.load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        let request = x11rb_protocol::protocol::Request::GetImage(xproto::GetImageRequest {
+            format: xproto::ImageFormat::Z_PIXMAP,
+            drawable: crate::xsrv::handshake::ROOT_WINDOW,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            plane_mask: u32::MAX,
+        });
+        if let Err(e) = state.handle(7, 42, &request) {
+            panic!("GetImage 应当成功：{e:?}");
+        }
+    }));
+
+    shared.start_raster_worker();
+    assert!(
+        wait_for(|| !receiver.is_empty(), 2_000),
+        "应当收到 GetImage 应答"
+    );
+    assert!(
+        observed.load(std::sync::atomic::Ordering::Acquire),
+        "GetImage 必须排在前序绘制之后执行（FIFO）"
+    );
+    let frame = receiver.try_recv().expect("应答帧");
+    // 序列号必须是 GetImage 自己的（应答按请求序号对齐）
+    assert_eq!(u16::from_ne_bytes([frame[2], frame[3]]), 42, "应答序列号");
+    shared.stop_raster_worker();
+}
+
+/// 关闭语义：stop 之后的剩余队列被丢弃，不再执行。
+/// **端到端证据**：真实 TCP 连接走完整请求循环时，绘制请求必须真的进光栅化
+/// 队列（worker 在干活）。
+///
+/// 关闭语义：stop 之后的剩余队列被丢弃（不执行），**且每条被丢弃的命令都要
+/// 回执** `mark_raster_done`。
+///
+/// 回执为什么必须：请求循环的直通判据是 `raster_done_for(client) >= last_enqueued`。
+/// 若丢弃不回执，该连接的 `last_enqueued` 永远追不上 `raster_done`，之后每个
+/// 请求都被判为"必须入队"，而 worker 已停止、无人消费——无应答、无绘制、无
+/// 错误，客户端挂死。
+#[test]
+fn stop_discards_pending_draws() {
+    let shared = ServerShared::new(Default::default());
+    let executed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // order=1：阻塞命令（worker 会在它上面停留，保证 2/3 排在队列里）
+    let hold1 = Arc::clone(&hold);
+    let executed1 = Arc::clone(&executed);
+    shared.enqueue_tracked(
+        7,
+        1,
+        Box::new(move |_| {
+            executed1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            hold1.store(true, std::sync::atomic::Ordering::Release);
+            while hold1.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }),
+    );
+    shared.start_raster_worker();
+    assert!(wait_for(
+        || hold.load(std::sync::atomic::Ordering::Acquire),
+        2_000
+    ), "worker 应当正在执行 order=1");
+    // order=2/3：排在队列里（worker 被命令 1 挡住）
+    for order in 2..=3u64 {
+        let executed = Arc::clone(&executed);
+        shared.enqueue_tracked(
+            7,
+            order,
+            Box::new(move |_| {
+                executed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+    }
+    // stop：worker 跑完当前这条后，丢弃 2/3 并回执
+    shared.stop_raster_worker();
+    hold.store(false, std::sync::atomic::Ordering::Release);
+
+    assert!(wait_for(
+        || shared.raster_done_for(7) >= 3,
+        2_000
+    ), "order=2/3 被丢弃也必须回执，否则连接 7 被永久判为'有在飞行命令'");
+    assert_eq!(
+        executed.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "只有正在执行的那条跑完；排队中的必须被丢弃（不执行）"
+    );
+    assert_eq!(shared.pending_draws(), 0, "队列必须被清空");
+}
+
+/// panic 隔离：一条绘制命令 panic 只废掉它自己，worker 必须继续消费队列。
+///
+/// 旧实现 `cmd.run(...)` 是裸调用——任何绘制 panic（例如借走的 drawable 像素
+/// 没归还导致后续采样越界）都会杀死唯一的光栅化线程。之后队列再也没人消费：
+/// 窗口还在（CreateWindow/MapWindow 是就地执行的），但画面永久冻结，且进程内
+/// 无法恢复（server 被全局静态量持有，重连也拿到同一个死掉的实例）。
+#[test]
+fn worker_survives_draw_panic() {
+    let shared = ServerShared::new(Default::default());
+    let later = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    shared.enqueue_draw(Box::new(|_| panic!("模拟绘制命令 panic")));
+    let flag = Arc::clone(&later);
+    shared.enqueue_draw(Box::new(move |_| {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }));
+    shared.start_raster_worker();
+    assert!(
+        wait_for(|| later.load(std::sync::atomic::Ordering::Acquire), 2_000),
+        "panic 之后 worker 必须继续执行后面的命令（否则整个界面永久停止刷新）"
+    );
+    assert_eq!(
+        shared.raster_panics.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "panic 必须计数（日志里有 [raster] 行可对账）"
+    );
+    shared.stop_raster_worker();
+}
+
+/// RwLock 快照语义（task-18）：读锁并发不互斥；读锁持有期间写锁阻塞、
+/// 释放后写锁立即拿到（写等读，而不是写插队饿死读）。
+#[test]
+fn rwlock_snapshot_allows_concurrent_reads_and_fair_writes() {
+    let shared = ServerShared::new(Default::default());
+
+    // 1) 读读并发：两个读锁必须能同时持有
+    let r1 = shared.state_read();
+    let r2 = shared.state_read();
+    let _ = (&r1, &r2);
+    drop(r1);
+    drop(r2);
+
+    // 2) 读锁持有期间写锁等待；释放后写锁立刻拿到（≤200ms）
+    let r = shared.state_read();
+    let writer = {
+        let shared = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let _w = shared.state(); // 写锁：等读锁释放
+            let waited = started.elapsed();
+            assert!(
+                waited.as_millis() <= 200,
+                "读锁释放后写锁应当立刻拿到（等了 {waited:?}）"
+            );
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(r); // 释放读锁 → 写锁放行
+    writer.join().expect("写锁线程应当成功");
+
+    // 3) 帧快照路径：无变化时 take_frame_snapshot 返回 None 且消费版本，
+    //    连续调用稳定为 None（不重扫、不重复发送）
+    assert!(shared.take_frame_snapshot().is_none());
+    assert!(shared.take_frame_snapshot().is_none());
 }

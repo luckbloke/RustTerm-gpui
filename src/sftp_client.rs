@@ -173,13 +173,19 @@ impl SftpClient {
                 .await
                 .map_err(|e| anyhow!("打开远端文件失败: {e}"))?
         };
-        let total = {
-            let sftp = self.session.lock().await;
-            sftp.metadata(remote.to_string())
-                .await
-                .ok()
-                .and_then(|m| m.size)
-                .unwrap_or(0)
+        // 用**已打开句柄的 FSTAT** 拿大小，不要用 STAT：OpenSSH 对
+        // SSH_FXP_STAT 的成功响应是 STATUS(code=0)+尾部 attrs，而 vendored
+        // russh-sftp 的 Status 结构没有 attrs 字段 → STAT 恒解析失败 →
+        // 旧代码 .ok() 吞掉 → total=0 → 进度条永远「未知大小」。
+        // FSTAT 的响应按协议就是 SSH_FXP_ATTRS，不受影响。
+        let total = match file.metadata().await {
+            Ok(m) => m.size.unwrap_or(0),
+            Err(e) => {
+                crate::xsrv::log_line(format_args!(
+                    "[sftp] FSTAT 获取大小失败（进度将显示未知大小）: {e}"
+                ));
+                0
+            }
         };
 
         let mut out = tokio::fs::File::create(local)

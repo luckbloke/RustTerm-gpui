@@ -11,10 +11,14 @@ use russh::keys::PrivateKeyWithHashAlg;
 use russh::{Channel, ChannelMsg, ChannelOpenFailure};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::TermIo;
+
+/// task-22 多显示：X 屏幕编号源（每条启用 X11 的 SSH 连接递增一个）。
+static NEXT_X11_SCREEN: AtomicUsize = AtomicUsize::new(1);
 
 /// SSH X11 转发：服务端反向打开的 X11 协议通道（`x11` 与兼容模式的
 /// `forwarded-tcpip`），交给内置 X server（`crate::remote::x11`）。
@@ -237,6 +241,9 @@ impl client::Handler for HostKeyChecker {
                 }
             }
             None => {
+                crate::xsrv::log_line(format_args!(
+                    "[x11-fwd] x11 通道被拒：本会话未启用 X11 转发（x11_sink=None）"
+                ));
                 reply
                     .reject(ChannelOpenFailure::AdministrativelyProhibited)
                     .await;
@@ -265,6 +272,9 @@ impl client::Handler for HostKeyChecker {
                 }
             }
             None => {
+                crate::xsrv::log_line(format_args!(
+                    "[x11-fwd] forwarded-tcpip 通道被拒：本会话未启用 X11 转发"
+                ));
                 reply
                     .reject(ChannelOpenFailure::AdministrativelyProhibited)
                     .await;
@@ -467,6 +477,10 @@ pub struct SshHandle {
     handle: Arc<Handle<HostKeyChecker>>,
     /// 建链信息，供 UI 显示（user@host:port）
     pub target: String,
+    /// task-22 多显示：本会话的 X 屏幕 id（启用 X11 转发时才有）。
+    ///
+    /// UI 据此把「X 屏幕」标签绑定到**本会话独享**的 server（互不重叠）。
+    pub x11_screen_id: Option<String>,
 }
 
 impl SshHandle {
@@ -585,34 +599,56 @@ where
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
     let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
+    // task-22 多显示：**每条连接**独享一个 X 屏幕（MobaXterm 式：同一主机的
+    // 两条 SSH 连接也有各自的屏幕，互不重叠）。id 同时交给 SshHandle（UI 的
+    // X 屏幕标签按它绑定）与消费循环（通道按它接入）。会话结束时消费循环会
+    // `close_screen` 回收该屏幕（display 编号一并释放）。
+    let x11_screen_id = if x11_rx.is_some() {
+        Some(format!(
+            "ssh-{}",
+            NEXT_X11_SCREEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    } else {
+        None
+    };
+
     // 保持 Handle 存活直到循环退出（跳板机 Handle 也要一并保活）
     let keep = Arc::new(handle);
     // 同一个连接上给 SFTP 面板留一个句柄（不额外建链、不重复认证）
     let ssh_handle = Arc::new(SshHandle {
         handle: keep.clone(),
         target: format!("{}@{}:{}", user, host, port),
+        x11_screen_id: x11_screen_id.clone(),
     });
     let keep_for_task = keep.clone();
 
-    // 启用 X11 转发：把服务端反向打开的 X11 通道接进内置 X server。
+    // 启用 X11 转发：把服务端反向打开的 X11 通道接进**本会话独享**的 X server。
     // 每条通道的 X11 协议字节流直接灌进 `serve_stream`，不需要 TCP 端口。
-    if let Some(mut x11_rx) = x11_rx {
+    if let (Some(mut x11_rx), Some(screen_id)) = (x11_rx, x11_screen_id.clone()) {
         tokio::spawn(async move {
-            let server = match crate::remote::x11::ensure_xserver(1280, 800).await {
+            let server = match crate::remote::x11::ensure_screen(&screen_id, 1280, 800).await {
                 Ok(server) => server,
                 Err(e) => {
                     eprintln!("[ssh] 启动内置 X server 失败，X11 转发不可用：{e}");
+                    crate::xsrv::log_line(format_args!(
+                        "[x11-fwd] 启动内置 X server 失败（端口被旧实例占用？）：{e}"
+                    ));
                     return;
                 }
             };
             eprintln!(
-                "[ssh] X11 转发就绪：远端 X 程序将显示在内置 X server（display :{}）",
+                "[ssh] X11 转发就绪（屏幕 {screen_id}，display :{}）：远端 X 程序将显示在内置 X server",
                 server.display
             );
             while let Some(channel) = x11_rx.recv().await {
+                crate::xsrv::log_line(format_args!(
+                    "[x11-fwd] 收到 sshd 反向 X11 通道，接入屏幕 {screen_id}"
+                ));
                 let index = server.next_client_index();
                 server.serve_channel(channel.into_stream(), index);
             }
+            // 会话结束（x11_rx 关闭）：回收本会话的屏幕（display 编号一并释放）
+            crate::remote::x11::close_screen(&screen_id);
         });
     }
 

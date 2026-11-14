@@ -1,4 +1,4 @@
-﻿//! 远程桌面标签页：VNC / RDP / SPICE 的真实连接与渲染（GPUI 版）。
+//! 远程桌面标签页：VNC / RDP / SPICE 的真实连接与渲染（GPUI 版）。
 //!
 //! - 后端：`crate::remote`（每会话一个线程 + 事件通道）
 //! - 渲染：整帧 BGRA 缓冲 + `RenderImage` 贴图（canvas 元素）
@@ -111,6 +111,11 @@ pub struct RdpConnectionProfile {
     /// 用来把标签页里改的共享目录写回 `sessions.json`：
     /// 表单是本次运行的临时状态，会话才是跨重启的真相。
     pub session_id: Option<String>,
+    /// task-22 多显示：X 屏幕标签要绑定的屏幕 id（仅 X11 协议使用）。
+    ///
+    /// SSH 会话启用 X11 转发时生成（`SshHandle.x11_screen_id`）；
+    /// `None` = 独立屏幕（"default"）。随 LastTab 快照持久化，重启后恢复。
+    pub x11_screen_id: Option<String>,
 }
 
 impl Default for RdpConnectionProfile {
@@ -127,6 +132,7 @@ impl Default for RdpConnectionProfile {
             share_dir: String::new(),
             legacy_compat: false,
             session_id: None,
+            x11_screen_id: None,
         }
     }
 }
@@ -255,6 +261,12 @@ pub struct RemoteDesktopTab {
     /// 非自适应时的缩放
     pub zoom: f32,
     pub fps: f32,
+    /// task-24 CPU 节流：上一次纹理重建时刻（见上传节流处）。
+    last_texture_at: Option<std::time::Instant>,
+    /// task-24 图集回收：被替换的旧纹理等 paint 阶段 drop_image 归还 gpui 的
+    /// sprite atlas。不调它图集无限增长（RenderImage::new 每次新 ImageId，
+    /// paint_image 按 id 插 3.7MB GPU tile，旧的从不移除——实测数分钟数 GB）。
+    images_to_drop: Vec<Arc<RenderImage>>,
     pub clipboard_sync: bool,
     /// 捕获键盘（关闭后键盘事件不再发往远端）
     pub capture_keys: bool,
@@ -358,6 +370,8 @@ impl RemoteDesktopTab {
             fit: true,
             zoom: 1.0,
             fps: 0.0,
+            last_texture_at: None,
+            images_to_drop: Vec::new(),
             clipboard_sync: true,
             capture_keys: true,
             session: None,
@@ -454,6 +468,12 @@ impl RemoteDesktopTab {
                 None
             },
             legacy_compat: self.profile.legacy_compat,
+            // task-22 多显示：X 屏幕标签按它绑定到会话独享的 server
+            x11_screen_id: if self.profile.protocol == RdTabProtocol::X11 {
+                self.profile.x11_screen_id.clone()
+            } else {
+                None
+            },
         };
         self.state = RdState::Connecting;
         self.notice = None;
@@ -501,8 +521,16 @@ impl RemoteDesktopTab {
 
         let mut events: Vec<RdEvent> = Vec::new();
         if let Some(s) = &self.session {
-            while let Ok(ev) = s.events.try_recv() {
-                events.push(ev);
+            // task-24 背压上限：**一次 poll 最多收 128 条**。曾经无上限排空——
+            // UI 慢半拍时积压几千条帧事件（3.7MB/帧）被一次性收进 Vec（实测
+            // 内存涨到 7.8GB），随后逐条 fb.put（4MB 拷贝/条）把 CPU 吃满，
+            // 输入事件排在同一条线程后面 → "卡很久才有反应"。剩余的留在通道
+            // 里由下一次 poll（8ms 后）继续处理；源端另有丢弃保护（x11.rs）。
+            for _ in 0..128 {
+                match s.events.try_recv() {
+                    Ok(ev) => events.push(ev),
+                    Err(_) => break,
+                }
             }
         }
 
@@ -546,12 +574,53 @@ impl RemoteDesktopTab {
 
         // ---- 上传纹理：RGBA 主缓冲 → BGRA 副本 ----
         // 主缓冲始终保留（还要接后续脏区），只有纹理副本被取走。
-        if let Some(bgra) = self.fb.take_texture() {
-            let (w, h) = (self.fb.width, self.fb.height);
-            if let Some(img) = image::RgbaImage::from_raw(w, h, bgra) {
-                self.image = Some(Arc::new(RenderImage::new(smallvec::smallvec![
-                    image::Frame::new(img),
-                ])));
+        //
+        // task-24 CPU 节流：这一步 = 「全帧 RGBA→BGRA 逐像素转换 + 3.7MB 重新
+        // 分配 + RenderImage 重建 + 纹理上传」，且全部发生在 **UI 主线程**上。
+        // 远端持续重绘时（实测 26 帧/s）主线程被它占满，而输入事件排在同一条
+        // 线程后面 → 现象是"点了没反应、过一会才补上"、"像 CPU 100%"，且远端
+        // 一静止就立刻恢复。压到最多 20 次/s：`take_texture` 的 dirty 标志在
+        // 跳过时保持置位，下一次调用会把累积的变化一次性带走（画面不丢，合帧）。
+        const MIN_TEXTURE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        let texture_due = self
+            .last_texture_at
+            .map(|t| t.elapsed() >= MIN_TEXTURE_INTERVAL)
+            .unwrap_or(true);
+        if texture_due {
+            if let Some(bgra) = self.fb.take_texture() {
+                let (w, h) = (self.fb.width, self.fb.height);
+                if let Some(img) = image::RgbaImage::from_raw(w, h, bgra) {
+                    // task-24 纹理泄漏取证：替换前看旧纹理的引用计数。==1 说明
+                    // 只有我们自己持有（会被正常释放）；>1 说明 **GPUI 渲染器
+                    // 还攥着旧帧**——每帧 3.7MB 永不释放，正是内存暴涨的形态。
+                    // task-24 图集回收：旧纹理交给 paint 阶段 drop_image
+                    if let Some(old) = self.image.take() {
+                        let count = Arc::strong_count(&old);
+                        if count > 1 {
+                            use std::sync::atomic::{AtomicU64, Ordering};
+                            static LAST: AtomicU64 = AtomicU64::new(0);
+                            let now = crate::xsrv::counters::now_ms();
+                            if now.saturating_sub(LAST.load(Ordering::Relaxed)) >= 3000
+                                && LAST.compare_exchange(
+                                    LAST.load(Ordering::Relaxed),
+                                    now,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                crate::xsrv::log_line(format_args!(
+                                    "[tex] 旧 RenderImage 仍被持有 {count} 份（>1 = 渲染器缓存未释放）"
+                                ));
+                            }
+                        }
+                        self.images_to_drop.push(old);
+                    }
+                    self.image = Some(Arc::new(RenderImage::new(smallvec::smallvec![
+                        image::Frame::new(img),
+                    ])));
+                }
+                self.last_texture_at = Some(std::time::Instant::now());
             }
         }
 
@@ -1352,6 +1421,10 @@ impl RemoteDesktopTab {
         // 每帧把**自己**的绘制矩形写进全局映射（按实体 id 分键）。
         // 绘制阶段只能动全局——`Entity::update` 在这里会 double-lease panic。
         let me_id = cx.entity_id();
+        // task-24 图集回收：把替换下来的旧纹理带进 paint 闭包（只有那里有
+        // Window），逐个从 sprite atlas 删除——不删的话每帧 3.7MB 的 GPU tile
+        // 永久驻留（RenderImage::new 每次新 ImageId），实测数分钟数 GB。
+        let images_to_drop = std::mem::take(&mut self.images_to_drop);
         area = area.child(canvas(
             move |bounds, _window, cx| {
                 let mut map = cx
@@ -1362,6 +1435,10 @@ impl RemoteDesktopTab {
                 cx.set_global(RdAreas(map));
             },
             move |bounds, (), window, _cx| {
+                // task-24 图集回收：从 atlas 删除被替换的旧纹理
+                for img in &images_to_drop {
+                    let _ = window.drop_image(std::sync::Arc::clone(img));
+                }
                 // 白屏排查：限频（≥1s）记录画布尺寸与图像状态。
                 // 「w/h 为 0」= 布局塌缩；「image=None」= 帧没到；都正常还白
                 // = 帧缓冲内容本身是白的（远端/会话问题，不是绘制问题）。

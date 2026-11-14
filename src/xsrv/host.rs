@@ -64,11 +64,30 @@ pub struct HostServer {
     /// 后台任务句柄（accept 循环、帧泵）。用 Mutex 包起来是为了让 `shutdown`
     /// 能拿到 `&self` 就停——服务端实例会被 `Arc` 共享给多个命令。
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// task-20：X server 的**专用后台 runtime**。
+    ///
+    /// 每个远程会话是独立的 `current_thread` runtime（remote/mod.rs 的会话
+    /// 线程）。此前 accept 循环与帧泵被 spawn 在**第一个**会话的 runtime 上：
+    /// 那个标签关闭 → 会话线程退出 → runtime 连同它的全部任务被销毁，而
+    /// `XSERVER` 静态量仍持有这个实例——之后重开 X 屏幕拿到的是"对象活着、
+    /// 任务全死"的服务：永远无帧、新 X 连接也无人 accept，必须重启程序
+    /// （用户实测：切换 x11 后 X 服务关了再开就什么都不显示）。
+    /// 现在任务跑在这个专用 runtime 上，寿命与 HostServer 一致。
+    _rt: tokio::runtime::Runtime,
 }
 
 impl HostServer {
     /// 分配一个空闲 display 并启动服务端。
     pub async fn start(width: u16, height: u16) -> Result<Self, String> {
+        Self::start_screened("default", width, height).await
+    }
+
+    /// task-22 多显示：带屏幕 id 启动（每个 SSH 会话一个独立屏幕）。
+    pub async fn start_screened(
+        screen_id: &str,
+        width: u16,
+        height: u16,
+    ) -> Result<Self, String> {
         let (display, listener) = bind_display().await?;
         let port = listener
             .local_addr()
@@ -79,18 +98,64 @@ impl HostServer {
             screen_width: width.max(320),
             screen_height: height.max(240),
         });
+        // task-22 按需显示：有窗口映射而 UI 未挂观众时 → 通知请求进队列。
+        // 回调去重（同一屏幕只排一次）；弹出/提示由 UI 的周期 tick 消费。
+        //
+        // 注意：回调要装到 **两处**——`ServerShared`（供查询）与
+        // `ServerState.on_map_no_viewer`（map_window 真正读取的地方；
+        // 漏装 state 侧会让钩子静默空转，实测自动弹窗因此从未触发）。
+        let notify_id = screen_id.to_string();
+        let cb: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+            let mut queue = crate::remote::x11::POPUP_REQUESTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let already = queue.iter().any(|req| req == &notify_id);
+            if !already {
+                queue.push(notify_id.clone());
+            }
+            drop(queue);
+            crate::xsrv::log_line(format_args!(
+                "[popup] MapWindow 且无观众：screen={notify_id} 队列已有={already}"
+            ));
+            crate::xsrv::counters::mark_ui_dirty();
+        });
+        shared.set_map_notify(screen_id, std::sync::Arc::clone(&cb));
+        {
+            let flag = Arc::clone(&shared.viewer_attached);
+            let mut state = shared.state();
+            state.viewer_attached = flag;
+            state.on_map_no_viewer = Some(std::sync::Arc::clone(&cb));
+        }
+        // 与 ServerState 共享观众标志（map_window 触发判断用）
+        {
+            let flag = Arc::clone(&shared.viewer_attached);
+            shared.state().viewer_attached = flag;
+        }
         let frame = FramePump::new(Arc::clone(&shared));
+        // task-17：顺序异步光栅化 worker——绘制类命令按序消费，查询就地应答
+        shared.start_raster_worker();
         let (stop_tx, stop_rx) = watch::channel(false);
         let next_client = Arc::new(AtomicU32::new(0));
 
+        // task-20：专用后台 runtime（见 HostServer::_rt 的注释）。
+        //
+        // 注意不能用 `rt.block_on(...)`——本函数跑在会话的 runtime 上，
+        // runtime 内嵌 block_on 会直接 panic（实测：X 屏幕标签秒失败）。
+        // 正确姿势是 `rt.enter()` 守卫：持有期间，spawn_accept_loop /
+        // spawn_loop 内部的 tokio::spawn 落到这个专用 runtime 上。
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| format!("创建 X server 后台运行时失败：{e}"))?;
         let mut tasks = Vec::new();
-        tasks.push(spawn_accept_loop(
-            listener,
-            Arc::clone(&shared),
-            Arc::clone(&next_client),
-            stop_rx.clone(),
-        ));
-        tasks.push(frame.spawn_loop());
+        {
+            let _enter = rt.enter();
+            tasks.push(spawn_accept_loop(
+                listener,
+                Arc::clone(&shared),
+                Arc::clone(&next_client),
+                stop_rx.clone(),
+            ));
+            tasks.push(Arc::clone(&frame).spawn_loop());
+        }
 
         eprintln!("[xsrv] 进程内 X server 已启动：127.0.0.1:{port}（display :{display}）");
         Ok(Self {
@@ -101,6 +166,7 @@ impl HostServer {
             next_client,
             stop_tx,
             tasks: std::sync::Mutex::new(tasks),
+            _rt: rt,
         })
     }
 
@@ -120,6 +186,12 @@ impl HostServer {
     /// UI 侧帧接收端挂上来（或切标签回来）时调用。帧泵会立刻推一张整屏。
     pub fn attach_viewer(&self, sink: FrameSink) {
         self.frame.attach(sink);
+    }
+
+    /// task-24 背压：作废已发基准帧——下一拍帧泵会重发**全屏**。
+    /// 供帧转发的积压丢弃路径使用（丢带后自愈）。
+    pub fn invalidate_sent_frame(&self) {
+        self.frame.invalidate();
     }
 
     pub fn detach_viewer(&self) {
@@ -219,6 +291,8 @@ impl HostServer {
     pub fn shutdown(&self) {
         let _ = self.stop_tx.send(true);
         self.frame.stop();
+        // 先停光栅化 worker（丢弃剩余队列）再断连接循环，避免执行已无主的状态
+        self.shared.stop_raster_worker();
         let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         for task in tasks.drain(..) {
             task.abort();

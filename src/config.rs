@@ -198,10 +198,14 @@ pub struct AppConfig {
     /// ZMODEM 接收文件的落盘目录；None / 空串表示按系统下载目录回退。
     #[serde(default)]
     pub zmodem_download_dir: Option<String>,
-    /// 内置 X server 的输入协议：Xi2（默认）/ Core（核心事件，兼容排障）。
-    /// 老配置无此字段时必须反序列化为 Xi2（`#[serde(default)]`）。
+    /// 内置 X server 的输入协议：Core（默认）/ Xi2（事件推送，兼容）。
+    /// 老配置无此字段时必须反序列化为 Core（`#[serde(default)]`）。
     #[serde(default)]
     pub xinput_mode: XInputMode,
+    /// task-22 按需显示：远端 X 程序启动时自动弹出对应 X 屏幕标签。
+    /// 关掉则只在状态栏提示。老配置默认开（MobaXterm 行为）。
+    #[serde(default = "default_true")]
+    pub x11_auto_popup: bool,
 }
 
 fn default_true() -> bool {
@@ -221,7 +225,8 @@ impl Default for AppConfig {
             ai: AiSettings::default(),
             zmodem_enabled: true,
             zmodem_download_dir: None,
-            xinput_mode: XInputMode::Xi2,
+            xinput_mode: XInputMode::Core,
+            x11_auto_popup: true,
         }
     }
 }
@@ -257,6 +262,7 @@ impl AppConfig {
         let cfg = Self::load_inner();
         // 心跳间隔做成进程级全局量，见 `keep_alive_interval` 的说明
         set_keep_alive_interval(cfg.keep_alive_interval);
+    X11_AUTO_POPUP.store(cfg.x11_auto_popup, Ordering::Relaxed);
         // ZMODEM 同理：窗格的创建入口很多（本地 / SSH / Telnet / 命令 / 分屏
         // 复制），逐个把配置传进 TermPane 太容易漏；而且改完配置要求已经
         // 在跑的窗格立即生效，所以也落成进程级全局量。
@@ -386,6 +392,18 @@ pub fn set_keep_alive_interval(secs: u64) {
     KEEP_ALIVE_SECS.store(secs, Ordering::Relaxed);
 }
 
+/// task-22 按需显示：远端 X 程序启动时是否自动弹出对应 X 屏幕标签。
+pub fn x11_auto_popup() -> bool {
+    X11_AUTO_POPUP.load(Ordering::Relaxed)
+}
+
+/// 设置自动弹出（配置加载 / 配置面板保存时调用）。
+pub fn set_x11_auto_popup(v: bool) {
+    X11_AUTO_POPUP.store(v, Ordering::Relaxed);
+}
+
+pub static X11_AUTO_POPUP: AtomicBool = AtomicBool::new(true);
+
 // ---------------------------------------------------------------------------
 // ZMODEM（rz/sz）开关与接收目录（同样是进程级全局量）
 // ---------------------------------------------------------------------------
@@ -425,17 +443,17 @@ pub fn set_zmodem(enabled: bool, dir: Option<String>) {
 mod tests {
     use super::*;
 
-    /// 老配置（无 xinput_mode 字段）必须反序列化为默认 Xi2——不能因缺字段丢配置。
+    /// 老配置（无 xinput_mode 字段）必须反序列化为默认 Core——不能因缺字段丢配置。
     #[test]
-    fn missing_xinput_mode_field_defaults_to_xi2() {
+    fn missing_xinput_mode_field_defaults_to_core() {
         let cfg: AppConfig =
             serde_json::from_str(r#"{"font_size":14,"font_family":"m","theme":"dark","language":"zh-CN","show_status_bar":true,"keep_alive_interval":30,"enable_key_macros":true}"#)
                 .expect("无新字段的老配置必须能解析");
-        assert_eq!(cfg.xinput_mode, XInputMode::Xi2);
-        assert!(xinput_enabled());
+        assert_eq!(cfg.xinput_mode, XInputMode::Core);
+        assert!(!xinput_enabled());
     }
 
-    /// 字段名小写（lowercase）；Core 值往返保真，且缺省构造也是 Xi2。
+    /// 字段名小写（lowercase）；Core 值往返保真，且缺省构造也是 Core。
     #[test]
     fn xinput_mode_round_trips() {
         assert_eq!(
@@ -451,17 +469,18 @@ mod tests {
         )
         .expect("Core 模式配置必须能解析");
         assert_eq!(cfg.xinput_mode, XInputMode::Core);
-        assert_eq!(AppConfig::default().xinput_mode, XInputMode::Xi2);
+        assert_eq!(AppConfig::default().xinput_mode, XInputMode::Core);
     }
 
     /// 进程级开关：set_xinput_mode(Core) 后 xinput_enabled()=false，恢复 Xi2 后为 true。
     /// （顺序敏感——同一进程内的其他测试可能与它并发，断言后恢复默认。）
     #[test]
     fn xinput_mode_global_gate_flips() {
-        set_xinput_mode(XInputMode::Core);
-        assert!(!xinput_enabled());
         set_xinput_mode(XInputMode::Xi2);
         assert!(xinput_enabled());
+        // 恢复默认（Core）——同进程并发测试依赖默认态
+        set_xinput_mode(XInputMode::Core);
+        assert!(!xinput_enabled());
     }
 }
 
@@ -471,21 +490,21 @@ mod tests {
 
 /// 内置 X server 的输入协议。
 ///
-/// - `Xi2`（默认）：宣告 XInputExtension，GDK3 走 XI2 设备管理器 + 事件推送。
-/// - `Core`：**不宣告** XInputExtension，客户端（GDK/firefox）自动退回核心
-///   Motion/Button/Key 路径——XI2 万一再出问题时的一键排障开关。
+/// - `Core`（默认）：**不宣告** XInputExtension，客户端（GDK/firefox）走核心
+///   Motion/Button/Key 路径——XI2 查询风暴导致输入延迟时的稳定默认。
+/// - `Xi2`：宣告 XInputExtension，GDK3 走 XI2 设备管理器 + 事件推送。
 ///
 /// 只影响**新连接**：扩展列表在连接握手时确定，已连接客户端不受影响。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum XInputMode {
-    #[default]
     Xi2,
+    #[default]
     Core,
 }
 
-/// XInputExtension 是否宣告（Xi2=true / Core=false）。默认 true。
-static XINPUT_XI2_ENABLED: AtomicBool = AtomicBool::new(true);
+/// XInputExtension 是否宣告（Xi2=true / Core=false）。默认 false（Core 为默认模式）。
+static XINPUT_XI2_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 当前配置的输入协议。
 pub fn xinput_mode() -> XInputMode {

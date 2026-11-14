@@ -556,7 +556,14 @@ fn sample_picture(
             if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
                 return (0, 0, 0, 0);
             }
-            let pixel = pixels[sy as usize * width + sx as usize];
+            // 缓冲长度必须覆盖 width*height：借还漏配（历史 bug，见
+            // `BorrowedPixels` 的注释）会留下空/短缓冲。直接索引会 panic，而
+            // 绘制跑在**唯一的光栅化 worker** 上——一次 panic 就让整个界面
+            // 永久停更（旧实现连日志都没有）。这里按"透明"处理，把致命故障
+            // 降级为"那一块内容不显示"。
+            let Some(pixel) = pixels.get(sy as usize * width + sx as usize).copied() else {
+                return (0, 0, 0, 0);
+            };
             // depth 32 (ARGB32) 的像素带 alpha 字节（0xAARRGGBB，firefox 的
             // UI 基底大量是 alpha=0 的透明层——强制不透明会渲染成全黑）；
             // 其余深度按服务端 0x00RRGGBB 不透明约定。
@@ -652,7 +659,7 @@ fn composite_setup(
         | PictureSource::RadialGradient { .. }
         | PictureSource::ConicalGradient { .. } => return Err(XError::bad_match()),
     };
-    let (width, height, _) = state.drawable_geometry(drawable)?;
+    let (width, height, _) = state.drawable_geometry_checked(drawable)?;
     let src = state.picture(src_id)?.clone();
     let src_pixels = match &src.source {
         PictureSource::Drawable(d) => BorrowedPixels::take(state, *d, drawable),
@@ -787,12 +794,19 @@ fn composite_pixels_inner(
         }
 
         // ---- 快路径 2：Drawable 源 + 无 mask + 非 32 位 + 不 repeat ----
+        // 额外要求 `spixels.len() >= sw * sh`：界判定用的是**声明**尺寸，而快
+        // 路径的行拷贝是裸切片——源缓冲短于声明尺寸时（借还漏配留下的空/短
+        // 缓冲）会越界 panic，绕过了慢路径里 `sample_picture` 的 `.get()` 加固。
+        // 条件不满足就退回逐像素路径（安全）。
         if let PictureSource::Drawable(_) = &setup.src.source {
             if !setup.src.repeat && setup.src_pixels.depth != 32 && clip.is_none() {
                 if let (true, Some((spixels, sw, sh))) = (
                     op_replaces_dst_with_opaque_src(setup.op),
                     setup.src_pixels.view(),
                 ) {
+                    if spixels.len() < sw * sh {
+                        // 源缓冲不完整：交给下面的通用逐像素路径（sample_picture 已加固）
+                    } else {
                     for dy in row0..row1 {
                         let sy = i32::from(src_y) + (dy - i32::from(dst_y));
                         let sx0 = i32::from(src_x) + (col0 - i32::from(dst_x));
@@ -817,6 +831,7 @@ fn composite_pixels_inner(
                         }
                     }
                     return Ok(());
+                    }
                 }
             }
         }
@@ -1256,7 +1271,7 @@ impl ServerState {
             PictureSource::Drawable(d) => d,
             PictureSource::Solid { .. } => return Err(XError::bad_match()),
         };
-        let (width, height, _) = self.drawable_geometry(drawable)?;
+        let (width, height, _) = self.drawable_geometry_checked(drawable)?;
         let src = premultiply(request.color);
 
         // NyaTerm 探针：FillRectangles 的落点（插入符/下划线常走这条）。
@@ -1376,28 +1391,31 @@ impl ServerState {
 
     pub fn render_composite(&mut self, request: &render::CompositeRequest) -> Result<(), XError> {
         let dst_id = u32::from(request.dst);
+        // 掩码 picture **必须在借走源像素之前**解析：`self.picture(id)?` 的
+        // 早退如果发生在 `composite_setup` 之后，借走的源像素就再也回不去了
+        // （该 drawable 永久为空缓冲 → 后续采样越界 panic → worker 死亡）。
+        let mask_picture = match u32::from(request.mask) {
+            0 => None,
+            id => Some(self.picture(id)?.clone()),
+        };
         let setup = composite_setup(self, u8::from(request.op), u32::from(request.src), dst_id)?;
         // mask：None（x11rb 的 Picture::NONE = 0）或一个 picture（只取 alpha 通道）
-        let (mask_picture, mut mask_pixels) = match u32::from(request.mask) {
-            0 => (None, None),
-            id => {
-                let picture = self.picture(id)?.clone();
-                let pixels = match &picture.source {
-                    // 渐变源的像素在采样时现算，不会走到像素缓冲分支
-                    PictureSource::Drawable(d) => BorrowedPixels::take(self, *d, setup.drawable),
-                    PictureSource::Solid { .. }
-                    | PictureSource::LinearGradient { .. }
-                    | PictureSource::RadialGradient { .. }
-                    | PictureSource::ConicalGradient { .. } => BorrowedPixels::empty(),
-                };
-                (Some(picture), Some(pixels))
-            }
+        let mut mask_pixels = match &mask_picture {
+            None => None,
+            Some(picture) => Some(match &picture.source {
+                // 渐变源的像素在采样时现算，不会走到像素缓冲分支
+                PictureSource::Drawable(d) => BorrowedPixels::take(self, *d, setup.drawable),
+                PictureSource::Solid { .. }
+                | PictureSource::LinearGradient { .. }
+                | PictureSource::RadialGradient { .. }
+                | PictureSource::ConicalGradient { .. } => BorrowedPixels::empty(),
+            }),
         };
         let mask = match (&mask_picture, &mask_pixels) {
             (Some(p), Some(b)) => Some((p, b)),
             _ => None,
         };
-        composite_pixels(
+        let drawn = composite_pixels(
             self,
             &setup,
             mask,
@@ -1409,11 +1427,22 @@ impl ServerState {
             request.mask_y,
             request.width,
             request.height,
-        )?;
-        setup.src_pixels.restore(self);
+        );
+        // NyaTerm: **无论成败都必须归还**借走的像素，而且必须**按借用的逆序**
+        // 归还。`BorrowedPixels` 是显式归还（没有 Drop），此前的实现用 `?`
+        // 早退：不支持的 op / 掩码缺失都会把源 drawable 的缓冲用 `mem::take`
+        // 抽空且不还——那块 drawable 之后永久为空，`sample_picture` 的边界检查
+        // 只看 id（仍是 Some）不看实际长度，于是越界 panic 杀死唯一的光栅化
+        // worker，表现为「窗口还在、但整个界面再也不刷新」。
+        //
+        // 逆序的原因：mask 与 src 可能是**同一个 drawable**。同一 drawable 被
+        // 借两次时，第二次借到的是空 Vec（首次已 `mem::take` 走），若先还 src
+        // 再还 mask，最后写回的正是那个空 Vec——等于又把它抽空了。
         if let Some(pixels) = mask_pixels.take() {
             pixels.restore(self);
         }
+        setup.src_pixels.restore(self);
+        drawn?;
         finish_draw(self, setup.drawable);
         Ok(())
     }
@@ -1658,12 +1687,19 @@ impl ServerState {
 
         // 3. 逐字形逐像素混合。A8 字形只提供 alpha（颜色取源 picture）；
         //    ARGB32 字形自带预乘色（与源无关，独立字形的语义）。
-        {
+        //
+        //    绘制体放进块里、错误用标志位带出（不用 `return`）：**无论成败都
+        //    必须走到下面的 restore**。`BorrowedPixels` 是显式归还，此前这里
+        //    完全没有 restore——只要源是 Drawable（例如 cairo 把中间 surface
+        //    当文字颜色源），那块 drawable 就被永久抽空，后续采样越界 panic
+        //    杀死光栅化 worker，症状是「界面再也不刷新」。
+        let drawn: Result<(), XError> = {
             let pixels = match self.windows.get_mut(&setup.drawable) {
                 Some(window) => &mut window.pixels,
                 None => &mut self.pixmaps.get_mut(&setup.drawable).expect("composite_setup 已确认存在").pixels,
             };
-            for (glyph, base_x, base_y) in &items {
+            let mut bad_op: Option<u8> = None;
+            'glyphs: for (glyph, base_x, base_y) in &items {
                 let stride = (glyph.width as usize * glyph.bytes_per_pixel as usize).div_ceil(4) * 4;
                 for row in 0..glyph.height as usize {
                     let dy = base_y + row as i32;
@@ -1703,14 +1739,21 @@ impl ServerState {
                         };
                         let index = dy as usize * setup.width + dx as usize;
                         let Some(value) = blend_pixel(setup.op, pixels[index], source) else {
-                            return Err(XError::new(BAD_PICT_OP, setup.op as u32));
+                            bad_op = Some(setup.op);
+                            break 'glyphs;
                         };
                         pixels[index] = value;
                     }
                 }
             }
-        }
+            match bad_op {
+                Some(op) => Err(XError::new(BAD_PICT_OP, u32::from(op))),
+                None => Ok(()),
+            }
+        };
 
+        setup.src_pixels.restore(self);
+        drawn?;
         finish_draw(self, setup.drawable);
         Ok(())
     }
@@ -2427,6 +2470,229 @@ mod tests {
             }),
         );
         assert_eq!(err.unwrap_err().code, BAD_GLYPH);
+    }
+
+    /// 回归：以 **Drawable** 作为源的 CompositeGlyphs 必须归还借走的源像素。
+    ///
+    /// `composite_glyphs_impl` 经 `composite_setup` 把源 drawable 的像素
+    /// `mem::take` 走，但函数内**没有任何 restore**——那块 drawable 从此永久
+    /// 是空缓冲。后果不是"画错"而是**致命**：`BorrowedPixels::view()` 只看
+    /// `id`（仍是 Some），所以后续 `sample_picture` 的边界检查会通过，然后
+    /// `pixels[...]` 在空 Vec 上越界 panic；绘制命令跑在唯一的光栅化 worker
+    /// 线程上，panic 直接杀死该线程且不留任何日志——表现就是"窗口还在，但
+    /// 整个界面再也不刷新"。
+    ///
+    /// 现有测试都用 Solid 源（`BorrowedPixels::empty()`，id=None，restore 是
+    /// 空操作），所以这条泄漏一直没被测到。
+    #[test]
+    fn composite_glyphs_restores_drawable_source_pixels() {
+        let (mut state, client, _rx) = fixture();
+        let window = super::super::handshake::resource_id_base(0);
+        make_window(&mut state, client, 1, window);
+
+        // 源 pixmap（2x1，非空像素缓冲）
+        let pixmap = window + 1;
+        ok(&mut state, client, 3, Request::CreatePixmap(xproto::CreatePixmapRequest {
+            depth: 24,
+            pid: pixmap,
+            drawable: window,
+            width: 2,
+            height: 1,
+        }));
+        // 目标 picture（窗口）
+        let dst_picture = window + 2;
+        ok(&mut state, client, 4, Request::RenderCreatePicture(render::CreatePictureRequest {
+            pid: render::Picture::from(dst_picture),
+            drawable: window,
+            format: render::Pictformat::from(FORMAT_RGB24),
+            value_list: Cow::default(),
+        }));
+        // 源 picture（pixmap）——这就是触发路径：source 是 Drawable
+        let src_picture = window + 3;
+        ok(&mut state, client, 5, Request::RenderCreatePicture(render::CreatePictureRequest {
+            pid: render::Picture::from(src_picture),
+            drawable: pixmap,
+            format: render::Pictformat::from(FORMAT_RGB24),
+            value_list: Cow::default(),
+        }));
+        // A8 glyph set + 一个 1x1 字形
+        let glyphset = window + 4;
+        ok(&mut state, client, 6, Request::RenderCreateGlyphSet(render::CreateGlyphSetRequest {
+            gsid: render::Glyphset::from(glyphset),
+            format: render::Pictformat::from(FORMAT_A8),
+        }));
+        let info = render::Glyphinfo { width: 1, height: 1, x: 0, y: 0, x_off: 1, y_off: 0 };
+        ok(&mut state, client, 7, Request::RenderAddGlyphs(render::AddGlyphsRequest {
+            glyphset: render::Glyphset::from(glyphset),
+            glyphids: Cow::Owned(vec![65]),
+            glyphs: Cow::Owned(vec![info]),
+            data: Cow::Owned(vec![0xff, 0, 0, 0]),
+        }));
+        ok(&mut state, client, 8, Request::RenderCompositeGlyphs8(render::CompositeGlyphs8Request {
+            op: render::PictOp::OVER,
+            src: render::Picture::from(src_picture),
+            dst: render::Picture::from(dst_picture),
+            mask_format: render::Pictformat::from(FORMAT_A8),
+            glyphset: render::Glyphset::from(glyphset),
+            src_x: 0,
+            src_y: 0,
+            glyphcmds: Cow::Owned(vec![1, 0, 0, 0, 0, 0, 0, 0, 65, 0, 0, 0]),
+        }));
+
+        let len = state.pixmaps.get(&pixmap).map(|p| p.pixels.len());
+        assert_eq!(
+            len,
+            Some(2),
+            "CompositeGlyphs 必须归还借走的源 pixmap 像素（否则该 drawable 永久为空 → 后续采样越界 panic → worker 死亡）"
+        );
+    }
+
+    /// 回归：Composite 走错误路径时也必须归还源/掩码像素。
+    ///
+    /// `render_composite` 里 `self.picture(mask)?`（取掩码 picture 失败）与
+    /// `composite_pixels(...)?`（不支持的 op → BadPictOp）两处 `?` 早退都会
+    /// 跳过 `restore`，把源 drawable 的缓冲永久抽空——与上面同一类致命后果。
+    /// 回归：mask 与 src 指向**同一个 drawable** 时也必须归还（且按逆序归还）。
+    ///
+    /// 同一 drawable 被借两次：第二次借到的是空 Vec（首次已 `mem::take` 走）。
+    /// 如果先还 src 再还 mask，最后写回的就是那个空 Vec——等于又把缓冲抽空了
+    /// （与"漏归还"同样的致命后果，只是更隐蔽）。
+    #[test]
+    fn composite_with_shared_src_and_mask_drawable_keeps_pixels() {
+        let (mut state, client, _rx) = fixture();
+        let window = super::super::handshake::resource_id_base(0);
+        make_window(&mut state, client, 1, window);
+
+        let pixmap = window + 1;
+        ok(&mut state, client, 3, Request::CreatePixmap(xproto::CreatePixmapRequest {
+            depth: 24,
+            pid: pixmap,
+            drawable: window,
+            width: 2,
+            height: 1,
+        }));
+        let dst_picture = window + 2;
+        ok(&mut state, client, 4, Request::RenderCreatePicture(render::CreatePictureRequest {
+            pid: render::Picture::from(dst_picture),
+            drawable: window,
+            format: render::Pictformat::from(FORMAT_RGB24),
+            value_list: Cow::default(),
+        }));
+        // 源与掩码各自建 picture，但都包同一个 pixmap
+        let src_picture = window + 3;
+        let mask_picture = window + 4;
+        for (pid, seq) in [(src_picture, 5u16), (mask_picture, 6u16)] {
+            ok(&mut state, client, seq, Request::RenderCreatePicture(render::CreatePictureRequest {
+                pid: render::Picture::from(pid),
+                drawable: pixmap,
+                format: render::Pictformat::from(FORMAT_RGB24),
+                value_list: Cow::default(),
+            }));
+        }
+
+        ok(&mut state, client, 7, Request::RenderComposite(render::CompositeRequest {
+            op: render::PictOp::OVER,
+            src: render::Picture::from(src_picture),
+            mask: render::Picture::from(mask_picture),
+            dst: render::Picture::from(dst_picture),
+            src_x: 0,
+            src_y: 0,
+            mask_x: 0,
+            mask_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: 1,
+            height: 1,
+        }));
+        assert_eq!(
+            state.pixmaps.get(&pixmap).map(|p| p.pixels.len()),
+            Some(2),
+            "同一 drawable 兼作 src 与 mask 时，归还必须按借用逆序执行，别把空缓冲写回去"
+        );
+    }
+
+    #[test]
+    fn composite_error_paths_restore_borrowed_pixels() {
+        let (mut state, client, _rx) = fixture();
+        let window = super::super::handshake::resource_id_base(0);
+        make_window(&mut state, client, 1, window);
+
+        let pixmap = window + 1;
+        ok(&mut state, client, 3, Request::CreatePixmap(xproto::CreatePixmapRequest {
+            depth: 24,
+            pid: pixmap,
+            drawable: window,
+            width: 2,
+            height: 1,
+        }));
+        let dst_picture = window + 2;
+        ok(&mut state, client, 4, Request::RenderCreatePicture(render::CreatePictureRequest {
+            pid: render::Picture::from(dst_picture),
+            drawable: window,
+            format: render::Pictformat::from(FORMAT_RGB24),
+            value_list: Cow::default(),
+        }));
+        let src_picture = window + 3;
+        ok(&mut state, client, 5, Request::RenderCreatePicture(render::CreatePictureRequest {
+            pid: render::Picture::from(src_picture),
+            drawable: pixmap,
+            format: render::Pictformat::from(FORMAT_RGB24),
+            value_list: Cow::default(),
+        }));
+
+        // 路径 A：mask 指向一个不存在的 picture → self.picture(mask)? 早退
+        let err = state.handle(
+            client,
+            6,
+            &Request::RenderComposite(render::CompositeRequest {
+                op: render::PictOp::OVER,
+                src: render::Picture::from(src_picture),
+                mask: render::Picture::from(0x00ff_ffffu32),
+                dst: render::Picture::from(dst_picture),
+                src_x: 0,
+                src_y: 0,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+            }),
+        );
+        assert_eq!(err.unwrap_err().code, BAD_PICTURE);
+        assert_eq!(
+            state.pixmaps.get(&pixmap).map(|p| p.pixels.len()),
+            Some(2),
+            "mask 查找失败早退后必须归还源像素"
+        );
+
+        // 路径 B：不支持的 op → blend_pixel 回 None → composite_pixels 返回 Err
+        assert!(blend_pixel(u8::from(render::PictOp::DISJOINT_OVER), 0x0011_2233, (0, 0, 0, 255)).is_none(),
+            "DISJOINT_OVER 必须落在未支持的 op 上（这条测试的前提）");
+        let err = state.handle(
+            client,
+            7,
+            &Request::RenderComposite(render::CompositeRequest {
+                op: render::PictOp::DISJOINT_OVER,
+                src: render::Picture::from(src_picture),
+                mask: render::Picture::from(0u32),
+                dst: render::Picture::from(dst_picture),
+                src_x: 0,
+                src_y: 0,
+                mask_x: 0,
+                mask_y: 0,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+            }),
+        );
+        assert_eq!(err.unwrap_err().code, BAD_PICT_OP);
+        assert_eq!(
+            state.pixmaps.get(&pixmap).map(|p| p.pixels.len()),
+            Some(2),
+            "composite_pixels 返回错误后必须归还源像素"
+        );
     }
 
     #[test]

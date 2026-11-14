@@ -383,6 +383,28 @@ impl GlyphSetData {
     }
 }
 
+/// 一条水平脏区带（task-17 阶段 B）：连续变化行聚成的矩形 + 矩形本地像素。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameBand {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// 行优先紧密排列的 `width * height` 个 u32 像素。
+    pub pixels: Vec<u32>,
+}
+
+/// 一次帧 diff 的结果（task-18：读阶段产物，写阶段据此提交基准帧）。
+#[derive(Debug, Clone)]
+pub struct FrameDiff {
+    /// 产生这份 diff 的屏幕版本号（提交时写入 sent_seq）。
+    pub seq: u64,
+    /// 屏幕尺寸相对基准帧发生了变化（提交时重建基准帧缓冲）。
+    pub size_changed: bool,
+    /// 变化带（像素已拷出）。
+    pub bands: Vec<FrameBand>,
+}
+
 /// 一个已打开的字体。
 ///
 /// 所有名字都映射到同一份内置点阵字体（见 `font.rs`），这里只保留名字用于
@@ -473,6 +495,11 @@ pub struct ServerState {
     /// compose / 窗口映射变化时维护；`None` 表示未知（按全屏处理）。
     /// 帧泵据此把对比范围缩到真正会变的窗口区域。
     damage_hint: Option<(i32, i32, i32, i32)>,
+    /// task-22 按需显示：UI 观众是否在场（与 `ServerShared.viewer_attached`
+    /// 共享同一个 Arc；FramePump attach/detach 维护）。
+    pub viewer_attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 有窗口映射且无观众时触发（HostServer::start 填写；去重在回调里）。
+    pub on_map_no_viewer: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ServerState {
@@ -554,6 +581,8 @@ impl ServerState {
             xi2_clients: std::collections::HashMap::new(),
             xi2_selections: std::collections::HashMap::new(),
             damage_hint: None,
+            viewer_attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            on_map_no_viewer: None,
         };
         state.intern_server_atoms();
         state.setup_xsettings_manager();
@@ -815,6 +844,36 @@ impl ServerState {
         }
     }
 
+    /// 取 drawable 几何，并**修复像素缓冲长度不变量**（`len == width * height`）。
+    ///
+    /// 为什么需要：所有绘制/合成路径都按 `width * height` 直接索引像素缓冲。
+    /// 借还漏配（`BorrowedPixels`/`BorrowedBitmap` 是显式归还，没有 Drop 兜底）
+    /// 会把某个 drawable 的缓冲永久抽空；此后任何一次索引都会越界 panic——
+    /// 而绘制跑在**唯一的光栅化 worker** 上、合成跑在**帧泵任务**上，两者任一
+    /// panic 都表现为「窗口都在、整个界面再也不刷新」，日志里没有任何异常。
+    /// 这里在使用前把缓冲补齐到声明尺寸（内容留背景色），把"致命"降级成
+    /// "那一块暂时是空的"，且下一次绘制就会自愈。
+    pub fn drawable_geometry_checked(&mut self, id: Drawable) -> Result<(u16, u16, u8), XError> {
+        if let Some(window) = self.windows.get_mut(&id) {
+            let (w, h, depth) = (window.width, window.height, window.depth);
+            let need = usize::from(w) * usize::from(h);
+            if window.pixels.len() != need {
+                window.pixels.resize(need, window.background_pixel);
+            }
+            Ok((w, h, depth))
+        } else if let Some(pixmap) = self.pixmaps.get_mut(&id) {
+            let (w, h, depth) = (pixmap.width, pixmap.height, pixmap.depth);
+            let need = usize::from(w) * usize::from(h);
+            // pixmap 没有背景色概念，补齐用 0（透明黑）
+            if pixmap.pixels.len() != need {
+                pixmap.pixels.resize(need, 0);
+            }
+            Ok((w, h, depth))
+        } else {
+            Err(XError::bad_drawable(id))
+        }
+    }
+
     // ---- atoms ----
 
     pub fn intern_atom(&mut self, name: &[u8], only_if_exists: bool) -> Result<Atom, XError> {
@@ -870,22 +929,57 @@ impl ServerState {
         window: Window,
         mask: u32,
         evtype: u16,
+        // task-24 输入绕行：true = 对 XI2 激活的客户端也投核心事件，帧带
+        // send_event 位（GDK 的 XI2 管理器只为这种核心事件开例外，
+        // gdkdevicemanager-xi2.c L1413——滚轮/键盘绕行就靠它）。
+        xi2_bypass: bool,
         build: impl Fn(Window) -> Vec<u8>,
     ) {
         let Some(target) = self.windows.get(&window) else {
             return;
         };
+        let mut delivered: Vec<u32> = Vec::new();
+        // 第一轮：核心掩码选择者（XI2 激活的客户端按 xi2_bypass 决定去留）
         for (&client, &selected) in &target.event_masks {
             if selected & mask == 0 {
                 continue;
             }
-            if self.core_suppressed(client, evtype, true) {
+            let xi2_active = self.core_suppressed(client, evtype, true);
+            if xi2_active && !xi2_bypass {
+                // XI 投递后核心投递终止（XI2 规范）——正常路径跳过核心
                 continue;
             }
             if let Some(handle) = self.clients.get(&client) {
                 let mut frame = pad_event(build(window));
+                if xi2_active {
+                    // 绕行路径：GDK 的 XI2 管理器只翻译带 send_event 位的核心
+                    // 事件（源码 L1413 的官方后门），置位才能穿过 XI2 客户端
+                    frame[0] |= 0x80;
+                }
                 self.stamp_sequence(client, &mut frame);
                 let _ = handle.sender.send(frame);
+                delivered.push(client);
+            }
+        }
+        // 第二轮（仅绕行）：**只选了 XI2、没有对应核心掩码**的客户端——GDK 就
+        // 是这样（窗口上只选 XI2 键盘掩码），第一轮的 event_masks 遍历够不到
+        // 它们；这里按 XI2 选择表补投（带 send_event 位），并按已投去重。
+        if xi2_bypass {
+            if let Some(selectors) = self.xi2_selections.get(&window) {
+                for (&client, sel) in selectors {
+                    if delivered.contains(&client) {
+                        continue;
+                    }
+                    if !super::xinput::xi2_client_selects(selectors, client, evtype) {
+                        continue;
+                    }
+                    if let Some(handle) = self.clients.get(&client) {
+                        let mut frame = pad_event(build(window));
+                        frame[0] |= 0x80;
+                        self.stamp_sequence(client, &mut frame);
+                        let _ = handle.sender.send(frame);
+                    }
+                }
             }
         }
     }
@@ -1264,6 +1358,29 @@ impl ServerState {
         if let Some(parent) = self.windows.get_mut(&parent) {
             parent.children.retain(|child| *child != id);
         }
+        // **X 语义：窗口销毁后必须忘掉它在输入状态里的一切痕迹**（指针缓存、
+        // 焦点、抓取、XI2 选择）。否则命中测试/键盘焦点会一直指向一个**不存在
+        // 的窗口**：客户端（GDK）按事件里的 `event` 字段查自己的窗口表得到
+        // NULL，在 `translate_event` 开头直接 `return FALSE` **静默丢弃**——
+        // 症状是"远端画面照旧刷新，但点击/滚轮/键盘全部无反应"，且没有任何
+        // X 错误或 Gdk-CRITICAL（实测用户正是此现象）。
+        if self.input.pointer_window == Some(id) {
+            self.input.pointer_window = None;
+        }
+        if self.input.implicit_grab == Some(id) {
+            self.input.implicit_grab = None;
+        }
+        if self.input.pointer_grab.as_ref().map(|grab| grab.window) == Some(id) {
+            self.input.pointer_grab = None;
+        }
+        if self.input.keyboard_grab == Some(id) {
+            self.input.keyboard_grab = None;
+        }
+        if self.input.focus == id {
+            // X：焦点窗口被销毁 → 焦点回到 PointerRoot（跟随指针）
+            self.input.focus = super::input::POINTER_ROOT;
+        }
+        self.xi2_selections.remove(&id);
         self.windows.remove(&id);
         // 扩展资源跟着窗口走：SHAPE 形状、绑定在这个窗口上的 damage、
         // 以及包装这个窗口的 RENDER picture
@@ -1282,6 +1399,15 @@ impl ServerState {
 
         self.mark_compose_dirty();
         Ok(())
+    }
+
+    /// task-24 内存账目：本服务端持有的像素字节（窗口 + pixmap 缓冲）。
+    /// 返回 `(窗口数, pixmap 数, 像素字节)`——用来一刀切开"内存涨在服务端缓冲"
+    /// 还是"涨在 UI/渲染器侧"（用户实测进程涨到 7.8GB，必须先定位归属）。
+    pub fn pixel_bytes(&self) -> (usize, usize, usize) {
+        let win: usize = self.windows.values().map(|w| w.pixels.len() * 4).sum();
+        let pix: usize = self.pixmaps.values().map(|p| p.pixels.len() * 4).sum();
+        (self.windows.len(), self.pixmaps.len(), win + pix)
     }
 
     pub fn map_window(&mut self, id: Window, sequence: u16) -> Result<(), XError> {
@@ -1331,6 +1457,14 @@ impl ServerState {
             .serialize()
             .to_vec()
         });
+
+        // task-22 按需显示：有窗口映射而 UI 没挂观众时通知上层（自动弹出
+        // X 屏幕 / 状态栏提示）。去重与弹窗逻辑在回调里，这里只管触发。
+        if !self.viewer_attached.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(cb) = self.on_map_no_viewer.clone() {
+                cb();
+            }
+        }
 
         self.mark_compose_dirty();
         Ok(())
@@ -1550,21 +1684,35 @@ impl ServerState {
         screen.resize(width * height, background);
         screen.fill(background);
 
-        compose_children(
-            &mut screen,
-            width,
-            height,
-            0,
-            0,
-            width as i32,
-            height as i32,
-            ROOT_WINDOW,
-            &self.windows,
-            &self.shapes,
-        );
-
+        // 合成的绘制体做 panic 隔离：根窗口缓冲此刻是 `mem::take` 出来的，
+        // 而 `compose_dirty` 已在 ensure_composed 里清零。若这里 panic 直接
+        // 穿透，缓冲再也放不回去、脏标志也不会重置 → 之后每帧都 panic（画面
+        // 永久冻结且"看起来只是没变化"）。所以：先把缓冲放回去、把脏标志置回，
+        // 再 resume（帧泵侧也有 catch_unwind，下一次 tick 会重试）。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compose_children(
+                &mut screen,
+                width,
+                height,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                ROOT_WINDOW,
+                &self.windows,
+                &self.shapes,
+            );
+        }));
+        let panicked = outcome.is_err();
         if let Some(root) = self.windows.get_mut(&ROOT_WINDOW) {
+            if panicked && screen.len() != width * height {
+                screen.resize(width * height, background);
+            }
             root.pixels = screen;
+        }
+        if panicked {
+            self.compose_dirty = true;
+            std::panic::resume_unwind(outcome.unwrap_err());
         }
 
         // 版本号只增不减：Viewer 拿它和上次发送的版本比较，相同就跳过编码
@@ -1612,18 +1760,53 @@ impl ServerState {
         self.damage_hint = None;
     }
 
-    /// 帧泵取帧：与上次发送的帧在"脏区提示"范围内逐像素比对，只返回真正
-    /// 变化的矩形（u32 像素，矩形本地的行优先布局）。
+    /// 帧泵取帧（task-17 阶段 B：脏区分带）：与上次发送的帧在"脏区提示"范围
+    /// 内逐行比对，把连续变化行聚成最多 8 条**水平带**，每带独立抠取返回。
     ///
     /// 返回 `None` 表示自上次取帧以来屏幕没有任何变化——此时**不做任何
     /// 内存拷贝**。这是把空闲会话的 CPU 从"每 33ms 三遍整屏"降下来的关键。
     ///
     /// 一次取走后基准帧就地更新，所以同一版本不会被重复发送。
+    /// 旧调用方兼容：`take_frame_if_changed` 返回所有带的并集矩形。
     pub fn take_frame_if_changed(&mut self) -> Option<(u64, u16, u16, u16, u16, Vec<u32>)> {
+        let (seq, bands) = self.take_frame_if_changed_banded()?;
+        // 并集矩形（基准帧此刻 == 当前屏幕，直接从基准帧抠）
+        let width = usize::from(self.sent_size.0);
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, 0, 0);
+        for b in &bands {
+            x0 = x0.min(i32::from(b.x));
+            y0 = y0.min(i32::from(b.y));
+            x1 = x1.max(i32::from(b.x) + i32::from(b.width));
+            y1 = y1.max(i32::from(b.y) + i32::from(b.height));
+        }
+        let rect_w = (x1 - x0) as usize;
+        let rect_h = (y1 - y0) as usize;
+        let mut pixels = Vec::with_capacity(rect_w * rect_h);
+        for row in y0..y1 {
+            let start = row as usize * width + x0 as usize;
+            pixels.extend_from_slice(&self.sent_frame[start..start + rect_w]);
+        }
+        Some((seq, x0 as u16, y0 as u16, rect_w as u16, rect_h as u16, pixels))
+    }
+
+    /// 分带版取帧（task-18 前的行为：diff + 提交基准帧一步完成，`&mut self`）。
+    /// RwLock 快照路径请用 `diff_frame_bands` + `commit_frame_bands`
+    /// （`ServerShared::take_frame_snapshot` 已封装：读锁 diff、写锁提交）。
+    pub fn take_frame_if_changed_banded(&mut self) -> Option<(u64, Vec<FrameBand>)> {
         // NyaTerm: 绘制请求只标脏，这里（33ms 一次）统一合成——全屏重建的
         // 频率从"每绘制请求一次"降到 30fps 上限。
         self.ensure_composed();
-        if self.frame_seq == self.sent_seq {
+        let diff = self.diff_frame_bands()?;
+        self.commit_frame_bands(&diff);
+        Some((diff.seq, diff.bands))
+    }
+
+    /// **读阶段（纯读 `&self`）**：与基准帧在脏区提示范围内逐行比对，把连续
+    /// 变化行聚成 ≤8 条水平带并把像素**拷出来**。不碰基准帧/版本号/脏区提示。
+    /// 返回 `None` = 屏幕没有变化（零拷贝）。
+    pub fn diff_frame_bands(&self) -> Option<FrameDiff> {
+        let seq = self.frame_seq;
+        if seq == self.sent_seq {
             return None;
         }
         let Some(root) = self.windows.get(&ROOT_WINDOW) else {
@@ -1636,7 +1819,6 @@ impl ServerState {
         }
 
         let size_changed = self.sent_size != (width, height) || self.sent_frame.is_empty();
-        let seq = self.frame_seq;
 
         // 对比范围：脏区提示（钳到屏幕内），尺寸变化/无提示时退回全屏。
         let (rx0, ry0, rx1, ry1) = if size_changed {
@@ -1670,80 +1852,112 @@ impl ServerState {
             buffer
         };
 
-        // 与基准帧在区域内比对，求精确脏矩形。
-        let (mut dx0, mut dy0, mut dx1, mut dy1) = (rx1, ry1, rx0, ry0);
+        // 与基准帧在区域内逐行比对：记录每个变化行的 x 范围（绝对坐标）。
+        let region_w = (rx1 - rx0) as usize;
+        let mut changed_rows: Vec<(i32, i32, i32)> = Vec::new(); // (row, first_x, last_x+1)
         let mut any_diff = size_changed; // 尺寸变了就整块都算脏
         if !size_changed {
             let sent_w = self.sent_size.0;
             let sent = &self.sent_frame;
             for row in ry0..ry1 {
                 let y = (row - ry0) as usize;
-                let start = y * (rx1 - rx0) as usize;
-                let current = &region_pixels[start..start + (rx1 - rx0) as usize];
+                let start = y * region_w;
+                let current = &region_pixels[start..start + region_w];
                 let base = row as usize * sent_w + rx0 as usize;
-                let previous = &sent[base..base + (rx1 - rx0) as usize];
+                let previous = &sent[base..base + region_w];
+                let mut first: Option<i32> = None;
+                let mut last = 0i32;
                 for (offset, (a, b)) in current.iter().zip(previous.iter()).enumerate() {
                     if a != b {
                         let x = rx0 + offset as i32;
-                        dx0 = dx0.min(x);
-                        dx1 = dx1.max(x + 1);
-                        dy0 = dy0.min(row);
-                        dy1 = dy1.max(row + 1);
-                        any_diff = true;
-                        // 本行 x 范围已经撑满区域，这一行不用再往后扫；但**必须
-                        // 继续扫后面的行**——否则脏矩形高度被截断到本行，下面的
-                        // 变化永远发不出去（症状：画面只在顶部一条条"慢慢展开"，
-                        // 且 sent_seq 已推进，剩余行再也不会补发）。
-                        if dx0 == rx0 && dx1 == rx1 {
-                            break;
+                        if first.is_none() {
+                            first = Some(x);
                         }
+                        last = x + 1;
                     }
+                }
+                if let Some(first) = first {
+                    changed_rows.push((row, first, last));
+                    any_diff = true;
                 }
             }
             if !any_diff {
-                // 提示区域内其实没变（提示偏保守）：只消费掉版本与提示
-                self.sent_seq = seq;
-                self.damage_hint = None;
+                // 提示区域内其实没变（提示偏保守）：纯读路径不消费版本，
+                // 版本与提示由提交阶段（consume_frame_version）消费
                 return None;
             }
         } else {
-            dx0 = rx0;
-            dy0 = ry0;
-            dx1 = rx1;
-            dy1 = ry1;
+            changed_rows.push((ry0, rx0, rx1));
         }
 
-        // 从（可能是区域的）像素里抠出精确脏矩形。
-        let rect_w = (dx1 - dx0) as usize;
-        let rect_h = (dy1 - dy0) as usize;
-        let mut rect_pixels = Vec::with_capacity(rect_w * rect_h);
-        for row in dy0..dy1 {
-            let start = ((row - ry0) as usize) * (rx1 - rx0) as usize + (dx0 - rx0) as usize;
-            rect_pixels.extend_from_slice(&region_pixels[start..start + rect_w]);
+        // task-17 阶段 B：把连续的变化行聚成**带**（band）——上下分离的两块
+        // 小改动（如顶栏 + 光标行）不再被外接矩形夹着大片未变区域整包上传。
+        // 每带像素量 ≈ 变化区本体；damage 通常只占屏幕 20~40%，上传字节降 2~4 倍。
+        // 带数上限：超过就退化回单一外接矩形（老行为），避免帧头数量爆炸。
+        const MAX_FRAME_BANDS: usize = 8;
+        let mut segments: Vec<(i32, i32, i32, i32)> = Vec::new(); // (y0, y1, x0, x1)
+        {
+            let mut iter = changed_rows.into_iter().peekable();
+            while let Some((row0, fx, lx)) = iter.next() {
+                let (mut y_end, mut x0, mut x1) = (row0 + 1, fx, lx);
+                while let Some(&(row, fx, lx)) = iter.peek() {
+                    if row == y_end {
+                        y_end += 1;
+                        x0 = x0.min(fx);
+                        x1 = x1.max(lx);
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                segments.push((row0, y_end, x0, x1));
+            }
+            if segments.len() > MAX_FRAME_BANDS {
+                // 退化：单一外接矩形
+                let (mut x0, mut y0, mut x1, mut y1) =
+                    (rx1, ry1, rx0, ry0);
+                for (sy0, sy1, sx0, sx1) in &segments {
+                    y0 = y0.min(*sy0);
+                    y1 = y1.max(*sy1);
+                    x0 = x0.min(*sx0);
+                    x1 = x1.max(*sx1);
+                }
+                segments = vec![(y0, y1, x0, x1)];
+            }
         }
 
-        // 基准帧就地更新：只有脏矩形会变，直接按行覆写。
-        if size_changed {
-            self.sent_frame = vec![0; width * height];
-            self.sent_size = (width, height);
+        // 每带独立抠像素（数据拷出；基准帧更新在 commit_frame_bands 写阶段）。
+        let mut bands = Vec::with_capacity(segments.len());
+        for (by0, by1, bx0, bx1) in segments {
+            let band_w = (bx1 - bx0) as usize;
+            let band_h = (by1 - by0) as usize;
+            let mut band_pixels = Vec::with_capacity(band_w * band_h);
+            for row in by0..by1 {
+                let start = ((row - ry0) as usize) * region_w + (bx0 - rx0) as usize;
+                band_pixels.extend_from_slice(&region_pixels[start..start + band_w]);
+            }
+            bands.push(FrameBand {
+                x: bx0 as u16,
+                y: by0 as u16,
+                width: band_w as u16,
+                height: band_h as u16,
+                pixels: band_pixels,
+            });
         }
-        for row in dy0..dy1 {
-            let dst = row as usize * width + dx0 as usize;
-            let src = ((row - dy0) as usize) * rect_w;
-            self.sent_frame[dst..dst + rect_w]
-                .copy_from_slice(&rect_pixels[src..src + rect_w]);
-        }
-        self.sent_seq = seq;
+
+        Some(FrameDiff { seq, size_changed, bands })
+    }
+
+    /// 提交阶段的一部分：diff 报告「提示区域内其实没变」时，消费版本号与
+    /// 提示，避免每帧重复扫同一区域（写锁窗口极小，无拷贝）。
+    pub fn consume_frame_version(&mut self) {
+        self.sent_seq = self.frame_seq;
         self.damage_hint = None;
+    }
 
-        Some((
-            seq,
-            dx0 as u16,
-            dy0 as u16,
-            rect_w as u16,
-            rect_h as u16,
-            rect_pixels,
-        ))
+    /// 是否有待消费的屏幕版本（诊断/提交阶段判断用）。
+    pub fn frame_version_pending(&self) -> bool {
+        self.frame_seq != self.sent_seq
     }
 }
 
@@ -1760,6 +1974,31 @@ impl WindowData {
 
 /// 绘制与读取的入口：窗口绘制后自动重新合成屏幕。
 impl ServerState {
+    /// **写阶段（`&mut self`，窗口极小）**：把 diff 取走的带写回基准帧 +
+    /// 消费版本号与脏区提示。按行覆写，不重新 diff（diff 在
+    /// `diff_frame_bands` 读阶段完成）。
+    pub fn commit_frame_bands(&mut self, diff: &FrameDiff) {
+        let (cur_w, cur_h) = {
+            let root = self.windows.get(&ROOT_WINDOW).expect("根窗口");
+            (usize::from(root.width), usize::from(root.height))
+        };
+        if diff.size_changed {
+            self.sent_frame = vec![0; cur_w * cur_h];
+            self.sent_size = (cur_w, cur_h);
+        }
+        for band in &diff.bands {
+            let band_w = band.width as usize;
+            for row in 0..band.height as usize {
+                let dst = (band.y as usize + row) * self.sent_size.0 + band.x as usize;
+                let src = row * band_w;
+                self.sent_frame[dst..dst + band_w]
+                    .copy_from_slice(&band.pixels[src..src + band_w]);
+            }
+        }
+        self.sent_seq = diff.seq;
+        self.damage_hint = None;
+    }
+
     /// 只读获取可绘制对象的像素、宽、高、深度。
     pub fn drawable_pixels(&self, id: Drawable) -> Result<(&[u32], usize, usize, u8), XError> {
         if let Some(window) = self.windows.get(&id) {
@@ -1797,14 +2036,13 @@ impl ServerState {
     where
         F: FnOnce(&mut Canvas<'_>),
     {
-        // 先确认目标存在，再借用辅助位图——借用之后就没法回头做错误检查了
-        let (width, height, mapped) = if let Some(window) = self.windows.get(&id) {
-            (window.width as usize, window.height as usize, Some(window.mapped))
-        } else if let Some(pixmap) = self.pixmaps.get(&id) {
-            (pixmap.width as usize, pixmap.height as usize, None)
-        } else {
-            return Err(XError::bad_drawable(id));
+        // 先确认目标存在（并修复缓冲长度不变量），再借用辅助位图——
+        // 借用之后就没法回头做错误检查了
+        let (width, height) = {
+            let (w, h, _) = self.drawable_geometry_checked(id)?;
+            (usize::from(w), usize::from(h))
         };
+        let mapped = self.windows.get(&id).map(|window| window.mapped);
 
         let tile = BorrowedBitmap::take(self, gc.tile, id);
         let stipple = BorrowedBitmap::take(self, gc.stipple, id);
@@ -1836,18 +2074,31 @@ impl ServerState {
                 tile.view(),
                 stipple.view(),
             );
-            draw(&mut canvas);
-        }
-
-        tile.restore(self);
-        stipple.restore(self);
-        mask.restore(self);
-
-        // DAMAGE：这个可绘制对象被画过，订阅它的 damage 标脏（compose 时发通知）
-        self.mark_damage(id);
-
-        if mapped == Some(true) {
-            self.mark_compose_dirty();
+            // 绘制体做 panic 隔离：`BorrowedBitmap` 是**显式归还**（没有 Drop），
+            // panic 穿过借用窗口就会让借走的那块位图永久为空（此后每次用它都
+            // 越界 panic）。所以这里先记下 panic，归还之后再 resume。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                draw(&mut canvas);
+            }));
+            drop(canvas);
+            // **按借用的逆序归还**：tile/stipple/clip_mask 允许指向同一个 pixmap
+            //（协议只做 `!= 0` 过滤，没有互异校验）。同一 pixmap 被借两次时，
+            // 第二次借到的是空 Vec；若按借用同序归还，最后写回的就是那个空 Vec
+            // ——等于把它永久抽空（症状：一次合法绘制之后该 pixmap 变成全空，
+            // 下一次用它就 panic）。
+            mask.restore(self);
+            stipple.restore(self);
+            tile.restore(self);
+            // DAMAGE/重合成标记**无条件**执行：绘制体可能已经写进了一部分像素
+            // 才 panic，那部分同样要上屏；标完再把 panic 继续抛给上层（worker
+            // 有 catch_unwind，只废这一条命令）。
+            self.mark_damage(id);
+            if mapped == Some(true) {
+                self.mark_compose_dirty();
+            }
+            if let Err(payload) = outcome {
+                std::panic::resume_unwind(payload);
+            }
         }
         Ok(())
     }
@@ -2295,8 +2546,16 @@ fn blit_clipped(
         let src_start = src_row * source_w + (left - x) as usize;
         let dst_start = row as usize * screen_w + left as usize;
         let len = (right - left) as usize;
-        screen[dst_start..dst_start + len]
-            .copy_from_slice(&source[src_start..src_start + len]);
+        // 防御式切片：源缓冲短于声明尺寸（借还漏配留下的空/短缓冲）时跳过该行，
+        // 而不是 panic。这条路径跑在**帧泵任务**上——panic 会让帧泵直接退出，
+        // 表现同样是"窗口都在、画面永久不再刷新"，且日志里没有任何线索。
+        let (Some(src), Some(dst)) = (
+            source.get(src_start..src_start + len),
+            screen.get_mut(dst_start..dst_start + len),
+        ) else {
+            continue;
+        };
+        dst.copy_from_slice(src);
     }
 }
 #[cfg(test)]
@@ -2343,5 +2602,195 @@ mod tests {
             fh as usize >= 6,
             "脏矩形必须覆盖到第 5 行（高度 >= 6），实际高度 {fh}"
         );
+    }
+
+    // ---- task-17 阶段 B：脏区分带上传 ----
+
+    /// 搭一个「基准帧全 0 + 当前帧手工改像素」的状态（不经过 compose）。
+    fn frame_fixture() -> (ServerState, usize, usize) {
+        let mut state = ServerState::new(Default::default());
+        let (w, h) = {
+            let root = state.windows.get(&ROOT_WINDOW).expect("根窗口");
+            (usize::from(root.width), usize::from(root.height))
+        };
+        state.sent_size = (w, h);
+        state.sent_frame = vec![0u32; w * h];
+        state.sent_seq = 0;
+        state.frame_seq = 1;
+        state.compose_dirty = false;
+        state.damage_hint = Some((0, 0, w as i32, h as i32));
+        let root = state.windows.get_mut(&ROOT_WINDOW).expect("根窗口");
+        root.pixels = vec![0u32; w * h];
+        (state, w, h)
+    }
+
+    /// 上下分离的两块小改动 → 两条独立带（而不是一个夹着大片未变区的矩形）。
+    #[test]
+    fn separate_changes_become_separate_bands() {
+        let (mut state, w, _h) = frame_fixture();
+        // 第 0 行改 1 个像素；隔 4 行再改 1 个像素
+        {
+            let root = state.windows.get_mut(&ROOT_WINDOW).expect("根窗口");
+            root.pixels[0] = 0x0011_1111;
+            root.pixels[5 * w + 3] = 0x0022_2222;
+        }
+        let (_, bands) = state.take_frame_if_changed_banded().expect("应当有帧");
+        assert_eq!(bands.len(), 2, "上下分离的变化应当是两条独立带");
+        assert_eq!(
+            (bands[0].x, bands[0].y, bands[0].width, bands[0].height),
+            (0, 0, 1, 1),
+            "第一条带只含第 0 行的那个像素"
+        );
+        assert_eq!(
+            (bands[1].x, bands[1].y, bands[1].width, bands[1].height),
+            (3, 5, 1, 1),
+            "第二条带只含第 5 行的那个像素"
+        );
+        // 像素值正确
+        assert_eq!(bands[0].pixels, [0x0011_1111]);
+        assert_eq!(bands[1].pixels, [0x0022_2222]);
+        // 基准帧已就地更新：再取一次没有帧
+        assert!(state.take_frame_if_changed_banded().is_none(), "不应重复发送");
+    }
+
+    /// 相邻行变化 → 合并为一条带；超过 8 条带退化回单一外接矩形。
+    #[test]
+    fn bands_merge_and_degrade_to_full_rect() {
+        let (mut state, w, _h) = frame_fixture();
+        // 相邻两行各改 1 像素（同一列）→ 1 条带
+        {
+            let root = state.windows.get_mut(&ROOT_WINDOW).expect("根窗口");
+            root.pixels[2 * w + 1] = 0x0033_3333;
+            root.pixels[3 * w + 1] = 0x0033_3333;
+        }
+        let (_, bands) = state.take_frame_if_changed_banded().expect("应当有帧");
+        assert_eq!(bands.len(), 1, "相邻行必须合并成一条带");
+        assert_eq!((bands[0].y, bands[0].height), (2, 2));
+
+        // 9 处上下分散的变化 → 超过带数上限，退化为单一外接矩形
+        let (mut state, w, _h) = frame_fixture();
+        {
+            let root = state.windows.get_mut(&ROOT_WINDOW).expect("根窗口");
+            for i in 0..9usize {
+                root.pixels[i * 3 * w] = 0x0044_4444;
+            }
+        }
+        let (_, bands) = state.take_frame_if_changed_banded().expect("应当有帧");
+        assert_eq!(bands.len(), 1, "超过带数上限必须退化成单一矩形");
+        assert_eq!(bands[0].y, 0);
+        assert_eq!(usize::from(bands[0].height), 8 * 3 + 1, "退化矩形覆盖全部 9 行");
+    }
+
+    /// 回归（task-19，验证者 C2 探针转正）：GC 的 tile 与 stipple 指向**同一个
+    /// pixmap**（协议允许，只做 `!= 0` 过滤）时，绘制不得把该 pixmap 抽空。
+    ///
+    /// 同一 pixmap 被借两次：第二次借到的是空 Vec；若按借用**同序**归还，
+    /// 最后写回的就是那个空 Vec → pixmap 永久变空，之后再用它就 panic/静默全空。
+    /// 修复 = 按借用**逆序**归还（mask → stipple → tile）。
+    #[test]
+    fn draw_with_gc_shared_tile_and_stipple_keeps_pixmap() {
+        let mut state = ServerState::new(Default::default());
+        // 一个 2x2 的 pixmap（兼作 tile 与 stipple）
+        let pixmap = 0x0020_0002u32;
+        state.pixmaps.insert(
+            pixmap,
+            PixmapData {
+                id: pixmap,
+                owner: 0,
+                depth: 24,
+                width: 2,
+                height: 2,
+                pixels: vec![0x0011_2233; 4],
+            },
+        );
+        // 目标窗口
+        let window = 0x0020_0001u32;
+        ok_create_window_and_map(&mut state, window);
+
+        let gc = GcData::new(0x0020_0003, 0, 24);
+        let mut gc = gc;
+        gc.foreground = 0x00ff_0000;
+        gc.tile = Some(pixmap);
+        gc.stipple = Some(pixmap);
+        gc.fill_style = 0; // Solid：绘制体不读 tile/stipple，但借用照常发生
+
+        state
+            .draw_with_gc(window, &gc, |canvas| {
+                canvas.fill_rect(0, 0, 4, 4);
+            })
+            .expect("绘制应当成功");
+        assert_eq!(
+            state.pixmaps.get(&pixmap).map(|p| p.pixels.len()),
+            Some(4),
+            "tile==stipple 的合法 GC 不得把 pixmap 抽空（逆序归还）"
+        );
+    }
+
+    /// 回归（task-19，验证者 D5 探针转正）：绘制体 panic 之后，借走的辅助位图
+    /// 必须**先归还**再抛出——panic 穿过借用窗口会把 tile/stipple/clip_mask
+    /// 永久抽空（没有 Drop 兜底），此后每次使用都命中空缓冲。
+    #[test]
+    fn draw_with_gc_panic_still_restores_borrowed_bitmaps() {
+        let mut state = ServerState::new(Default::default());
+        let pixmap = 0x0020_0002u32;
+        state.pixmaps.insert(
+            pixmap,
+            PixmapData {
+                id: pixmap,
+                owner: 0,
+                depth: 24,
+                width: 2,
+                height: 2,
+                pixels: vec![0x0044_5566; 4],
+            },
+        );
+        let window = 0x0020_0001u32;
+        ok_create_window_and_map(&mut state, window);
+
+        let mut gc = GcData::new(0x0020_0003, 0, 24);
+        gc.tile = Some(pixmap);
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = state.draw_with_gc(window, &gc, |_canvas| {
+                panic!("模拟绘制体 panic");
+            });
+        }));
+        assert!(outcome.is_err(), "panic 应当继续向上传播（worker 侧负责隔离）");
+        assert_eq!(
+            state.pixmaps.get(&pixmap).map(|p| p.pixels.len()),
+            Some(4),
+            "panic 后借走的 tile 位图必须已归还（否则永久抽空）"
+        );
+    }
+
+    /// 测试辅助：建一个映射了的 4x4 窗口（挂根下；client 0 要先注册，
+    /// `check_new_id` 需要 `clients` 表里的 resource_id_base）。
+    fn ok_create_window_and_map(state: &mut ServerState, id: Window) {
+        use x11rb_protocol::protocol::Request;
+        use x11rb_protocol::protocol::xproto;
+        let (_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        state.register_client(0, _tx);
+        let mut request = |seq: u16, req: Request<'static>| {
+            state
+                .handle(0, seq, &req)
+                .unwrap_or_else(|e| panic!("请求 {seq} 失败：{e:?}"));
+        };
+        request(
+            1,
+            Request::CreateWindow(xproto::CreateWindowRequest {
+                depth: 0,
+                wid: id,
+                parent: ROOT_WINDOW,
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+                border_width: 0,
+                class: WindowClass::INPUT_OUTPUT,
+                visual: 0,
+                value_list: std::borrow::Cow::default(),
+            }),
+        );
+        request(2, Request::MapWindow(xproto::MapWindowRequest { window: id }));
     }
 }
